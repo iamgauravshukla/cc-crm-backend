@@ -9,6 +9,7 @@ const authRoutes = require('./routes/auth.routes');
 const bookingRoutes = require('./routes/booking.routes');
 const analyticsRoutes = require('./routes/analytics.routes');
 const dashboardRoutes = require('./routes/dashboard.routes');
+const healthRoutes = require('./routes/health.routes');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -37,10 +38,9 @@ app.use('/api/bookings', bookingRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/analytics', analyticsRoutes);
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
-});
+// Health check routes
+app.use('/health', healthRoutes);
+app.use('/api/health', healthRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
