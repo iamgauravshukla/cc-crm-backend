@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const path = require('path');
 
 // Import routes
 const authRoutes = require('./routes/auth.routes');
@@ -49,6 +50,19 @@ app.use('/api/analytics', analyticsRoutes);
 // Health check routes
 app.use('/health', healthRoutes);
 app.use('/api/health', healthRoutes);
+
+// Serve client build in production (or when build files exist)
+const clientBuildPath = path.join(__dirname, '..', 'client', 'build');
+app.use(express.static(clientBuildPath));
+
+// SPA fallback: return index.html for non-API routes so client-side routing works on refresh
+app.get('*', (req, res, next) => {
+  const url = req.originalUrl || req.url;
+  if (url.startsWith('/api') || url.startsWith('/health')) return next();
+  res.sendFile(path.join(clientBuildPath, 'index.html'), err => {
+    if (err) next(err);
+  });
+});
 
 // Error handling middleware
 app.use((err, req, res, next) => {

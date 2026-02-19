@@ -55,6 +55,7 @@ const bookingSchema = Joi.object({
   companionTreatment: Joi.string().allow('').optional(),
   companionGender: Joi.string().valid('Male', 'Female', '').allow('').optional(),
   bookingDetails: Joi.string().allow('').optional(),
+  adInteracted: Joi.string().allow('').optional(),
   agent: Joi.string().required()
 });
 
