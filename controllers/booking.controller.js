@@ -593,8 +593,8 @@ async function checkPromoHunter(firstName, lastName, email, phone, companionFirs
     }
 
     const fullName = `${firstName} ${lastName}`.toLowerCase().trim();
-    const normalizedEmail = email.toLowerCase().trim();
-    const normalizedPhone = phone.replace(/\D/g, ''); // Remove non-digits
+    const normalizedEmail = (email || '').toLowerCase().trim();
+    const normalizedPhone = (phone || '').replace(/\D/g, ''); // Remove non-digits
     const companionFullName = companionFirstName && companionLastName 
       ? `${companionFirstName} ${companionLastName}`.toLowerCase().trim() 
       : '';
