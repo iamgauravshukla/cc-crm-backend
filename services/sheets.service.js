@@ -12,12 +12,24 @@ class SheetsService {
     if (this.initialized) return;
 
     try {
+      // Get private key - support both base64 encoded and raw format
+      let privateKey;
+      if (process.env.GOOGLE_PRIVATE_KEY_BASE64) {
+        // Decode base64 encoded key (recommended for deployment)
+        privateKey = Buffer.from(process.env.GOOGLE_PRIVATE_KEY_BASE64, 'base64').toString('utf-8');
+      } else if (process.env.GOOGLE_PRIVATE_KEY) {
+        // Use raw key with \n replacement
+        privateKey = process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n');
+      } else {
+        throw new Error('GOOGLE_PRIVATE_KEY or GOOGLE_PRIVATE_KEY_BASE64 is required');
+      }
+
       // Initialize Google Auth using environment variables
       const credentials = {
         type: 'service_account',
         project_id: process.env.GOOGLE_PROJECT_ID,
         private_key_id: process.env.GOOGLE_PRIVATE_KEY_ID,
-        private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+        private_key: privateKey,
         client_email: process.env.GOOGLE_CLIENT_EMAIL,
         client_id: process.env.GOOGLE_CLIENT_ID,
         auth_uri: 'https://accounts.google.com/o/oauth2/auth',

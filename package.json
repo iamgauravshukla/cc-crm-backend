@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "validate": "node utils/validate-sheets.js"
+    "validate": "node utils/validate-sheets.js",
+    "check-env": "node check-env.js"
   },
   "keywords": ["booking", "wellness", "backend"],
   "author": "",
