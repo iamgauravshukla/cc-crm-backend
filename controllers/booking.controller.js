@@ -200,7 +200,8 @@ class BookingController {
         timestamp,                              // 39: dash_booking_created_at
         formattedDate,                          // 40: dash_appointment_date
         bookingData.branch,                     // 41: dash_branch
-        finalStatus                             // 42: dash_booking_status (updated if promo hunter)
+        finalStatus,                            // 42: dash_booking_status (updated if promo hunter)
+        ''                                      // 43: cancellation_time (empty for new bookings)
       ];
       await sheetsService.appendRow('DB', masterDbRow);
 
@@ -516,6 +517,12 @@ class BookingController {
         ? `${bookingData.companionFirstName} ${bookingData.companionLastName}`.toLowerCase()
         : '';
       
+      // Track cancellation time if status is being set to Cancelled
+      let cancellationTime = existingRow[43] || ''; // preserve existing cancellation_time
+      if (bookingData.status && bookingData.status.toLowerCase() === 'cancelled') {
+        cancellationTime = timestamp; // set cancellation time to now if cancelled
+      }
+      
       const updatedDbRow = [
         timestamp,                              // 0: Timestamp (updated)
         bookingData.branch,                     // 1: Branch
@@ -559,7 +566,8 @@ class BookingController {
         existingRow[39] || '',                  // 39: dash_booking_created_at (preserve)
         existingRow[40] || '',                  // 40: dash_appointment_date (preserve)
         bookingData.branch,                     // 41: dash_branch (update to match)
-        bookingData.status || 'Scheduled'       // 42: dash_booking_status (update to match)
+        bookingData.status || 'Scheduled',      // 42: dash_booking_status (update to match)
+        cancellationTime                        // 43: cancellation_time (track when cancelled)
       ];
 
       // Update the row in DB sheet
@@ -574,6 +582,155 @@ class BookingController {
     } catch (error) {
       console.error('Update booking error:', error);
       res.status(500).json({ error: 'Failed to update booking' });
+    }
+  }
+
+  // Get daily reports with 6 sections
+  async getDailyReports(req, res) {
+    try {
+      const dbRows = await sheetsService.readSheet('DB');
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      const nextSevenDaysEnd = new Date(today);
+      nextSevenDaysEnd.setDate(nextSevenDaysEnd.getDate() + 7);
+
+      // Helper to extract date from ISO timestamp
+      const getDateFromTimestamp = (isoString) => {
+        if (!isoString) return null;
+        try {
+          const date = new Date(isoString);
+          // Convert to local date (not UTC)
+          const localDate = new Date(date.getTime() - (date.getTimezoneOffset() * 60000));
+          const localDateOnly = new Date(localDate.toISOString().split('T')[0]);
+          return localDateOnly;
+        } catch (e) {
+          return null;
+        }
+      };
+
+      // Helper to parse date from DB formatted date string
+      const parseBookingDate = (dateStr) => {
+        if (!dateStr) return null;
+        const parsed = parseDateString(dateStr);
+        if (!parsed) return null;
+        const d = new Date(parsed);
+        d.setHours(0, 0, 0, 0);
+        return d;
+      };
+
+      // Helper to check if date falls in range
+      const isToday = (date) => date && date.getTime() === today.getTime();
+      const isTomorrow = (date) => date && date.getTime() === tomorrow.getTime();
+      const isNext7Days = (date) => date && date > today && date <= nextSevenDaysEnd;
+      const isInNext7Days = (date) => date && date >= today && date <= nextSevenDaysEnd;
+
+      // Branches list
+      const branches = ['STA LUCIA', 'FELIZ', 'ESTANCIA', 'Spa', 'Clinic', 'Lab', 
+                       'Dermatology', 'Wellness', 'Med Spa', 'Aesthetic', 'Hydro', 
+                       'Hair Care', 'Anti-Aging', 'Mother Care', 'Other', 
+                       'AI SKIN', 'CENTRIS', 'DNA MANILA', 'GENEVA', 'GLORIETTA', 'HERA',
+                       'LIONESSE', 'LUMIA', 'PARIS', 'SM NORTH', 'VENICE'];
+
+      // Initialize report objects
+      const reports = {
+        otsBookings: { total: 0, revenue: 0, count: 0 },
+        overallBookings: { total: 0, revenue: 0, count: 0, byBranch: {} },
+        bookedTomorrow: { byBranch: {} },
+        bookedNext7Days: { byBranch: {} },
+        cancellations: { total: 0, revenue: 0, count: 0, byBranch: {} },
+        overallBookingsTomorrow: { total: 0, revenue: 0, count: 0 }
+      };
+
+      // Initialize branch-level data
+      branches.forEach(branch => {
+        reports.overallBookings.byBranch[branch] = { count: 0, revenue: 0 };
+        reports.bookedTomorrow.byBranch[branch] = { count: 0, revenue: 0 };
+        reports.bookedNext7Days.byBranch[branch] = { count: 0, revenue: 0 };
+        reports.cancellations.byBranch[branch] = { count: 0, revenue: 0 };
+      });
+
+      // Process each booking row
+      for (let i = 1; i < dbRows.length; i++) {
+        const row = dbRows[i];
+        const timestamp = row[0];
+        const branch = row[1];
+        const status = (row[2] || '').toLowerCase();
+        const bookingDateStr = row[3];
+        const price = parseFloat(row[12]) || 0;
+        const cancellationTime = row[43];
+
+        // Parse booking date from formatted date column
+        const bookingDate = parseBookingDate(bookingDateStr);
+        if (!bookingDate) continue;
+
+        // Extract created date from timestamp (ISO format)
+        const createdDate = getDateFromTimestamp(timestamp);
+        const createdToday = createdDate && createdDate.getTime() === today.getTime();
+
+        // Section 1: OTS Bookings (Created today + Scheduled for today)
+        if (createdToday && isToday(bookingDate) && !status.includes('cancel')) {
+          reports.otsBookings.count++;
+          reports.otsBookings.revenue += price;
+          reports.otsBookings.total++;
+        }
+
+        // Section 2: OVERALL Bookings (Created today + Scheduled for next 7 days, not today)
+        if (createdToday && isNext7Days(bookingDate) && !status.includes('cancel')) {
+          reports.overallBookings.count++;
+          reports.overallBookings.revenue += price;
+          reports.overallBookings.total++;
+          if (reports.overallBookings.byBranch[branch]) {
+            reports.overallBookings.byBranch[branch].count++;
+            reports.overallBookings.byBranch[branch].revenue += price;
+          }
+        }
+
+        // Section 3: Booked Tomorrow per Branch (Created today, scheduled for tomorrow)
+        if (createdToday && isTomorrow(bookingDate) && !status.includes('cancel')) {
+          if (reports.bookedTomorrow.byBranch[branch]) {
+            reports.bookedTomorrow.byBranch[branch].count++;
+            reports.bookedTomorrow.byBranch[branch].revenue += price;
+          }
+        }
+
+        // Section 4: Booked Next 7 Days per Branch (Any bookings next 7 days)
+        if (isInNext7Days(bookingDate) && !status.includes('cancel')) {
+          if (reports.bookedNext7Days.byBranch[branch]) {
+            reports.bookedNext7Days.byBranch[branch].count++;
+            reports.bookedNext7Days.byBranch[branch].revenue += price;
+          }
+        }
+
+        // Section 5: Cancellations per Branch (Created today + Cancelled)
+        if (createdToday && status.includes('cancel') && cancellationTime) {
+          reports.cancellations.count++;
+          reports.cancellations.revenue += price;
+          reports.cancellations.total++;
+          if (reports.cancellations.byBranch[branch]) {
+            reports.cancellations.byBranch[branch].count++;
+            reports.cancellations.byBranch[branch].revenue += price;
+          }
+        }
+
+        // Section 6: Overall Bookings Tomorrow (Scheduled for tomorrow, anytime)
+        if (isTomorrow(bookingDate) && !status.includes('cancel')) {
+          reports.overallBookingsTomorrow.count++;
+          reports.overallBookingsTomorrow.revenue += price;
+          reports.overallBookingsTomorrow.total++;
+        }
+      }
+
+      res.json({
+        success: true,
+        date: today.toISOString().split('T')[0],
+        reports
+      });
+
+    } catch (error) {
+      console.error('Get daily reports error:', error);
+      res.status(500).json({ error: 'Failed to fetch daily reports' });
     }
   }
 }

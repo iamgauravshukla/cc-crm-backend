@@ -8,6 +8,7 @@ router.use(authMiddleware);
 
 // Booking routes
 router.post('/', bookingController.createBooking);
+router.get('/daily-reports', bookingController.getDailyReports);
 router.get('/old', bookingController.getOldBookings);
 router.get('/:id', bookingController.getBookingById);
 router.put('/:id', bookingController.updateBooking);
