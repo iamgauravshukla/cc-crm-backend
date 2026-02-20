@@ -63,9 +63,9 @@ class SheetsService {
         if (sheetName === 'Intake') {
           sheetRange = 'A:AK';
         } 
-        // DB sheet has 43 columns (A-AQ)
+        // DB sheet has 44 columns (A-AR) - includes cancellation_time at column 43
         else if (sheetName === 'DB') {
-          sheetRange = 'A:AQ';
+          sheetRange = 'A:AR';
         } 
         // Default for other sheets
         else {
@@ -73,6 +73,7 @@ class SheetsService {
         }
       }
 
+      console.log(`Reading ${sheetName} sheet with range: ${sheetRange}`);
       const response = await this.sheets.spreadsheets.values.get({
         spreadsheetId: this.spreadsheetId,
         range: `${sheetName}!${sheetRange}`
@@ -112,7 +113,7 @@ class SheetsService {
       if (sheetName === 'Intake') {
         sheetRange = `A${rowIndex}:AK${rowIndex}`;
       } else if (sheetName === 'DB') {
-        sheetRange = `A${rowIndex}:AQ${rowIndex}`;
+        sheetRange = `A${rowIndex}:AR${rowIndex}`;
       } else {
         sheetRange = `A${rowIndex}:Z${rowIndex}`;
       }

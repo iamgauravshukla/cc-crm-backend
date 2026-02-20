@@ -1,28 +1,5 @@
 const sheetsService = require('../services/sheets.service');
-
-// Helper function to parse date strings in format "Jan 25 2026 5:30 PM"
-function parseDateString(dateStr) {
-  if (!dateStr) return null;
-  
-  const monthNames = {
-    jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
-    jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
-  };
-  
-  const dateParts = dateStr.toLowerCase().split(' ');
-  if (dateParts.length >= 3) {
-    const monthStr = dateParts[0].toLowerCase();
-    const day = parseInt(dateParts[1]);
-    const year = parseInt(dateParts[2]);
-    
-    if (monthNames.hasOwnProperty(monthStr) && day && year) {
-      return new Date(year, monthNames[monthStr], day);
-    }
-  }
-  
-  // Fallback: try standard parsing
-  return new Date(dateStr);
-}
+const { parseDateString, parsePrice, mapRowToBooking } = require('../utils/dataParser');
 
 /**
  * Get comprehensive analytics for a specific branch or all branches
@@ -74,7 +51,7 @@ async function getAnalytics(req, res) {
       filteredBookings = allBookings.filter(row => row[1] === branch);
     }
 
-    // Parse bookings with proper structure - CORRECTED COLUMN MAPPING for 43-column DB sheet
+    // Parse bookings with proper structure - CORRECTED COLUMN MAPPING for 44-column DB sheet
     let bookings = filteredBookings.map((row, idx) => {
       // Parse price - remove peso sign and any non-numeric characters except decimal point
       let price = row[12] || '0';
@@ -867,7 +844,7 @@ async function getAdPerformance(req, res) {
       });
     }
 
-    // Parse all bookings from DB sheet (43 columns)
+    // Parse all bookings from DB sheet (44 columns)
     let allBookings = rows.slice(1).map((row) => {
       let price = row[12] || '0';
       if (typeof price === 'string') {
@@ -1038,6 +1015,221 @@ async function getAdPerformance(req, res) {
   }
 }
 
-module.exports = { getAnalytics, getAgentPerformance, getAdPerformance };
+/**
+ * Get comprehensive sales report
+ * Query params:
+ *  - timeRange (optional): "90days", "6months", "1year" (default: "6months")
+ *  - branch (optional): specific branch name or "all" (default: "all")
+ */
+async function getSalesReport(req, res) {
+  try {
+    const timeRange = req.query.timeRange || '6months';
+    const selectedBranch = req.query.branch || 'all';
+    const dbRows = await sheetsService.readSheet('DB');
+
+    if (dbRows.length < 2) {
+      return res.json({
+        success: true,
+        data: {
+          timeRange,
+          branch: selectedBranch,
+          dailySales: { overall: 0, byBranch: [] },
+          firstHalfSales: { overall: 0, byBranch: [] },
+          secondHalfSales: { overall: 0, byBranch: [] },
+          currentMonthSales: { overall: 0, byBranch: [] },
+          lastMonthSales: { overall: 0, byBranch: [] },
+          yearlySales: { overall: 0, monthlyBreakdown: [] },
+          monthlySalesAndBookings: []
+        }
+      });
+    }
+
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const currentMonth = now.getMonth();
+    const currentYear = now.getFullYear();
+
+    // Calculate date range based on timeRange parameter
+    let startDate;
+    switch (timeRange) {
+      case '90days':
+        startDate = new Date(now.getTime() - (90 * 24 * 60 * 60 * 1000));
+        break;
+      case '6months':
+        startDate = new Date(now);
+        startDate.setMonth(startDate.getMonth() - 6);
+        break;
+      case '1year':
+        startDate = new Date(now);
+        startDate.setFullYear(startDate.getFullYear() - 1);
+        break;
+      default:
+        startDate = new Date(now);
+        startDate.setMonth(startDate.getMonth() - 6);
+    }
+
+    // Initialize accumulators
+    let dailySales = { overall: 0, byBranch: {} };
+    let firstHalfSales = { overall: 0, byBranch: {} };
+    let secondHalfSales = { overall: 0, byBranch: {} };
+    let currentMonthSales = { overall: 0, byBranch: {} };
+    let lastMonthSales = { overall: 0, byBranch: {} };
+    let yearlySales = { overall: 0, monthlyBreakdown: {} };
+    let monthlySalesData = {}; // Months within range
+
+    // Process each booking (skip header row)
+    for (let i = 1; i < dbRows.length; i++) {
+      const row = dbRows[i];
+      
+      const branch = row[1];
+      const status = row[2];
+      const dateStr = row[3]; // Date column
+      const price = parsePrice(row[12]); // Total price column M (index 12)
+
+      // Only count ACTUAL SALES: "Arrived & bought" or "Comeback & bought"
+      if (status !== 'Arrived & bought' && status !== 'Comeback & bought') continue;
+
+      // Filter by branch if specified (not "all")
+      if (selectedBranch !== 'all' && branch !== selectedBranch) continue;
+
+      // Parse booking date
+      const bookingDate = parseDateString(dateStr);
+      if (!bookingDate || isNaN(bookingDate.getTime())) continue;
+
+      // Filter by time range
+      if (bookingDate < startDate || bookingDate > now) continue;
+
+      const bookingYear = bookingDate.getFullYear();
+      const bookingMonth = bookingDate.getMonth();
+      const bookingDay = bookingDate.getDate();
+
+      // Daily Sales (today)
+      if (bookingDate >= today && bookingDate < new Date(today.getTime() + 86400000)) {
+        dailySales.overall += price;
+        dailySales.byBranch[branch] = (dailySales.byBranch[branch] || 0) + price;
+      }
+
+      // Current Month Sales
+      if (bookingYear === currentYear && bookingMonth === currentMonth) {
+        currentMonthSales.overall += price;
+        currentMonthSales.byBranch[branch] = (currentMonthSales.byBranch[branch] || 0) + price;
+
+        // First half (1-15)
+        if (bookingDay <= 15) {
+          firstHalfSales.overall += price;
+          firstHalfSales.byBranch[branch] = (firstHalfSales.byBranch[branch] || 0) + price;
+        }
+        // Second half (16-31)
+        else {
+          secondHalfSales.overall += price;
+          secondHalfSales.byBranch[branch] = (secondHalfSales.byBranch[branch] || 0) + price;
+        }
+      }
+
+      // Last Month Sales
+      const lastMonth = currentMonth === 0 ? 11 : currentMonth - 1;
+      const lastMonthYear = currentMonth === 0 ? currentYear - 1 : currentYear;
+      if (bookingYear === lastMonthYear && bookingMonth === lastMonth) {
+        lastMonthSales.overall += price;
+        lastMonthSales.byBranch[branch] = (lastMonthSales.byBranch[branch] || 0) + price;
+      }
+
+      // Yearly Sales (current year)
+      if (bookingYear === currentYear) {
+        yearlySales.overall += price;
+        const monthKey = bookingMonth;
+        if (!yearlySales.monthlyBreakdown[monthKey]) {
+          yearlySales.monthlyBreakdown[monthKey] = { sales: 0, bookings: 0 };
+        }
+        yearlySales.monthlyBreakdown[monthKey].sales += price;
+        yearlySales.monthlyBreakdown[monthKey].bookings += 1;
+      }
+
+      // Monthly Sales & Bookings (within time range)
+      const monthYearKey = `${bookingYear}-${bookingMonth}`;
+      if (!monthlySalesData[monthYearKey]) {
+        monthlySalesData[monthYearKey] = { year: bookingYear, month: bookingMonth, sales: 0, bookings: 0 };
+      }
+      monthlySalesData[monthYearKey].sales += price;
+      monthlySalesData[monthYearKey].bookings += 1;
+    }
+
+    // Format byBranch data
+    const formatBranchData = (branchObj) => {
+      return Object.keys(branchObj).map(branch => ({
+        branch,
+        sales: Math.round(branchObj[branch] * 100) / 100
+      })).sort((a, b) => b.sales - a.sales);
+    };
+
+    // Format monthly breakdown for yearly sales
+    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const monthlyBreakdownArray = [];
+    for (let i = 0; i < 12; i++) {
+      const data = yearlySales.monthlyBreakdown[i] || { sales: 0, bookings: 0 };
+      monthlyBreakdownArray.push({
+        month: monthNames[i],
+        sales: Math.round(data.sales * 100) / 100,
+        bookings: data.bookings
+      });
+    }
+
+    // Format last 12 months data (or within time range)
+    const monthlySalesArray = [];
+    const monthsToShow = timeRange === '90days' ? 3 : (timeRange === '6months' ? 6 : 12);
+    for (let i = monthsToShow - 1; i >= 0; i--) {
+      const targetDate = new Date(currentYear, currentMonth - i, 1);
+      const targetYear = targetDate.getFullYear();
+      const targetMonth = targetDate.getMonth();
+      const key = `${targetYear}-${targetMonth}`;
+      
+      const data = monthlySalesData[key] || { sales: 0, bookings: 0 };
+      monthlySalesArray.push({
+        month: `${monthNames[targetMonth]} ${targetYear}`,
+        sales: Math.round(data.sales * 100) / 100,
+        bookings: data.bookings
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        timeRange,
+        branch: selectedBranch,
+        dailySales: {
+          overall: Math.round(dailySales.overall * 100) / 100,
+          byBranch: formatBranchData(dailySales.byBranch)
+        },
+        firstHalfSales: {
+          overall: Math.round(firstHalfSales.overall * 100) / 100,
+          byBranch: formatBranchData(firstHalfSales.byBranch)
+        },
+        secondHalfSales: {
+          overall: Math.round(secondHalfSales.overall * 100) / 100,
+          byBranch: formatBranchData(secondHalfSales.byBranch)
+        },
+        currentMonthSales: {
+          overall: Math.round(currentMonthSales.overall * 100) / 100,
+          byBranch: formatBranchData(currentMonthSales.byBranch)
+        },
+        lastMonthSales: {
+          overall: Math.round(lastMonthSales.overall * 100) / 100,
+          byBranch: formatBranchData(lastMonthSales.byBranch)
+        },
+        yearlySales: {
+          overall: Math.round(yearlySales.overall * 100) / 100,
+          monthlyBreakdown: monthlyBreakdownArray
+        },
+        monthlySalesAndBookings: monthlySalesArray
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching sales report:', error);
+    res.status(500).json({ error: 'Failed to fetch sales report data' });
+  }
+}
+
+module.exports = { getAnalytics, getAgentPerformance, getAdPerformance, getSalesReport };
 
 

@@ -9,10 +9,15 @@
     "validate": "node utils/validate-sheets.js",
     "check-env": "node check-env.js"
   },
-  "keywords": ["booking", "wellness", "backend"],
+  "keywords": [
+    "booking",
+    "wellness",
+    "backend"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "axios": "^1.13.5",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
