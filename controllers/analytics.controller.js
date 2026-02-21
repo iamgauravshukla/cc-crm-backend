@@ -1018,13 +1018,17 @@ async function getAdPerformance(req, res) {
 /**
  * Get comprehensive sales report
  * Query params:
- *  - timeRange (optional): "90days", "6months", "1year" (default: "6months")
+ *  - startDate (optional): YYYY-MM-DD (requires endDate)
+ *  - endDate (optional): YYYY-MM-DD (requires startDate)
+ *  - timeRange (optional): "30days", "60days", "90days", "6months", "1year" (default: "6months")
  *  - branch (optional): specific branch name or "all" (default: "all")
  */
 async function getSalesReport(req, res) {
   try {
-    const timeRange = req.query.timeRange || '6months';
+    let timeRange = req.query.timeRange || '6months';
     const selectedBranch = req.query.branch || 'all';
+    const startDateParam = req.query.startDate;
+    const endDateParam = req.query.endDate;
     const dbRows = await sheetsService.readSheet('DB');
 
     if (dbRows.length < 2) {
@@ -1033,6 +1037,11 @@ async function getSalesReport(req, res) {
         data: {
           timeRange,
           branch: selectedBranch,
+          rangeSales: { overall: 0, byBranch: [] },
+          previousRangeSales: { overall: 0, byBranch: [] },
+          rangeFirstHalfSales: { overall: 0, byBranch: [] },
+          rangeSecondHalfSales: { overall: 0, byBranch: [] },
+          dailySalesAndBookings: [],
           dailySales: { overall: 0, byBranch: [] },
           firstHalfSales: { overall: 0, byBranch: [] },
           secondHalfSales: { overall: 0, byBranch: [] },
@@ -1049,33 +1058,76 @@ async function getSalesReport(req, res) {
     const currentMonth = now.getMonth();
     const currentYear = now.getFullYear();
 
-    // Calculate date range based on timeRange parameter
+    // Calculate date range based on start/end dates or timeRange parameter
     let startDate;
-    switch (timeRange) {
-      case '90days':
-        startDate = new Date(now.getTime() - (90 * 24 * 60 * 60 * 1000));
-        break;
-      case '6months':
-        startDate = new Date(now);
-        startDate.setMonth(startDate.getMonth() - 6);
-        break;
-      case '1year':
-        startDate = new Date(now);
-        startDate.setFullYear(startDate.getFullYear() - 1);
-        break;
-      default:
-        startDate = new Date(now);
-        startDate.setMonth(startDate.getMonth() - 6);
+    let endDate = now;
+
+    if (startDateParam && endDateParam) {
+      const parsedStart = new Date(startDateParam);
+      const parsedEnd = new Date(endDateParam);
+      if (!isNaN(parsedStart.getTime()) && !isNaN(parsedEnd.getTime())) {
+        startDate = parsedStart;
+        endDate = parsedEnd;
+        startDate.setHours(0, 0, 0, 0);
+        endDate.setHours(23, 59, 59, 999);
+        timeRange = 'custom';
+      }
     }
+
+    if (!startDate) {
+      switch (timeRange) {
+        case '30days':
+          startDate = new Date(now);
+          startDate.setDate(startDate.getDate() - 30);
+          break;
+        case '60days':
+          startDate = new Date(now);
+          startDate.setDate(startDate.getDate() - 60);
+          break;
+        case 'thisMonth':
+          startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+          break;
+        case '90days':
+          startDate = new Date(now.getTime() - (90 * 24 * 60 * 60 * 1000));
+          break;
+        case '6months':
+          startDate = new Date(now);
+          startDate.setMonth(startDate.getMonth() - 6);
+          break;
+        case '1year':
+          startDate = new Date(now);
+          startDate.setFullYear(startDate.getFullYear() - 1);
+          break;
+        default:
+              startDate = new Date(now);
+          startDate.setMonth(startDate.getMonth() - 6);
+      }
+    }
+
+            startDate.setHours(0, 0, 0, 0);
+
+            const rangeDurationMs = endDate.getTime() - startDate.getTime();
+            const previousRangeEnd = new Date(startDate.getTime() - 1);
+            const previousRangeStart = new Date(previousRangeEnd.getTime() - rangeDurationMs);
+            const rangeMidpoint = new Date(startDate.getTime() + Math.floor(rangeDurationMs / 2));
 
     // Initialize accumulators
     let dailySales = { overall: 0, byBranch: {} };
     let firstHalfSales = { overall: 0, byBranch: {} };
     let secondHalfSales = { overall: 0, byBranch: {} };
+    let rangeSales = { overall: 0, byBranch: {} };
+    let previousRangeSales = { overall: 0, byBranch: {} };
     let currentMonthSales = { overall: 0, byBranch: {} };
     let lastMonthSales = { overall: 0, byBranch: {} };
     let yearlySales = { overall: 0, monthlyBreakdown: {} };
     let monthlySalesData = {}; // Months within range
+    let dailySalesData = {}; // Days within range
+    const formatDateKey = (date) => {
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    };
 
     // Process each booking (skip header row)
     for (let i = 1; i < dbRows.length; i++) {
@@ -1096,8 +1148,19 @@ async function getSalesReport(req, res) {
       const bookingDate = parseDateString(dateStr);
       if (!bookingDate || isNaN(bookingDate.getTime())) continue;
 
+      // Range sales totals
+      if (bookingDate >= startDate && bookingDate <= endDate) {
+        rangeSales.overall += price;
+        rangeSales.byBranch[branch] = (rangeSales.byBranch[branch] || 0) + price;
+      }
+
+      if (bookingDate >= previousRangeStart && bookingDate <= previousRangeEnd) {
+        previousRangeSales.overall += price;
+        previousRangeSales.byBranch[branch] = (previousRangeSales.byBranch[branch] || 0) + price;
+      }
+
       // Filter by time range
-      if (bookingDate < startDate || bookingDate > now) continue;
+      if (bookingDate < startDate || bookingDate > endDate) continue;
 
       const bookingYear = bookingDate.getFullYear();
       const bookingMonth = bookingDate.getMonth();
@@ -1109,21 +1172,13 @@ async function getSalesReport(req, res) {
         dailySales.byBranch[branch] = (dailySales.byBranch[branch] || 0) + price;
       }
 
-      // Current Month Sales
-      if (bookingYear === currentYear && bookingMonth === currentMonth) {
-        currentMonthSales.overall += price;
-        currentMonthSales.byBranch[branch] = (currentMonthSales.byBranch[branch] || 0) + price;
-
-        // First half (1-15)
-        if (bookingDay <= 15) {
-          firstHalfSales.overall += price;
-          firstHalfSales.byBranch[branch] = (firstHalfSales.byBranch[branch] || 0) + price;
-        }
-        // Second half (16-31)
-        else {
-          secondHalfSales.overall += price;
-          secondHalfSales.byBranch[branch] = (secondHalfSales.byBranch[branch] || 0) + price;
-        }
+      // Range split (first half / second half)
+      if (bookingDate <= rangeMidpoint) {
+        firstHalfSales.overall += price;
+        firstHalfSales.byBranch[branch] = (firstHalfSales.byBranch[branch] || 0) + price;
+      } else {
+        secondHalfSales.overall += price;
+        secondHalfSales.byBranch[branch] = (secondHalfSales.byBranch[branch] || 0) + price;
       }
 
       // Last Month Sales
@@ -1152,6 +1207,14 @@ async function getSalesReport(req, res) {
       }
       monthlySalesData[monthYearKey].sales += price;
       monthlySalesData[monthYearKey].bookings += 1;
+
+      // Daily Sales & Bookings (within time range)
+      const dayKey = formatDateKey(bookingDate);
+      if (!dailySalesData[dayKey]) {
+        dailySalesData[dayKey] = { date: dayKey, sales: 0, bookings: 0 };
+      }
+      dailySalesData[dayKey].sales += price;
+      dailySalesData[dayKey].bookings += 1;
     }
 
     // Format byBranch data
@@ -1174,21 +1237,40 @@ async function getSalesReport(req, res) {
       });
     }
 
-    // Format last 12 months data (or within time range)
+    // Format monthly data across selected range
     const monthlySalesArray = [];
-    const monthsToShow = timeRange === '90days' ? 3 : (timeRange === '6months' ? 6 : 12);
-    for (let i = monthsToShow - 1; i >= 0; i--) {
-      const targetDate = new Date(currentYear, currentMonth - i, 1);
-      const targetYear = targetDate.getFullYear();
-      const targetMonth = targetDate.getMonth();
+    const rangeMonthStart = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
+    const rangeMonthEnd = new Date(endDate.getFullYear(), endDate.getMonth(), 1);
+    const cursor = new Date(rangeMonthStart);
+
+    while (cursor <= rangeMonthEnd) {
+      const targetYear = cursor.getFullYear();
+      const targetMonth = cursor.getMonth();
       const key = `${targetYear}-${targetMonth}`;
-      
       const data = monthlySalesData[key] || { sales: 0, bookings: 0 };
+
       monthlySalesArray.push({
         month: `${monthNames[targetMonth]} ${targetYear}`,
         sales: Math.round(data.sales * 100) / 100,
         bookings: data.bookings
       });
+
+      cursor.setMonth(cursor.getMonth() + 1);
+    }
+
+    // Format daily data across selected range
+    const dailySalesArray = [];
+    const dayCursor = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+    const dayEnd = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
+    while (dayCursor <= dayEnd) {
+      const key = formatDateKey(dayCursor);
+      const data = dailySalesData[key] || { date: key, sales: 0, bookings: 0 };
+      dailySalesArray.push({
+        date: data.date,
+        sales: Math.round(data.sales * 100) / 100,
+        bookings: data.bookings
+      });
+      dayCursor.setDate(dayCursor.getDate() + 1);
     }
 
     res.json({
@@ -1196,17 +1278,26 @@ async function getSalesReport(req, res) {
       data: {
         timeRange,
         branch: selectedBranch,
-        dailySales: {
-          overall: Math.round(dailySales.overall * 100) / 100,
-          byBranch: formatBranchData(dailySales.byBranch)
+        rangeSales: {
+          overall: Math.round(rangeSales.overall * 100) / 100,
+          byBranch: formatBranchData(rangeSales.byBranch)
         },
-        firstHalfSales: {
+        previousRangeSales: {
+          overall: Math.round(previousRangeSales.overall * 100) / 100,
+          byBranch: formatBranchData(previousRangeSales.byBranch)
+        },
+        rangeFirstHalfSales: {
           overall: Math.round(firstHalfSales.overall * 100) / 100,
           byBranch: formatBranchData(firstHalfSales.byBranch)
         },
-        secondHalfSales: {
+        rangeSecondHalfSales: {
           overall: Math.round(secondHalfSales.overall * 100) / 100,
           byBranch: formatBranchData(secondHalfSales.byBranch)
+        },
+        dailySalesAndBookings: dailySalesArray,
+        dailySales: {
+          overall: Math.round(dailySales.overall * 100) / 100,
+          byBranch: formatBranchData(dailySales.byBranch)
         },
         currentMonthSales: {
           overall: Math.round(currentMonthSales.overall * 100) / 100,
