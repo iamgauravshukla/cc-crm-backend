@@ -1037,6 +1037,10 @@ async function getSalesReport(req, res) {
         data: {
           timeRange,
           branch: selectedBranch,
+          arrivalRate: 0,
+          totalArrivals: 0,
+          totalBookings: 0,
+          arrivalRateByBranch: [],
           rangeSales: { overall: 0, byBranch: [] },
           previousRangeSales: { overall: 0, byBranch: [] },
           rangeFirstHalfSales: { overall: 0, byBranch: [] },
@@ -1122,6 +1126,15 @@ async function getSalesReport(req, res) {
     let yearlySales = { overall: 0, monthlyBreakdown: {} };
     let monthlySalesData = {}; // Months within range
     let dailySalesData = {}; // Days within range
+    let totalArrivals = 0;
+    let totalBookings = 0;
+    let arrivalsByBranch = {};
+    let bookingsByBranch = {};
+    const arrivalStatuses = new Set([
+      'Arrived not potential',
+      'Arrived & bought',
+      'Comeback & bought'
+    ]);
     const formatDateKey = (date) => {
       const year = date.getFullYear();
       const month = String(date.getMonth() + 1).padStart(2, '0');
@@ -1138,15 +1151,24 @@ async function getSalesReport(req, res) {
       const dateStr = row[3]; // Date column
       const price = parsePrice(row[12]); // Total price column M (index 12)
 
-      // Only count ACTUAL SALES: "Arrived & bought" or "Comeback & bought"
-      if (status !== 'Arrived & bought' && status !== 'Comeback & bought') continue;
-
       // Filter by branch if specified (not "all")
       if (selectedBranch !== 'all' && branch !== selectedBranch) continue;
 
       // Parse booking date
       const bookingDate = parseDateString(dateStr);
       if (!bookingDate || isNaN(bookingDate.getTime())) continue;
+
+      if (bookingDate >= startDate && bookingDate <= endDate) {
+        totalBookings += 1;
+        bookingsByBranch[branch] = (bookingsByBranch[branch] || 0) + 1;
+        if (arrivalStatuses.has(status)) {
+          totalArrivals += 1;
+          arrivalsByBranch[branch] = (arrivalsByBranch[branch] || 0) + 1;
+        }
+      }
+
+      // Only count ACTUAL SALES: "Arrived & bought" or "Comeback & bought"
+      if (status !== 'Arrived & bought' && status !== 'Comeback & bought') continue;
 
       // Range sales totals
       if (bookingDate >= startDate && bookingDate <= endDate) {
@@ -1278,6 +1300,19 @@ async function getSalesReport(req, res) {
       data: {
         timeRange,
         branch: selectedBranch,
+        arrivalRate: totalBookings > 0 ? Math.round((totalArrivals / totalBookings) * 10000) / 100 : 0,
+        totalArrivals,
+        totalBookings,
+        arrivalRateByBranch: Object.keys(bookingsByBranch).map((branch) => {
+          const bookings = bookingsByBranch[branch] || 0;
+          const arrivals = arrivalsByBranch[branch] || 0;
+          return {
+            branch,
+            bookings,
+            arrivals,
+            arrivalRate: bookings > 0 ? Math.round((arrivals / bookings) * 10000) / 100 : 0
+          };
+        }).sort((a, b) => b.arrivalRate - a.arrivalRate),
         rangeSales: {
           overall: Math.round(rangeSales.overall * 100) / 100,
           byBranch: formatBranchData(rangeSales.byBranch)
