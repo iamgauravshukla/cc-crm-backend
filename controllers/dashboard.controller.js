@@ -57,6 +57,7 @@ async function getDashboardOverview(req, res) {
         companionFreebie: row[20] || '',
         companionTreatment: row[21] || '',
         companionGender: row[22] || '',
+        companionPhone: row[25] || '',
         bookingDetails: row[23] || '',
         agent: row[24] || '',
         promoHunterStatus: row[30] || '',
@@ -196,6 +197,10 @@ async function getDashboardOverview(req, res) {
       newCustomers: newCustomers.length
     };
 
+    // Prevent caching to ensure fresh data on each request
+    res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
 
     res.json({
       success: true,
@@ -218,10 +223,11 @@ async function getDashboardOverview(req, res) {
           agent: b.agent,
           bookingDetails: b.bookingDetails,
           companionName: b.companionFirstName && b.companionLastName ? `${b.companionFirstName} ${b.companionLastName}` : '',
+          companionPhone: b.companionPhone || '',
           companionAge: b.companionAge || '',
           companionGender: b.companionGender || '',
           companionFreebie: b.companionFreebie || '',
-          companionTreatment: b.companionTreatment,
+          companionTreatment: b.companionTreatment || '',
           status: b.status,
           promoHunterStatus: b.promoHunterStatus,
           matchReason: b.matchReason,
@@ -413,7 +419,11 @@ async function getBookingTrend(req, res) {
 
     const bookingCounts = Object.values(dateBuckets);
 
-   
+    // Prevent caching to ensure fresh data on each request
+    res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+
     res.json({
       success: true,
       data: {
