@@ -7,6 +7,21 @@ const { parseDateString, parsePrice, mapRowToBooking } = require('../utils/dataP
 // Cache with 5 minute TTL
 const cache = new NodeCache({ stdTTL: 300 });
 
+// Helper function to format current timestamp as "Feb 21 2026 10:53 AM"
+const getCurrentTimestamp = () => {
+  const now = new Date();
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const monthName = months[now.getMonth()];
+  const day = now.getDate();
+  const year = now.getFullYear();
+  const hours = now.getHours();
+  const minutes = now.getMinutes().toString().padStart(2, '0');
+  const displayHours = hours % 12 || 12;
+  const ampm = hours >= 12 ? 'PM' : 'AM';
+  
+  return `${monthName} ${day} ${year} ${displayHours}:${minutes} ${ampm}`;
+};
+
 // Validation schema for booking creation
 const bookingSchema = Joi.object({
   branch: Joi.string().required(),
@@ -50,24 +65,28 @@ class BookingController {
 
       // Generate booking ID and timestamp
       const bookingId = uuidv4();
-      const timestamp = new Date().toISOString();
+      const timestamp = getCurrentTimestamp();
 
-      // Format date to match "Jan 22 2026 6:35 PM" format
-      const formatDateTime = (dateStr) => {
-        const date = new Date(dateStr);
-        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-        const month = months[date.getMonth()];
-        const day = date.getDate();
-        const year = date.getFullYear();
-        const hours = date.getHours();
-        const minutes = date.getMinutes().toString().padStart(2, '0');
-        const ampm = hours >= 12 ? 'PM' : 'AM';
-        const displayHours = hours % 12 || 12;
+      // Format date and time to match "Feb 25 2026 12:00 AM" format
+      const formatDateTime = (dateStr, timeStr) => {
+        // dateStr is in format "YYYY-MM-DD" (from date input)
+        // timeStr is in format "HH:MM" (from time input)
+        const [year, month, day] = dateStr.split('-');
+        const [hours, minutes] = timeStr ? timeStr.split(':') : ['00', '00'];
         
-        return `${month} ${day} ${year} ${displayHours}:${minutes} ${ampm}`;
+        const date = new Date(year, parseInt(month) - 1, day, hours, minutes);
+        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        const monthName = months[date.getMonth()];
+        const dayNum = date.getDate();
+        const yearNum = date.getFullYear();
+        const displayHours = parseInt(hours) % 12 || 12;
+        const minutesStr = minutes.toString().padStart(2, '0');
+        const ampm = parseInt(hours) >= 12 ? 'PM' : 'AM';
+        
+        return `${monthName} ${dayNum} ${yearNum} ${displayHours}:${minutesStr} ${ampm}`;
       };
       
-      const formattedDate = formatDateTime(bookingData.date);
+      const formattedDate = formatDateTime(bookingData.date, bookingData.time);
 
       // Get client IP
       const customerIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
@@ -78,6 +97,7 @@ class BookingController {
         bookingData.lastName,
         bookingData.email,
         bookingData.phone,
+        bookingData.socialMedia,
         bookingData.companionFirstName,
         bookingData.companionLastName
       );
@@ -208,9 +228,16 @@ class BookingController {
       const branch = req.query.branch || '';
       const status = req.query.status || '';
       const sortOrder = req.query.sortOrder || 'newest'; // 'newest' or 'oldest'
-      const dateRange = req.query.dateRange;
-      const startDate = req.query.startDate;
-      const endDate = req.query.endDate;
+      
+      // Booking Created Date filters (timestamp based)
+      const createdDateRange = req.query.createdDateRange;
+      const createdStartDate = req.query.createdStartDate;
+      const createdEndDate = req.query.createdEndDate;
+      
+      // Appointment Date filters (scheduled date based)
+      const appointmentDateRange = req.query.appointmentDateRange;
+      const appointmentStartDate = req.query.appointmentStartDate;
+      const appointmentEndDate = req.query.appointmentEndDate;
       
       // Try to get from cache
       let allBookings = cache.get('old_bookings_all');
@@ -276,82 +303,113 @@ class BookingController {
         cache.set('old_bookings_all', allBookings);
       }
 
-      // Filter by branch
-      let filteredBookings = allBookings;
-      if (branch && branch !== 'All') {
-        filteredBookings = filteredBookings.filter(booking => 
-          booking.branch === branch
-        );
+      // Pre-calculate all date boundaries once (outside the filter loop for performance)
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      
+      // Helper function to safely parse dates with caching
+      const parseDate = (dateStr, isTimestamp = false) => {
+        if (!dateStr) return null;
+        try {
+          return parseDateString(dateStr);
+        } catch {
+          return null;
+        }
+      };
+      
+      // Pre-calculate created date filter boundaries
+      let createdDateStart = null;
+      let createdDateEnd = null;
+      let applyCreatedFilter = false;
+      
+      if (createdStartDate && createdEndDate) {
+        createdDateStart = new Date(createdStartDate);
+        createdDateStart.setHours(0, 0, 0, 0);
+        createdDateEnd = new Date(createdEndDate);
+        createdDateEnd.setHours(23, 59, 59, 999);
+        applyCreatedFilter = true;
+      } else if (createdDateRange && createdDateRange !== 'all') {
+        applyCreatedFilter = true;
+        if (createdDateRange === 'today') {
+          createdDateStart = today;
+          createdDateEnd = tomorrow;
+        } else if (createdDateRange === 'last7' || createdDateRange === 'last30' || createdDateRange === 'last90') {
+          let days = createdDateRange === 'last7' ? 7 : createdDateRange === 'last30' ? 30 : 90;
+          createdDateStart = new Date(today);
+          createdDateStart.setDate(createdDateStart.getDate() - days);
+          createdDateEnd = tomorrow;
+        }
       }
-
-      // Filter by status
-      if (status && status !== 'All') {
-        filteredBookings = filteredBookings.filter(booking => 
-          booking.status === status
-        );
+      
+      // Pre-calculate appointment date filter boundaries
+      let appointmentDateStart = null;
+      let appointmentDateEnd = null;
+      let applyAppointmentFilter = false;
+      
+      if (appointmentStartDate && appointmentEndDate) {
+        appointmentDateStart = new Date(appointmentStartDate);
+        appointmentDateStart.setHours(0, 0, 0, 0);
+        appointmentDateEnd = new Date(appointmentEndDate);
+        appointmentDateEnd.setHours(23, 59, 59, 999);
+        applyAppointmentFilter = true;
+      } else if (appointmentDateRange && appointmentDateRange !== 'all') {
+        applyAppointmentFilter = true;
+        if (appointmentDateRange === 'today') {
+          appointmentDateStart = today;
+          appointmentDateEnd = tomorrow;
+        } else if (appointmentDateRange === 'tomorrow') {
+          appointmentDateStart = tomorrow;
+          const dayAfterTomorrow = new Date(tomorrow);
+          dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 1);
+          appointmentDateEnd = dayAfterTomorrow;
+        } else if (appointmentDateRange === 'thisWeek') {
+          appointmentDateStart = today;
+          const endOfWeek = new Date(today);
+          endOfWeek.setDate(endOfWeek.getDate() + (6 - today.getDay())); // Days until Sunday
+          endOfWeek.setHours(23, 59, 59, 999);
+          appointmentDateEnd = endOfWeek;
+        }
       }
-
-      // Filter by date range
-      if (startDate && endDate) {
-        const start = new Date(startDate);
-        start.setHours(0, 0, 0, 0);
-        const end = new Date(endDate);
-        end.setHours(23, 59, 59, 999);
-        
-        filteredBookings = filteredBookings.filter(booking => {
-          if (!booking.date) return false;
-          try {
-            const bookingDate = parseDateString(booking.date);
-            if (bookingDate && !isNaN(bookingDate.getTime())) {
-              return bookingDate >= start && bookingDate <= end;
-            }
-            return false;
-          } catch {
-            return false;
-          }
-        });
-      } else if (dateRange && dateRange !== 'all') {
-        const now = new Date();
-        now.setHours(0, 0, 0, 0);
-        let cutoffDate = new Date(now);
-        
-        switch(dateRange) {
-          case 'today':
-            // Already set to start of today
-            break;
-          case 'yesterday':
-            cutoffDate.setDate(cutoffDate.getDate() - 1);
-            break;
-          case '7':
-            cutoffDate.setDate(cutoffDate.getDate() - 7);
-            break;
-          case '30':
-            cutoffDate.setDate(cutoffDate.getDate() - 30);
-            break;
-          case '90':
-            cutoffDate.setDate(cutoffDate.getDate() - 90);
-            break;
+      
+      const searchLower = search ? search.toLowerCase() : null;
+      
+      // Single-pass filtering for performance
+      let filteredBookings = allBookings.filter(booking => {
+        // Branch filter
+        if (branch && branch !== 'All' && booking.branch !== branch) {
+          return false;
         }
         
-        filteredBookings = filteredBookings.filter(booking => {
-          if (!booking.date) return false;
-          try {
-            const bookingDate = parseDateString(booking.date);
-            if (bookingDate && !isNaN(bookingDate.getTime())) {
-              return bookingDate >= cutoffDate;
+        // Status filter
+        if (status && status !== 'All' && booking.status !== status) {
+          return false;
+        }
+        
+        // Created date filter
+        if (applyCreatedFilter) {
+          const createdDate = parseDate(booking.timestamp, true);
+          if (createdDate && !isNaN(createdDate.getTime())) {
+            if (createdDate < createdDateStart || createdDate >= createdDateEnd) {
+              return false;
             }
-            return false;
-          } catch {
-            return false;
           }
-        });
-      }
-
-      // Filter by search query
-      if (search) {
-        const searchLower = search.toLowerCase();
-        filteredBookings = filteredBookings.filter(booking => {
-          return (
+        }
+        
+        // Appointment date filter
+        if (applyAppointmentFilter) {
+          const appointmentDate = parseDate(booking.date, false);
+          if (appointmentDate && !isNaN(appointmentDate.getTime())) {
+            if (appointmentDate < appointmentDateStart || appointmentDate > appointmentDateEnd) {
+              return false;
+            }
+          }
+        }
+        
+        // Search filter
+        if (searchLower) {
+          const searchMatch = (
             booking.firstName.toLowerCase().includes(searchLower) ||
             booking.lastName.toLowerCase().includes(searchLower) ||
             booking.email.toLowerCase().includes(searchLower) ||
@@ -360,8 +418,13 @@ class BookingController {
             booking.treatment.toLowerCase().includes(searchLower) ||
             booking.branch.toLowerCase().includes(searchLower)
           );
-        });
-      }
+          if (!searchMatch) {
+            return false;
+          }
+        }
+        
+        return true;
+      });
 
       // Sort bookings based on sortOrder
       // Sheet is in chronological order (oldest first), so:
@@ -459,10 +522,24 @@ class BookingController {
     try {
       const { id: rowNumber } = req.params;
       const bookingData = req.body;
+      const user = req.user; // Set by auth middleware
 
       console.log('========== UPDATE BOOKING START ==========');
       console.log('Updating booking at row number:', rowNumber);
+      console.log('User:', user?.name, 'Role:', user?.role);
       console.log('Booking data:', JSON.stringify(bookingData, null, 2));
+
+      // Role-based access control for sensitive fields
+      if (user?.role !== 'Admin') {
+        // Agents cannot modify status or agent fields
+        if (bookingData.status !== undefined || bookingData.agent !== undefined) {
+          console.warn(`⚠️ Agent ${user?.name} attempted to modify restricted fields (status/agent)`);
+          return res.status(403).json({ 
+            error: 'Agents cannot modify booking status or agent assignment',
+            code: 'RESTRICTED_FIELDS'
+          });
+        }
+      }
 
       // Read DB sheet to find the row
       const dbRows = await sheetsService.readSheet('DB');
@@ -550,7 +627,7 @@ class BookingController {
       });
 
       // Prepare updated row for DB sheet (44 columns total, indices 0-43)
-      const timestamp = new Date().toISOString();
+      const timestamp = getCurrentTimestamp();
       
       // Handle dateTime - if provided, use it; otherwise preserve existing
       const dateTimeValue = bookingData.dateTime || existingRow[3] || '';
@@ -1246,8 +1323,8 @@ class BookingController {
   }
 }
 
-// Helper function to check for promo hunter by matching name, email, phone, or companion name
-async function checkPromoHunter(firstName, lastName, email, phone, companionFirstName, companionLastName) {
+// Helper function to check for promo hunter by matching name, email, phone, social media, or companion name
+async function checkPromoHunter(firstName, lastName, email, phone, socialMedia, companionFirstName, companionLastName) {
   try {
     const dbRows = await sheetsService.readSheet('DB');
     
@@ -1262,7 +1339,8 @@ async function checkPromoHunter(firstName, lastName, email, phone, companionFirs
 
     const fullName = `${firstName} ${lastName}`.toLowerCase().trim();
     const normalizedEmail = (email || '').toLowerCase().trim();
-    const normalizedPhone = (phone || '').replace(/\D/g, ''); // Remove non-digits
+    const normalizedPhone = (phone || '').replace(/\D/g, '').trim(); // Remove non-digits
+    const normalizedSocialMedia = (socialMedia || '').toLowerCase().trim();
     const companionFullName = companionFirstName && companionLastName 
       ? `${companionFirstName} ${companionLastName}`.toLowerCase().trim() 
       : '';
@@ -1278,7 +1356,8 @@ async function checkPromoHunter(firstName, lastName, email, phone, companionFirs
       const existingFirstName = (row[4] || '').toLowerCase().trim();
       const existingLastName = (row[5] || '').toLowerCase().trim();
       const existingEmail = (row[16] || '').toLowerCase().trim();
-      const existingPhone = (row[14] || '').replace(/\D/g, '');
+      const existingPhone = (row[14] || '').replace(/\D/g, '').trim();
+      const existingSocialMedia = (row[15] || '').toLowerCase().trim();
       const existingCompanionFirstName = (row[20] || '').toLowerCase().trim();
       const existingCompanionLastName = (row[21] || '').toLowerCase().trim();
 
@@ -1303,6 +1382,11 @@ async function checkPromoHunter(firstName, lastName, email, phone, companionFirs
       // Match by phone
       else if (normalizedPhone && existingPhone && existingPhone === normalizedPhone) {
         matchReason = 'Phone Match';
+        matchedAs = 'customer';
+      }
+      // Match by social media (Facebook / Instagram Name)
+      else if (normalizedSocialMedia && existingSocialMedia && existingSocialMedia === normalizedSocialMedia) {
+        matchReason = 'Social Media Match';
         matchedAs = 'customer';
       }
       // Match by companion name (current customer was a companion before)
@@ -1335,17 +1419,15 @@ async function checkPromoHunter(firstName, lastName, email, phone, companionFirs
       status = 'Promo hunter'; // Has previous booking(s)
     }
 
-    // Return detailed match information
+    // Return detailed match information from FIRST match only (most recent booking)
     if (matches.length > 0) {
       const firstMatch = matches[0];
-      const allReasons = matches.map(m => m.reason).join(', ');
-      const allRows = matches.map(m => `Row ${m.rowNumber}`).join(', ');
       
       return {
         status,
-        matchReason: allReasons,
-        matchedSource: matches.map(m => `${m.source} (${m.branch})`).join(', '),
-        matchedRow: allRows,
+        matchReason: firstMatch.reason,
+        matchedSource: `${firstMatch.source} (${firstMatch.branch})`,
+        matchedRow: `Row ${firstMatch.rowNumber}`,
         matchCount: matches.length
       };
     }
