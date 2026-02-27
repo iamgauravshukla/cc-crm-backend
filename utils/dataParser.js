@@ -6,6 +6,7 @@
  * Parse date strings in multiple formats:
  * - M/D/YYYY format (e.g., "2/20/2026")
  * - "Jan 25 2026" format
+ * - "Feb 25 2026 3:59 AM" format (with time)
  * - ISO format (2026-02-19)
  * - Standard date parsing fallback
  */
@@ -19,14 +20,41 @@ function parseDateString(dateStr) {
     return new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
   }
   
-  // Try "Jan 25 2026" format
+  // Try "Feb 25 2026 3:59 AM" format (with time and AM/PM)
+  const monthNameWithTimePattern = /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(\d{4})\s+(\d{1,2}):(\d{2})\s+(AM|PM)$/i;
+  const timeMatch = dateStr.match(monthNameWithTimePattern);
+  
+  if (timeMatch) {
+    const monthMap = {
+      jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+      jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
+    };
+    
+    const month = monthMap[timeMatch[1].toLowerCase()];
+    const day = parseInt(timeMatch[2]);
+    const year = parseInt(timeMatch[3]);
+    let hours = parseInt(timeMatch[4]);
+    const minutes = parseInt(timeMatch[5]);
+    const ampm = timeMatch[6].toUpperCase();
+    
+    // Convert to 24-hour format
+    if (ampm === 'PM' && hours !== 12) {
+      hours += 12;
+    } else if (ampm === 'AM' && hours === 12) {
+      hours = 0;
+    }
+    
+    return new Date(year, month, day, hours, minutes);
+  }
+  
+  // Try "Jan 25 2026" format (without time)
   const monthNames = {
     jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
     jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
   };
   
   const dateParts = dateStr.toLowerCase().split(' ');
-  if (dateParts.length >= 3) {
+  if (dateParts.length >= 3 && dateParts.length <= 4) {
     const monthStr = dateParts[0].toLowerCase();
     const day = parseInt(dateParts[1]);
     const year = parseInt(dateParts[2]);

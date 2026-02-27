@@ -288,6 +288,34 @@ function parseTimestamp(timestamp) {
       return date && !isNaN(date.getTime()) ? date : null;
     }
 
+    // Handle new format: "Feb 25 2026 3:59 AM"
+    const monthNamePattern = /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(\d{4})\s+(\d{1,2}):(\d{2})\s+(AM|PM)$/;
+    const monthMatch = timestamp.match(monthNamePattern);
+    
+    if (monthMatch) {
+      const monthMap = {
+        'Jan': 0, 'Feb': 1, 'Mar': 2, 'Apr': 3, 'May': 4, 'Jun': 5,
+        'Jul': 6, 'Aug': 7, 'Sep': 8, 'Oct': 9, 'Nov': 10, 'Dec': 11
+      };
+      
+      const month = monthMap[monthMatch[1]];
+      const day = parseInt(monthMatch[2]);
+      const year = parseInt(monthMatch[3]);
+      let hours = parseInt(monthMatch[4]);
+      const minutes = parseInt(monthMatch[5]);
+      const ampm = monthMatch[6];
+      
+      // Convert to 24-hour format
+      if (ampm === 'PM' && hours !== 12) {
+        hours += 12;
+      } else if (ampm === 'AM' && hours === 12) {
+        hours = 0;
+      }
+      
+      const date = new Date(year, month, day, hours, minutes);
+      return date && !isNaN(date.getTime()) ? date : null;
+    }
+
     // Handle various timestamp formats
     // "1/26/2026 10:30:45", "01/26/2026 10:30:45", "2026-01-26 10:30:45"
     
