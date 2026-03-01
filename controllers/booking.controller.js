@@ -529,18 +529,6 @@ class BookingController {
       console.log('User:', user?.name, 'Role:', user?.role);
       console.log('Booking data:', JSON.stringify(bookingData, null, 2));
 
-      // Role-based access control for sensitive fields
-      if (user?.role !== 'Admin') {
-        // Agents cannot modify status or agent fields
-        if (bookingData.status !== undefined || bookingData.agent !== undefined) {
-          console.warn(`⚠️ Agent ${user?.name} attempted to modify restricted fields (status/agent)`);
-          return res.status(403).json({ 
-            error: 'Agents cannot modify booking status or agent assignment',
-            code: 'RESTRICTED_FIELDS'
-          });
-        }
-      }
-
       // Read DB sheet to find the row
       const dbRows = await sheetsService.readSheet('DB');
       
@@ -572,6 +560,27 @@ class BookingController {
       // Get the existing row
       const existingRow = dbRows[dbRowIndex];
       console.log('Existing row at index', dbRowIndex, ':', existingRow);
+
+      // Role-based access control: Only block modifications to status or agent if values are changing
+      if (user?.role !== 'Admin') {
+        // Check if status is being changed to a different value
+        if (bookingData.status !== undefined && bookingData.status !== existingRow[2]) {
+          console.warn(`⚠️ Agent ${user?.name} attempted to modify booking status from "${existingRow[2]}" to "${bookingData.status}"`);
+          return res.status(403).json({ 
+            error: 'Agents cannot modify booking status',
+            code: 'RESTRICTED_FIELDS'
+          });
+        }
+        
+        // Check if agent is being changed to a different value
+        if (bookingData.agent !== undefined && bookingData.agent !== existingRow[17]) {
+          console.warn(`⚠️ Agent ${user?.name} attempted to modify agent assignment from "${existingRow[17]}" to "${bookingData.agent}"`);
+          return res.status(403).json({ 
+            error: 'Agents cannot modify agent assignment',
+            code: 'RESTRICTED_FIELDS'
+          });
+        }
+      }
 
       // Log all existing columns
       console.log('========== EXISTING ROW COLUMNS ==========');
