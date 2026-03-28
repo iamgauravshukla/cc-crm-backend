@@ -443,8 +443,7 @@ function calculateAgentPerformance(bookings) {
     // Define arrival statuses for calculating arrival rate
     const arrivalStatuses = new Set([
       'arrived not potential',
-      'arrived & bought',
-      'comeback & bought'
+      'arrived & bought'
     ]);
 
     // Define completed/visited statuses for revenue calculation
@@ -795,8 +794,7 @@ async function getAgentPerformance(req, res) {
     // Define arrival statuses for calculating arrival rate
     const arrivalStatuses = new Set([
       'arrived not potential',
-      'arrived & bought',
-      'comeback & bought'
+      'arrived & bought'
     ]);
 
     // Define completed/visited statuses for revenue calculation
