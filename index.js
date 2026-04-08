@@ -11,6 +11,7 @@ const bookingRoutes = require('./routes/booking.routes');
 const analyticsRoutes = require('./routes/analytics.routes');
 const dashboardRoutes = require('./routes/dashboard.routes');
 const healthRoutes = require('./routes/health.routes');
+const leadsRoutes = require('./routes/leads.routes');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -46,6 +47,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/api/leads', leadsRoutes);
 
 // Health check routes
 app.use('/health', healthRoutes);
