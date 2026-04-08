@@ -22,6 +22,10 @@ app.use(helmet());
 const rawAllowed = process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000';
 const allowedOrigins = rawAllowed.split(',').map(o => o.trim()).filter(Boolean);
 
+// Handle preflight for public leads endpoint BEFORE global restricted CORS
+// so that website form submissions are never blocked
+app.options('/api/leads', cors({ origin: '*' }));
+
 app.use(cors({
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
@@ -47,7 +51,8 @@ app.use('/api/auth', authRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/analytics', analyticsRoutes);
-app.use('/api/leads', leadsRoutes);
+// Leads route uses open CORS — overwrites restricted headers for public POST submissions
+app.use('/api/leads', cors({ origin: '*' }), leadsRoutes);
 
 // Health check routes
 app.use('/health', healthRoutes);
