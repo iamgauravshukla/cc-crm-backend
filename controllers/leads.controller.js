@@ -72,7 +72,7 @@ async function submitCallLead(req, res, center) {
       center,                  // 1: Wellness Center
       fullname.trim(),         // 2: Full Name
       email.trim().toLowerCase(), // 3: Email
-      phone.trim(),            // 4: Phone
+      `'${phone.trim()}`,      // 4: Phone (apostrophe prevents Sheets treating + as formula)
       treatment.trim(),        // 5: Treatment
       (message || '').trim(),  // 6: Message
       'New'                    // 7: Status
@@ -106,7 +106,7 @@ async function submitBookingLead(req, res, center) {
       center,                               // 1: Wellness Center
       fullname.trim(),                      // 2: Full Name
       email.trim().toLowerCase(),           // 3: Email
-      phone.trim(),                         // 4: Phone
+      `'${phone.trim()}`,                   // 4: Phone (apostrophe prevents Sheets treating + as formula)
       treatment.trim(),                     // 5: Treatment
       (age || '').toString().trim(),        // 6: Age
       (schedule || '').trim(),              // 7: Schedule
