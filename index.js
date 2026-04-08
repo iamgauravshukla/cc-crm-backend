@@ -22,11 +22,6 @@ app.use(helmet());
 const rawAllowed = process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000';
 const allowedOrigins = rawAllowed.split(',').map(o => o.trim()).filter(Boolean);
 
-// Open CORS for public lead submission endpoint (website forms)
-const openCors = cors({ origin: '*' });
-app.options('/api/leads', openCors); // preflight
-app.post('/api/leads', openCors, (req, res, next) => next()); // open POST before general cors
-
 app.use(cors({
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
