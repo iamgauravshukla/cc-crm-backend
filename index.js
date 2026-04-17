@@ -22,18 +22,20 @@ app.use(helmet());
 const rawAllowed = process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000';
 const allowedOrigins = rawAllowed.split(',').map(o => o.trim()).filter(Boolean);
 
-// ── PUBLIC leads endpoint: registered BEFORE global cors so external origins
-//    are never rejected. Open cors handles both preflight and actual requests.
-app.options('/api/leads', cors({ origin: '*' }));
-app.use('/api/leads', cors({ origin: '*' }), leadsRoutes);
-
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) return callback(null, true);
-    return callback(new Error('CORS policy: origin not allowed'), false);
-  },
-  credentials: true
+// Single cors middleware — /api/leads is public (any origin), all other routes are restricted
+app.use(cors(function (req, callback) {
+  const isPublicLeads = req.path === '/api/leads' || req.path.startsWith('/api/leads/');
+  if (isPublicLeads) {
+    return callback(null, { origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] });
+  }
+  callback(null, {
+    origin: function (origin, cb) {
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.indexOf(origin) !== -1) return cb(null, true);
+      return cb(new Error('CORS policy: origin not allowed'), false);
+    },
+    credentials: true
+  });
 }));
 
 // Rate limiting
@@ -52,6 +54,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/api/leads', leadsRoutes);
 
 // Health check routes
 app.use('/health', healthRoutes);
