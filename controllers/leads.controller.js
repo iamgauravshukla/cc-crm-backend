@@ -148,6 +148,7 @@ async function getCallLeads(req, res) {
       treatment: row[5] || '',
       message: row[6] || '',
       status: row[7] || 'New',
+      feedback: row[8] || '',
     }));
 
     // Filter by center
@@ -207,6 +208,7 @@ async function getBookingLeads(req, res) {
       schedule: row[7] || '',
       paymentMethod: row[8] || '',
       status: row[9] || 'New',
+      feedback: row[10] || '',
     }));
 
     // Filter by center
@@ -264,4 +266,48 @@ async function getCenters(req, res) {
   }
 }
 
-module.exports = { submitLead, getCallLeads, getBookingLeads, getCenters };
+/**
+ * PATCH /api/leads/:type/:rowIndex
+ * Updates status and/or feedback for a lead row.
+ * Protected — CRM users only.
+ * type: 'call' | 'booking'
+ */
+async function updateLead(req, res) {
+  try {
+    const { type, rowIndex } = req.params;
+    const { status, feedback } = req.body;
+    const row = parseInt(rowIndex, 10);
+
+    if (!['call', 'booking'].includes(type)) {
+      return res.status(400).json({ error: 'Invalid type. Must be call or booking.' });
+    }
+    if (!row || isNaN(row) || row < 2) {
+      return res.status(400).json({ error: 'Invalid rowIndex.' });
+    }
+
+    const sheetName = type === 'call' ? CALL_LEADS_SHEET : BOOKING_LEADS_SHEET;
+    // CallLeads:    status=col7, feedback=col8
+    // BookingLeads: status=col9, feedback=col10
+    const statusIdx   = type === 'call' ? 7 : 9;
+    const feedbackIdx = type === 'call' ? 8 : 10;
+
+    // Read the current row so we don't wipe existing columns
+    const rows = await sheetsService.readSheet(sheetName);
+    const existingRow = rows[row - 1] ? [...rows[row - 1]] : [];
+
+    // Extend array if shorter than needed
+    while (existingRow.length <= feedbackIdx) existingRow.push('');
+
+    if (status !== undefined)  existingRow[statusIdx]   = status;
+    if (feedback !== undefined) existingRow[feedbackIdx] = feedback;
+
+    await sheetsService.updateRow(sheetName, row, existingRow);
+
+    return res.json({ success: true, message: 'Lead updated successfully' });
+  } catch (error) {
+    console.error('Update lead error:', error);
+    return res.status(500).json({ error: 'Failed to update lead' });
+  }
+}
+
+module.exports = { submitLead, getCallLeads, getBookingLeads, getCenters, updateLead };

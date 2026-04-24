@@ -7,7 +7,8 @@ const {
   submitLead,
   getCallLeads,
   getBookingLeads,
-  getCenters
+  getCenters,
+  updateLead
 } = require('../controllers/leads.controller');
 
 // Rate limiter for public lead submission
@@ -36,5 +37,8 @@ router.get('/booking', authMiddleware, getBookingLeads);
 
 // GET /api/leads/centers
 router.get('/centers', authMiddleware, getCenters);
+
+// PATCH /api/leads/:type/:rowIndex — update status & feedback
+router.patch('/:type/:rowIndex', authMiddleware, updateLead);
 
 module.exports = router;
