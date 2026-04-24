@@ -16,17 +16,21 @@ const leadsRoutes = require('./routes/leads.routes');
 const app = express();
 const PORT = process.env.PORT || 5001;
 
-// Security middleware
-app.use(helmet());
+// Security middleware — disable crossOriginResourcePolicy for public endpoints
+// so external websites can read the response (CORP 'same-origin' would block it)
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+}));
 
 const rawAllowed = process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000';
 const allowedOrigins = rawAllowed.split(',').map(o => o.trim()).filter(Boolean);
 
-// Single cors middleware — /api/leads is public (any origin), all other routes are restricted
+// CORS: only the root POST /api/leads is public (website form submissions).
+// All sub-paths (/call, /booking, /centers, /:type/:rowIndex) are CRM-only → restricted.
 app.use(cors(function (req, callback) {
-  const isPublicLeads = req.path === '/api/leads' || req.path.startsWith('/api/leads/');
+  const isPublicLeads = req.path === '/api/leads';
   if (isPublicLeads) {
-    return callback(null, { origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] });
+    return callback(null, { origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] });
   }
   callback(null, {
     origin: function (origin, cb) {
