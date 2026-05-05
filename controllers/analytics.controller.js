@@ -1302,8 +1302,8 @@ async function getSalesReport(req, res) {
         }
       }
 
-      // Only count ACTUAL SALES: "Arrived & bought" or "Comeback & bought"
-      if (status !== 'Arrived & bought' && status !== 'Comeback & bought') continue;
+      // Only count ACTUAL SALES: "Arrived & bought", "Arrived not potential", or "Comeback & bought"
+      if (status !== 'Arrived & bought' && status !== 'Comeback & bought' && status !== 'Arrived not potential') continue;
 
       // Range sales totals
       if (bookingDate >= startDate && bookingDate <= endDate) {
