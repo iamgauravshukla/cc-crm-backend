@@ -895,6 +895,17 @@ async function getAgentPerformance(req, res) {
         .map(([name, count]) => ({ name, count }))
         .sort((a, b) => b.count - a.count);
       
+      // Calculate weekly and monthly average arrivals
+      // Range length in days
+      let rangeDays = days;
+      if (startDate && endDate) {
+        const s = new Date(startDate);
+        const e = new Date(endDate);
+        rangeDays = Math.max(1, Math.round((e - s) / (1000 * 60 * 60 * 24)) + 1);
+      }
+      const rangeWeeks = Math.max(1, rangeDays / 7);
+      const rangeMonths = Math.max(1, rangeDays / 30);
+
       return {
         name: agent.name,
         bookings: agent.bookings,
@@ -904,6 +915,8 @@ async function getAgentPerformance(req, res) {
         conversionRate: parseFloat(conversionRate.toFixed(2)),
         arrivalRate: parseFloat(arrivalRate.toFixed(2)),
         arrivals: agent.arrivals,
+        avgWeeklyArrivals: parseFloat((agent.arrivals / rangeWeeks).toFixed(2)),
+        avgMonthlyArrivals: parseFloat((agent.arrivals / rangeMonths).toFixed(2)),
         converted: agent.converted,
         scheduled: agent.scheduled,
         cancelled: agent.cancelled,
@@ -911,8 +924,7 @@ async function getAgentPerformance(req, res) {
         topTreatment: topTreatment ? topTreatment[0] : null,
         topBranch: topBranch ? topBranch[0] : null,
         treatments: treatments
-      };
-    }).sort((a, b) => b.revenue - a.revenue);
+      };    }).sort((a, b) => b.revenue - a.revenue);
 
     // Calculate summary
     const summary = {
@@ -1271,8 +1283,7 @@ async function getSalesReport(req, res) {
     let bookingsByBranch = {};
     const arrivalStatuses = new Set([
       'arrived not potential',
-      'arrived & bought',
-      'comeback & bought'
+      'arrived & bought'
     ]);
     const formatDateKey = (date) => {
       const year = date.getFullYear();
@@ -1300,14 +1311,16 @@ async function getSalesReport(req, res) {
       if (bookingDate >= startDate && bookingDate <= endDate) {
         totalBookings += 1;
         bookingsByBranch[branch] = (bookingsByBranch[branch] || 0) + 1;
-        if (arrivalStatuses.has(status)) {
+        const statusNorm = (status || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        if (arrivalStatuses.has(statusNorm)) {
           totalArrivals += 1;
           arrivalsByBranch[branch] = (arrivalsByBranch[branch] || 0) + 1;
         }
       }
 
       // Only count ACTUAL SALES: "Arrived & bought", "Arrived not potential", or "Comeback & bought"
-      if (status !== 'Arrived & bought' && status !== 'Comeback & bought' && status !== 'Arrived not potential') continue;
+      const statusNormSales = (status || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      if (statusNormSales !== 'arrived & bought' && statusNormSales !== 'comeback & bought' && statusNormSales !== 'arrived not potential') continue;
 
       // Range sales totals
       if (bookingDate >= startDate && bookingDate <= endDate) {
