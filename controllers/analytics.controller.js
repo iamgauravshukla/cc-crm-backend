@@ -253,10 +253,11 @@ function calculateOverview(bookings) {
       .replace(/\s+/g, ' ')
       .trim();
 
-    // Only count revenue from completed bookings (Arrived & Bought, Arrived not potential)
+    // Count revenue from all 3 sale statuses
     const completedStatuses = new Set([
       'arrived not potential',
-      'arrived & bought'
+      'arrived & bought',
+      'comeback & bought'
     ]);
 
     const completedBookings = bookings.filter(b => {
@@ -295,10 +296,11 @@ function calculateBranchPerformance(bookings) {
       .replace(/\s+/g, ' ')
       .trim();
 
-    // Only count revenue from completed bookings
+    // Count revenue from all 3 sale statuses
     const completedStatuses = new Set([
       'arrived not potential',
-      'arrived & bought'
+      'arrived & bought',
+      'comeback & bought'
     ]);
 
     const completedBookings = bookings.filter(b => {
@@ -338,10 +340,11 @@ function calculateTreatmentAnalysis(bookings) {
       .replace(/\s+/g, ' ')
       .trim();
 
-    // Only count revenue from completed bookings
+    // Count revenue from all 3 sale statuses
     const completedStatuses = new Set([
       'arrived not potential',
-      'arrived & bought'
+      'arrived & bought',
+      'comeback & bought'
     ]);
 
     const completedBookings = bookings.filter(b => {
@@ -382,10 +385,11 @@ function calculateRevenueAnalysis(bookings) {
       .replace(/\s+/g, ' ')
       .trim();
 
-    // Only count revenue from completed bookings
+    // Count revenue from all 3 sale statuses
     const completedStatuses = new Set([
       'arrived not potential',
-      'arrived & bought'
+      'arrived & bought',
+      'comeback & bought'
     ]);
 
     const completedBookings = bookings.filter(b => {
@@ -446,11 +450,11 @@ function calculateAgentPerformance(bookings) {
       'arrived & bought'
     ]);
 
-    // Define completed/visited statuses for revenue calculation
-    // Only "Arrived & bought" and "Arrived not potential" count as completed/visited
+    // Count revenue from all 3 sale statuses
     const completedStatuses = new Set([
       'arrived not potential',
-      'arrived & bought'
+      'arrived & bought',
+      'comeback & bought'
     ]);
     
     bookings.forEach(b => {
@@ -797,11 +801,11 @@ async function getAgentPerformance(req, res) {
       'arrived & bought'
     ]);
 
-    // Define completed/visited statuses for revenue calculation
-    // Only "Arrived & bought" and "Arrived not potential" count as completed/visited
+    // Count revenue from all 3 sale statuses
     const completedStatuses = new Set([
       'arrived not potential',
-      'arrived & bought'
+      'arrived & bought',
+      'comeback & bought'
     ]);
     
     recentBookings.forEach(booking => {
