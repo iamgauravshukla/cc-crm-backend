@@ -139,7 +139,7 @@ async function getAnalytics(req, res) {
       branch,
       range: startDate && endDate ? `${startDate} to ${endDate}` : range,
       overview: calculateOverview(bookings),
-      branchPerformance: branch === 'All' ? calculateBranchPerformance(filterByDateRange(allParsedBookings, range, startDate, endDate)) : [],
+      branchPerformance: branch === 'All' ? calculateBranchPerformance(filterByDateRange(allParsedBookings, range, startDate, endDate), range, startDate, endDate) : [],
       treatmentAnalysis: calculateTreatmentAnalysis(bookings),
       revenueAnalysis: calculateRevenueAnalysis(bookings),
       agentPerformance: calculateAgentPerformance(bookings),
@@ -290,7 +290,7 @@ function calculateOverview(bookings) {
     };
 }
 
-function calculateBranchPerformance(bookings) {
+function calculateBranchPerformance(bookings, range, startDate, endDate) {
     const normalizeStatus = (status) => (status || '')
       .toLowerCase()
       .replace(/\s+/g, ' ')
@@ -303,33 +303,70 @@ function calculateBranchPerformance(bookings) {
       'comeback & bought'
     ]);
 
-    const completedBookings = bookings.filter(b => {
-      const statusNormalized = normalizeStatus(b.status);
-      return completedStatuses.has(statusNormalized);
-    });
+    // Arrival rate uses only 2 statuses (no comeback)
+    const arrivalStatuses = new Set([
+      'arrived not potential',
+      'arrived & bought'
+    ]);
+
+    // Compute range length in days for weekly/monthly averages
+    let rangeDays = 365; // default for 'year'
+    if (startDate && endDate) {
+      const s = new Date(startDate);
+      const e = new Date(endDate);
+      rangeDays = Math.max(1, Math.round((e - s) / (1000 * 60 * 60 * 24)) + 1);
+    } else {
+      switch (range) {
+        case 'today': rangeDays = 1; break;
+        case 'week': rangeDays = 7; break;
+        case 'month': rangeDays = 30; break;
+        case 'quarter': rangeDays = 90; break;
+        case 'year': rangeDays = 365; break;
+        default: rangeDays = 365;
+      }
+    }
+    const rangeWeeks = Math.max(1, rangeDays / 7);
+    const rangeMonths = Math.max(1, rangeDays / 30);
 
     const branches = {};
-    
-    completedBookings.forEach(booking => {
+
+    bookings.forEach(booking => {
       const branch = booking.branch || 'Unknown';
-      
+      const statusNorm = normalizeStatus(booking.status);
+
       if (!branches[branch]) {
         branches[branch] = {
           name: branch,
-          bookings: 0,
+          totalBookings: 0,
+          completedBookings: 0,
+          arrivals: 0,
           revenue: 0
         };
       }
-      
-      branches[branch].bookings++;
-      branches[branch].revenue += booking.totalPrice;
+
+      branches[branch].totalBookings++;
+
+      if (completedStatuses.has(statusNorm)) {
+        branches[branch].completedBookings++;
+        branches[branch].revenue += booking.totalPrice;
+      }
+
+      if (arrivalStatuses.has(statusNorm)) {
+        branches[branch].arrivals++;
+      }
     });
 
     return Object.values(branches)
       .map(b => ({
-        ...b,
+        name: b.name,
+        bookings: b.completedBookings,
+        totalBookings: b.totalBookings,
         revenue: parseFloat(b.revenue.toFixed(2)),
-        avgBookingValue: parseFloat((b.revenue / b.bookings).toFixed(2))
+        avgBookingValue: b.completedBookings > 0 ? parseFloat((b.revenue / b.completedBookings).toFixed(2)) : 0,
+        arrivals: b.arrivals,
+        arrivalRate: b.totalBookings > 0 ? parseFloat((b.arrivals / b.totalBookings * 100).toFixed(2)) : 0,
+        avgWeeklyArrivals: parseFloat((b.arrivals / rangeWeeks).toFixed(2)),
+        avgMonthlyArrivals: parseFloat((b.arrivals / rangeMonths).toFixed(2))
       }))
       .sort((a, b) => b.revenue - a.revenue);
 }

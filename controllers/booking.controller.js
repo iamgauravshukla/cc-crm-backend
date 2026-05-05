@@ -776,18 +776,14 @@ class BookingController {
       console.log(`📅 Today: ${today.toDateString()}, Tomorrow: ${tomorrow.toDateString()}`);
 
 
-      // Helper to extract date from ISO timestamp
-      const getDateFromTimestamp = (isoString) => {
-        if (!isoString) return null;
+      // Helper to extract date-only from timestamp string (e.g. "May 5 2026 10:30 AM")
+      // Uses parseDateString which correctly handles all custom timestamp formats
+      const getDateFromTimestamp = (timestampStr) => {
+        if (!timestampStr) return null;
         try {
-          const date = new Date(isoString);
-          if (isNaN(date.getTime())) return null;
-          // Extract just the date part in local timezone
-          const year = date.getFullYear();
-          const month = date.getMonth();
-          const day = date.getDate();
-          const localDateOnly = new Date(year, month, day, 0, 0, 0, 0);
-          return localDateOnly;
+          const parsed = parseDateString(timestampStr);
+          if (!parsed || isNaN(parsed.getTime())) return null;
+          return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 0, 0, 0, 0);
         } catch (e) {
           return null;
         }
@@ -808,8 +804,9 @@ class BookingController {
       const isTomorrow = (date) => date && date.getTime() === tomorrow.getTime();
       const isNext7Days = (date) => date && date > today && date <= nextSevenDaysEnd;
       const isInNext7Days = (date) => date && date >= today && date <= nextSevenDaysEnd;
-      
-      // Helper to check if cancellation happened today
+
+      // row[43] = cancellation_time: set by updateBooking when status changed to Cancelled
+      // Covers: cancelled via CRM today (any creation date) OR created+cancelled today without CRM
       const isCancelledToday = (cancellationTimeStr) => {
         if (!cancellationTimeStr) return false;
         const cancelledDate = getDateFromTimestamp(cancellationTimeStr);
@@ -848,7 +845,7 @@ class BookingController {
       // 2. OVERALL: Created TODAY + Scheduled (Next7Days \ {TODAY}) + NOT cancelled
       // 3. Tomorrow: Created TODAY + Scheduled TOMORROW + NOT cancelled
       // 4. Next7Days: Scheduled (Next7Days incl TODAY) + NOT cancelled (ignores when created)
-      // 5. Cancellations: Created TODAY + Cancelled + Cancelled TODAY
+      // 5. Cancellations: cancelled via CRM today OR created+cancelled today (no CRM update)
       // 6. TomorrowSummary: Scheduled TOMORROW + NOT cancelled (ignores when created)
       
       let processedCount = 0;
@@ -921,8 +918,9 @@ class BookingController {
           }
         }
 
-        // Section 5: Cancellations per Branch (Created today + Cancelled today)
-        if (createdToday && status.includes('cancel') && isCancelledToday(cancellationTime)) {
+        // Section 5: Cancellations per Branch
+        // Counts: cancelled via CRM today (cancellationTime = today) OR created+cancelled today
+        if (status.includes('cancel') && (isCancelledToday(cancellationTime) || (!cancellationTime && createdToday))) {
           reports.cancellations.count++;
           reports.cancellations.revenue += price;
           reports.cancellations.total++;
@@ -968,14 +966,11 @@ class BookingController {
       const today = new Date();
       today.setHours(0, 0, 0, 0);
 
-      const getDateFromTimestamp = (isoString) => {
-        if (!isoString) return null;
-        const date = new Date(isoString);
-        if (isNaN(date.getTime())) return null;
-        const year = date.getFullYear();
-        const month = date.getMonth();
-        const day = date.getDate();
-        return new Date(year, month, day, 0, 0, 0, 0);
+      const getDateFromTimestamp = (timestampStr) => {
+        if (!timestampStr) return null;
+        const parsed = parseDateString(timestampStr);
+        if (!parsed || isNaN(parsed.getTime())) return null;
+        return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 0, 0, 0, 0);
       };
 
       const parseBookingDate = (dateStr) => {
@@ -1034,14 +1029,11 @@ class BookingController {
       const nextSevenDaysEnd = new Date(today);
       nextSevenDaysEnd.setDate(nextSevenDaysEnd.getDate() + 7);
 
-      const getDateFromTimestamp = (isoString) => {
-        if (!isoString) return null;
-        const date = new Date(isoString);
-        if (isNaN(date.getTime())) return null;
-        const year = date.getFullYear();
-        const month = date.getMonth();
-        const day = date.getDate();
-        return new Date(year, month, day, 0, 0, 0, 0);
+      const getDateFromTimestamp = (timestampStr) => {
+        if (!timestampStr) return null;
+        const parsed = parseDateString(timestampStr);
+        if (!parsed || isNaN(parsed.getTime())) return null;
+        return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 0, 0, 0, 0);
       };
 
       const parseBookingDate = (dateStr) => {
@@ -1098,14 +1090,11 @@ class BookingController {
       const tomorrow = new Date(today);
       tomorrow.setDate(tomorrow.getDate() + 1);
 
-      const getDateFromTimestamp = (isoString) => {
-        if (!isoString) return null;
-        const date = new Date(isoString);
-        if (isNaN(date.getTime())) return null;
-        const year = date.getFullYear();
-        const month = date.getMonth();
-        const day = date.getDate();
-        return new Date(year, month, day, 0, 0, 0, 0);
+      const getDateFromTimestamp = (timestampStr) => {
+        if (!timestampStr) return null;
+        const parsed = parseDateString(timestampStr);
+        if (!parsed || isNaN(parsed.getTime())) return null;
+        return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 0, 0, 0, 0);
       };
 
       const parseBookingDate = (dateStr) => {
@@ -1162,16 +1151,6 @@ class BookingController {
       const nextSevenDaysEnd = new Date(today);
       nextSevenDaysEnd.setDate(nextSevenDaysEnd.getDate() + 7);
 
-      const getDateFromTimestamp = (isoString) => {
-        if (!isoString) return null;
-        const date = new Date(isoString);
-        if (isNaN(date.getTime())) return null;
-        const year = date.getFullYear();
-        const month = date.getMonth();
-        const day = date.getDate();
-        return new Date(year, month, day, 0, 0, 0, 0);
-      };
-
       const parseBookingDate = (dateStr) => {
         if (!dateStr) return null;
         const parsed = parseDateString(dateStr);
@@ -1214,27 +1193,18 @@ class BookingController {
     }
   }
 
-  // Get Cancellations detailed bookings (Created today + Cancelled today)
+  // Get Cancellations detailed bookings (Created today + status is Cancelled)
   async getCancellations(req, res) {
     try {
       const dbRows = await sheetsService.readSheet('DB');
       const today = new Date();
       today.setHours(0, 0, 0, 0);
 
-      const getDateFromTimestamp = (isoString) => {
-        if (!isoString) return null;
-        const date = new Date(isoString);
-        if (isNaN(date.getTime())) return null;
-        const year = date.getFullYear();
-        const month = date.getMonth();
-        const day = date.getDate();
-        return new Date(year, month, day, 0, 0, 0, 0);
-      };
-
-      const isCancelledToday = (cancellationTimeStr) => {
-        if (!cancellationTimeStr) return false;
-        const cancelledDate = getDateFromTimestamp(cancellationTimeStr);
-        return cancelledDate && cancelledDate.getTime() === today.getTime();
+      const getDateFromTimestamp = (timestampStr) => {
+        if (!timestampStr) return null;
+        const parsed = parseDateString(timestampStr);
+        if (!parsed || isNaN(parsed.getTime())) return null;
+        return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 0, 0, 0, 0);
       };
 
       const bookings = [];
@@ -1246,8 +1216,13 @@ class BookingController {
 
         const createdDate = getDateFromTimestamp(timestamp);
         const createdToday = createdDate && createdDate.getTime() === today.getTime();
+        const isCancelledToday = (ts) => {
+          if (!ts) return false;
+          const d = getDateFromTimestamp(ts);
+          return d && d.getTime() === today.getTime();
+        };
 
-        if (createdToday && status.includes('cancel') && isCancelledToday(cancellationTime)) {
+        if (status.includes('cancel') && (isCancelledToday(cancellationTime) || (!cancellationTime && createdToday))) {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',
@@ -1279,15 +1254,7 @@ class BookingController {
       const tomorrow = new Date(today);
       tomorrow.setDate(tomorrow.getDate() + 1);
 
-      const getDateFromTimestamp = (isoString) => {
-        if (!isoString) return null;
-        const date = new Date(isoString);
-        if (isNaN(date.getTime())) return null;
-        const year = date.getFullYear();
-        const month = date.getMonth();
-        const day = date.getDate();
-        return new Date(year, month, day, 0, 0, 0, 0);
-      };
+      // getTomorrowSummary doesn't filter by creation date, so no getDateFromTimestamp needed
 
       const parseBookingDate = (dateStr) => {
         if (!dateStr) return null;
