@@ -381,22 +381,29 @@ class BookingController {
       
       // Single-pass filtering for performance
       let filteredBookings = allBookings.filter(booking => {
-        // Branch filter (supports NOT: prefix for "is not" operator)
+        // Branch filter — supports single value, comma-separated multi-values, and NOT: prefix
         if (branch && branch !== 'All') {
           const isNot = branch.startsWith('NOT:');
-          const val = isNot ? branch.slice(4) : branch;
-          if (isNot ? booking.branch === val : booking.branch !== val) return false;
+          const raw = isNot ? branch.slice(4) : branch;
+          const vals = raw.split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+          const matches = vals.includes((booking.branch || '').toLowerCase());
+          if (isNot ? matches : !matches) return false;
         }
         
-        // Status filter (supports NOT: prefix for "is not" operator)
+        // Status filter — supports single value, comma-separated multi-values, and NOT: prefix
         if (status && status !== 'All') {
           const isNot = status.startsWith('NOT:');
-          const val = isNot ? status.slice(4) : status;
-          if (isNot ? booking.status === val : booking.status !== val) return false;
+          const raw = isNot ? status.slice(4) : status;
+          const vals = raw.split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+          const matches = vals.includes((booking.status || '').toLowerCase());
+          if (isNot ? matches : !matches) return false;
         }
 
-        // Agent filter (case-insensitive)
-        if (agent && agent !== 'All' && booking.agent.toLowerCase() !== agent.toLowerCase()) return false;
+        // Agent filter — supports single or comma-separated multi-values (case-insensitive)
+        if (agent && agent !== 'All') {
+          const vals = agent.split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+          if (!vals.includes(booking.agent.toLowerCase())) return false;
+        }
 
         // Gender filter (case-insensitive)
         if (gender && gender !== 'All' && booking.gender.toLowerCase() !== gender.toLowerCase()) return false;
@@ -920,6 +927,9 @@ class BookingController {
         const lastName = row[5];
         const price = parsePrice(row[12]);
         const cancellationTime = row[43];
+        // Skip rows flagged with cancel_validation — excluded from all Daily Report sections
+        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
+        if (cancelValidation) continue;
 
         // Parse booking date from formatted date column
         const bookingDate = parseBookingDate(bookingDateStr);
@@ -997,8 +1007,11 @@ class BookingController {
         }
 
         // Section 7: Arrivals Today (Booking date = today, status is arrived)
+        // Also exclude underage_validation rows (col 45) from arrival count
+        const underageValidation = (row[45] || '').toString().toUpperCase() === 'TRUE';
         const normalizedStatus = (row[2] || '').toLowerCase().replace(/\s+/g, ' ').trim();
-        if (isToday(bookingDate) && (normalizedStatus === 'arrived & bought' || normalizedStatus === 'arrived not potential')) {
+        if (isToday(bookingDate) && !underageValidation &&
+            (normalizedStatus === 'arrived & bought' || normalizedStatus === 'arrived not potential')) {
           reports.arrivalsToday.count++;
           if (reports.arrivalsToday.byBranch[branch]) {
             reports.arrivalsToday.byBranch[branch].count++;
@@ -1072,7 +1085,8 @@ class BookingController {
         const createdDate = getDateFromTimestamp(timestamp);
         const createdToday = createdDate && createdDate.getTime() === today.getTime();
 
-        if (createdToday && isToday(bookingDate) && !status.includes('cancel')) {
+        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
+        if (createdToday && isToday(bookingDate) && !status.includes('cancel') && !cancelValidation) {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',
@@ -1135,7 +1149,8 @@ class BookingController {
         const createdDate = getDateFromTimestamp(timestamp);
         const createdToday = createdDate && createdDate.getTime() === today.getTime();
 
-        if (createdToday && isNext7Days(bookingDate) && !status.includes('cancel')) {
+        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
+        if (createdToday && isNext7Days(bookingDate) && !status.includes('cancel') && !cancelValidation) {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',
@@ -1196,7 +1211,8 @@ class BookingController {
         const createdDate = getDateFromTimestamp(timestamp);
         const createdToday = createdDate && createdDate.getTime() === today.getTime();
 
-        if (createdToday && isTomorrow(bookingDate) && !status.includes('cancel')) {
+        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
+        if (createdToday && isTomorrow(bookingDate) && !status.includes('cancel') && !cancelValidation) {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',
@@ -1247,7 +1263,8 @@ class BookingController {
 
         const bookingDate = parseBookingDate(bookingDateStr);
 
-        if (isInNext7Days(bookingDate) && !status.includes('cancel')) {
+        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
+        if (isInNext7Days(bookingDate) && !status.includes('cancel') && !cancelValidation) {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',
@@ -1351,7 +1368,9 @@ class BookingController {
 
         const bookingDate = parseBookingDate(bookingDateStr);
 
-        if (isToday(bookingDate) && arrivalStatuses.has(normalizedStatus)) {
+        const cancelValidation   = (row[44] || '').toString().toUpperCase() === 'TRUE';
+        const underageValidation = (row[45] || '').toString().toUpperCase() === 'TRUE';
+        if (isToday(bookingDate) && arrivalStatuses.has(normalizedStatus) && !cancelValidation && !underageValidation) {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',
@@ -1404,7 +1423,8 @@ class BookingController {
 
         const bookingDate = parseBookingDate(bookingDateStr);
 
-        if (isTomorrow(bookingDate) && !status.includes('cancel')) {
+        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
+        if (isTomorrow(bookingDate) && !status.includes('cancel') && !cancelValidation) {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',

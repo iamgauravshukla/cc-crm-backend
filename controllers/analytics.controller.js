@@ -764,6 +764,8 @@ async function getAgentPerformance(req, res) {
     recentBookings.forEach(booking => {
       const agent = booking.agent || 'Unknown';
       if (PLACEHOLDER_AGENTS.has(agent.toLowerCase().trim())) return; // skip non-agents
+      if (booking.cancelValidation)   return; // cancel_validation: exclude entirely from agent stats
+      if (booking.underageValidation) return; // underage_validation: exclude entirely from agent stats
       
       if (!agentStats[agent]) {
         agentStats[agent] = {
@@ -795,7 +797,7 @@ async function getAgentPerformance(req, res) {
       }
       
       // Track arrivals — skip if cancel_validation or underage_validation is flagged
-      if (ARRIVAL_STATUSES.has(statusNormalized) && !booking.cancelValidation && !booking.underageValidation) {
+      if (ARRIVAL_STATUSES.has(statusNormalized)) {
         stats.arrivals++;
       }
 

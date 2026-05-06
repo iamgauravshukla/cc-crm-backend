@@ -63,9 +63,9 @@ class SheetsService {
         if (sheetName === 'Intake') {
           sheetRange = 'A:AK';
         } 
-        // DB sheet has 44 columns (A-AR) - includes cancellation_time at column 43
+        // DB sheet has 46 columns (A-AT) - includes cancel_validation (AS) and underage_validation (AT)
         else if (sheetName === 'DB') {
-          sheetRange = 'A:AR';
+          sheetRange = 'A:AT';
         } 
         // Default for other sheets
         else {
