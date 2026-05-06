@@ -88,9 +88,6 @@ class BookingController {
       
       const formattedDate = formatDateTime(bookingData.date, bookingData.time);
 
-      // Get client IP
-      const customerIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
-
       // Check for promo hunter status BEFORE saving
       const promoHunterResult = await checkPromoHunter(
         bookingData.firstName,
@@ -227,6 +224,8 @@ class BookingController {
       const search = req.query.search || '';
       const branch = req.query.branch || '';
       const status = req.query.status || '';
+      const agent  = req.query.agent  || '';
+      const gender = req.query.gender || '';
       const sortOrder = req.query.sortOrder || 'newest'; // 'newest' or 'oldest'
       
       // Booking Created Date filters (timestamp based)
@@ -377,15 +376,25 @@ class BookingController {
       
       // Single-pass filtering for performance
       let filteredBookings = allBookings.filter(booking => {
-        // Branch filter
-        if (branch && branch !== 'All' && booking.branch !== branch) {
-          return false;
+        // Branch filter (supports NOT: prefix for "is not" operator)
+        if (branch && branch !== 'All') {
+          const isNot = branch.startsWith('NOT:');
+          const val = isNot ? branch.slice(4) : branch;
+          if (isNot ? booking.branch === val : booking.branch !== val) return false;
         }
         
-        // Status filter
-        if (status && status !== 'All' && booking.status !== status) {
-          return false;
+        // Status filter (supports NOT: prefix for "is not" operator)
+        if (status && status !== 'All') {
+          const isNot = status.startsWith('NOT:');
+          const val = isNot ? status.slice(4) : status;
+          if (isNot ? booking.status === val : booking.status !== val) return false;
         }
+
+        // Agent filter (case-insensitive)
+        if (agent && agent !== 'All' && booking.agent.toLowerCase() !== agent.toLowerCase()) return false;
+
+        // Gender filter (case-insensitive)
+        if (gender && gender !== 'All' && booking.gender.toLowerCase() !== gender.toLowerCase()) return false;
         
         // Created date filter
         if (applyCreatedFilter) {
@@ -426,14 +435,15 @@ class BookingController {
         return true;
       });
 
-      // Sort bookings based on sortOrder
-      // Sheet is in chronological order (oldest first), so:
-      // - For 'newest': reverse the array (last row = most recent)
-      // - For 'oldest': keep as is (first row after header = oldest)
-      if (sortOrder === 'newest') {
-        filteredBookings.reverse();
-      }
-      // If sortOrder is 'oldest', array is already in correct order
+      // Sort by appointment date (booking.date), not by sheet row order.
+      // Row order reflects creation time, which has nothing to do with scheduled date.
+      filteredBookings.sort((a, b) => {
+        const da = parseDate(a.date);
+        const db = parseDate(b.date);
+        const ta = da && !isNaN(da.getTime()) ? da.getTime() : 0;
+        const tb = db && !isNaN(db.getTime()) ? db.getTime() : 0;
+        return sortOrder === 'newest' ? tb - ta : ta - tb;
+      });
 
       // Calculate pagination
       const total = filteredBookings.length;
@@ -827,7 +837,8 @@ class BookingController {
         bookedTomorrow: { byBranch: {} },
         bookedNext7Days: { byBranch: {} },
         cancellations: { total: 0, revenue: 0, count: 0, byBranch: {} },
-        overallBookingsTomorrow: { total: 0, revenue: 0, count: 0 }
+        overallBookingsTomorrow: { total: 0, revenue: 0, count: 0 },
+        arrivalsToday: { count: 0, byBranch: {}, byStatus: { 'Arrived & bought': 0, 'Arrived not potential': 0 } }
       };
 
       // Initialize branch-level data
@@ -837,6 +848,7 @@ class BookingController {
         reports.bookedTomorrow.byBranch[branch] = { count: 0, revenue: 0 };
         reports.bookedNext7Days.byBranch[branch] = { count: 0, revenue: 0 };
         reports.cancellations.byBranch[branch] = { count: 0, revenue: 0 };
+        reports.arrivalsToday.byBranch[branch] = { count: 0 };
       });
 
       // Process each booking row
@@ -847,6 +859,7 @@ class BookingController {
       // 4. Next7Days: Scheduled (Next7Days incl TODAY) + NOT cancelled (ignores when created)
       // 5. Cancellations: cancelled via CRM today OR created+cancelled today (no CRM update)
       // 6. TomorrowSummary: Scheduled TOMORROW + NOT cancelled (ignores when created)
+      // 7. ArrivalsToday: Booking date = TODAY + status is "Arrived & bought" or "Arrived not potential"
       
       let processedCount = 0;
       console.log(`🔄 Processing ${dbRows.length - 1} booking rows...`);
@@ -936,7 +949,24 @@ class BookingController {
           reports.overallBookingsTomorrow.revenue += price;
           reports.overallBookingsTomorrow.total++;
         }
-      }
+
+        // Section 7: Arrivals Today (Booking date = today, status is arrived)
+        const normalizedStatus = (row[2] || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        if (isToday(bookingDate) && (normalizedStatus === 'arrived & bought' || normalizedStatus === 'arrived not potential')) {
+          reports.arrivalsToday.count++;
+          if (reports.arrivalsToday.byBranch[branch]) {
+            reports.arrivalsToday.byBranch[branch].count++;
+          }
+          // Track by exact status label for breakdown
+          const statusLabel = row[2] || '';
+          if (reports.arrivalsToday.byStatus[statusLabel] !== undefined) {
+            reports.arrivalsToday.byStatus[statusLabel]++;
+          } else {
+            reports.arrivalsToday.byStatus[statusLabel] = 1;
+          }
+        }
+
+      } // end for loop
 
       console.log(`✅ Processed ${processedCount} bookings`);
       console.log(`📊 Reports Summary:`);
@@ -946,6 +976,7 @@ class BookingController {
       console.log(`   Next7Days: ${Object.values(reports.bookedNext7Days.byBranch).reduce((sum, b) => sum + b.count, 0)} bookings`);
       console.log(`   Cancellations: ${reports.cancellations.count}, Revenue: ₱${reports.cancellations.revenue}`);
       console.log(`   Tomorrow Summary: ${reports.overallBookingsTomorrow.count}, Revenue: ₱${reports.overallBookingsTomorrow.revenue}`);
+      console.log(`   Arrivals Today: ${reports.arrivalsToday.count}`);
 
       res.json({
         success: true,
@@ -1242,6 +1273,58 @@ class BookingController {
     } catch (error) {
       console.error('Get cancellations error:', error);
       res.status(500).json({ error: 'Failed to fetch cancellations' });
+    }
+  }
+
+  // Get Arrivals Today detailed bookings (Booking date = today + arrived status)
+  async getArrivalsToday(req, res) {
+    try {
+      const dbRows = await sheetsService.readSheet('DB');
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      const parseBookingDate = (dateStr) => {
+        if (!dateStr) return null;
+        const parsed = parseDateString(dateStr);
+        if (!parsed) return null;
+        const d = new Date(parsed);
+        d.setHours(0, 0, 0, 0);
+        return d;
+      };
+
+      const isToday = (date) => date && date.getTime() === today.getTime();
+
+      const arrivalStatuses = new Set(['arrived & bought', 'arrived not potential']);
+
+      const bookings = [];
+      for (let i = 1; i < dbRows.length; i++) {
+        const row = dbRows[i];
+        const bookingDateStr = row[3];
+        const rawStatus = row[2] || '';
+        const normalizedStatus = rawStatus.toLowerCase().replace(/\s+/g, ' ').trim();
+
+        const bookingDate = parseBookingDate(bookingDateStr);
+
+        if (isToday(bookingDate) && arrivalStatuses.has(normalizedStatus)) {
+          bookings.push({
+            firstName: row[4] || '',
+            lastName: row[5] || '',
+            branch: row[1] || '',
+            date: row[3] || '',
+            treatment: row[8] || '',
+            totalPrice: row[12] || 0,
+            status: rawStatus,
+            phone: row[14] || '',
+            email: row[16] || '',
+            agent: row[17] || ''
+          });
+        }
+      }
+
+      res.json({ success: true, bookings });
+    } catch (error) {
+      console.error('Get arrivals today error:', error);
+      res.status(500).json({ error: 'Failed to fetch arrivals today' });
     }
   }
 

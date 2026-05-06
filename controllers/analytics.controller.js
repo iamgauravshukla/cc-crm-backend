@@ -1,6 +1,12 @@
 const sheetsService = require('../services/sheets.service');
 const { parseDateString, parsePrice, mapRowToBooking } = require('../utils/dataParser');
 
+// ── Shared status helpers (single source of truth) ──────────────────────────
+const normalizeStatus = (status) => (status || '').toLowerCase().replace(/\s+/g, ' ').trim();
+const COMPLETED_STATUSES = new Set(['arrived not potential', 'arrived & bought', 'comeback & bought']);
+const ARRIVAL_STATUSES   = new Set(['arrived not potential', 'arrived & bought']);
+// ────────────────────────────────────────────────────────────────────────────
+
 /**
  * Get comprehensive analytics for a specific branch or all branches
  * Query params: 
@@ -142,7 +148,7 @@ async function getAnalytics(req, res) {
       branchPerformance: branch === 'All' ? calculateBranchPerformance(filterByDateRange(allParsedBookings, range, startDate, endDate), range, startDate, endDate) : [],
       treatmentAnalysis: calculateTreatmentAnalysis(bookings),
       revenueAnalysis: calculateRevenueAnalysis(bookings),
-      agentPerformance: calculateAgentPerformance(bookings),
+      agentPerformance: calculateAgentPerformance(bookings, range, startDate, endDate),
       demographicAnalysis: calculateDemographicAnalysis(bookings),
       timeSeriesData: calculateTimeSeriesData(bookings, range, startDate, endDate),
       marketingChannels: calculateMarketingChannels(bookings)
@@ -248,22 +254,7 @@ function filterByDateRange(bookings, range, startDate, endDate) {
 }
 
 function calculateOverview(bookings) {
-    const normalizeStatus = (status) => (status || '')
-      .toLowerCase()
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    // Count revenue from all 3 sale statuses
-    const completedStatuses = new Set([
-      'arrived not potential',
-      'arrived & bought',
-      'comeback & bought'
-    ]);
-
-    const completedBookings = bookings.filter(b => {
-      const statusNormalized = normalizeStatus(b.status);
-      return completedStatuses.has(statusNormalized);
-    });
+    const completedBookings = bookings.filter(b => COMPLETED_STATUSES.has(normalizeStatus(b.status)));
 
     const totalBookings = bookings.length;
     const totalRevenue = completedBookings.reduce((sum, b) => sum + b.totalPrice, 0);
@@ -291,24 +282,6 @@ function calculateOverview(bookings) {
 }
 
 function calculateBranchPerformance(bookings, range, startDate, endDate) {
-    const normalizeStatus = (status) => (status || '')
-      .toLowerCase()
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    // Count revenue from all 3 sale statuses
-    const completedStatuses = new Set([
-      'arrived not potential',
-      'arrived & bought',
-      'comeback & bought'
-    ]);
-
-    // Arrival rate uses only 2 statuses (no comeback)
-    const arrivalStatuses = new Set([
-      'arrived not potential',
-      'arrived & bought'
-    ]);
-
     // Compute range length in days for weekly/monthly averages
     let rangeDays = 365; // default for 'year'
     if (startDate && endDate) {
@@ -346,12 +319,12 @@ function calculateBranchPerformance(bookings, range, startDate, endDate) {
 
       branches[branch].totalBookings++;
 
-      if (completedStatuses.has(statusNorm)) {
+      if (COMPLETED_STATUSES.has(statusNorm)) {
         branches[branch].completedBookings++;
         branches[branch].revenue += booking.totalPrice;
       }
 
-      if (arrivalStatuses.has(statusNorm)) {
+      if (ARRIVAL_STATUSES.has(statusNorm)) {
         branches[branch].arrivals++;
       }
     });
@@ -372,22 +345,7 @@ function calculateBranchPerformance(bookings, range, startDate, endDate) {
 }
 
 function calculateTreatmentAnalysis(bookings) {
-    const normalizeStatus = (status) => (status || '')
-      .toLowerCase()
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    // Count revenue from all 3 sale statuses
-    const completedStatuses = new Set([
-      'arrived not potential',
-      'arrived & bought',
-      'comeback & bought'
-    ]);
-
-    const completedBookings = bookings.filter(b => {
-      const statusNormalized = normalizeStatus(b.status);
-      return completedStatuses.has(statusNormalized);
-    });
+    const completedBookings = bookings.filter(b => COMPLETED_STATUSES.has(normalizeStatus(b.status)));
 
     const treatments = {};
     
@@ -417,22 +375,7 @@ function calculateTreatmentAnalysis(bookings) {
 }
 
 function calculateRevenueAnalysis(bookings) {
-    const normalizeStatus = (status) => (status || '')
-      .toLowerCase()
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    // Count revenue from all 3 sale statuses
-    const completedStatuses = new Set([
-      'arrived not potential',
-      'arrived & bought',
-      'comeback & bought'
-    ]);
-
-    const completedBookings = bookings.filter(b => {
-      const statusNormalized = normalizeStatus(b.status);
-      return completedStatuses.has(statusNormalized);
-    });
+    const completedBookings = bookings.filter(b => COMPLETED_STATUSES.has(normalizeStatus(b.status)));
 
     const byPaymentMode = {};
     
@@ -473,26 +416,27 @@ function calculateRevenueAnalysis(bookings) {
     };
 }
 
-function calculateAgentPerformance(bookings) {
+function calculateAgentPerformance(bookings, range, startDate, endDate) {
     const agents = {};
-    
-    const normalizeStatus = (status) => (status || '')
-      .toLowerCase()
-      .replace(/\s+/g, ' ')
-      .trim();
 
-    // Define arrival statuses for calculating arrival rate
-    const arrivalStatuses = new Set([
-      'arrived not potential',
-      'arrived & bought'
-    ]);
-
-    // Count revenue from all 3 sale statuses
-    const completedStatuses = new Set([
-      'arrived not potential',
-      'arrived & bought',
-      'comeback & bought'
-    ]);
+    // Compute range length for weekly/monthly averages
+    let rangeDays = 365;
+    if (startDate && endDate) {
+      const s = new Date(startDate);
+      const e = new Date(endDate);
+      rangeDays = Math.max(1, Math.round((e - s) / (1000 * 60 * 60 * 24)) + 1);
+    } else {
+      switch (range) {
+        case 'today':   rangeDays = 1;   break;
+        case 'week':    rangeDays = 7;   break;
+        case 'month':   rangeDays = 30;  break;
+        case 'quarter': rangeDays = 90;  break;
+        case 'year':    rangeDays = 365; break;
+        default:        rangeDays = 365;
+      }
+    }
+    const rangeWeeks  = Math.max(1, rangeDays / 7);
+    const rangeMonths = Math.max(1, rangeDays / 30);
     
     bookings.forEach(b => {
       const agent = b.agent || 'Unknown';
@@ -509,14 +453,12 @@ function calculateAgentPerformance(bookings) {
       
       agents[agent].bookings++;
       
-      // Track arrivals for arrival rate calculation
       const statusNormalized = normalizeStatus(b.status);
-      if (arrivalStatuses.has(statusNormalized)) {
+      if (ARRIVAL_STATUSES.has(statusNormalized)) {
         agents[agent].arrivals++;
       }
 
-      // Only add revenue for completed/visited bookings
-      if (completedStatuses.has(statusNormalized)) {
+      if (COMPLETED_STATUSES.has(statusNormalized)) {
         agents[agent].completedBookings++;
         agents[agent].revenue += b.totalPrice;
       }
@@ -527,7 +469,9 @@ function calculateAgentPerformance(bookings) {
         ...a,
         revenue: parseFloat(a.revenue.toFixed(2)),
         avgBookingValue: a.completedBookings > 0 ? parseFloat((a.revenue / a.completedBookings).toFixed(2)) : 0,
-        arrivalRate: a.bookings > 0 ? Math.round((a.arrivals / a.bookings) * 10000) / 100 : 0
+        arrivalRate: a.bookings > 0 ? Math.round((a.arrivals / a.bookings) * 10000) / 100 : 0,
+        avgWeeklyArrivals:  parseFloat((a.arrivals / rangeWeeks).toFixed(2)),
+        avgMonthlyArrivals: parseFloat((a.arrivals / rangeMonths).toFixed(2))
       }))
       .sort((a, b) => b.revenue - a.revenue);
 }
@@ -686,26 +630,28 @@ function calculateMarketingChannels(bookings) {
     const channels = {};
     
     bookings.forEach(b => {
-      // Use socialMedia field (Instagram, Facebook, etc.) as marketing channel
       const channel = b.socialMedia || 'Unknown';
       
       if (!channels[channel]) {
-        channels[channel] = {
-          channel,
-          bookings: 0,
-          revenue: 0
-        };
+        channels[channel] = { channel, bookings: 0, completedBookings: 0, revenue: 0 };
       }
       
       channels[channel].bookings++;
-      channels[channel].revenue += b.totalPrice;
+      // Only count revenue from completed/arrived bookings
+      if (COMPLETED_STATUSES.has(normalizeStatus(b.status))) {
+        channels[channel].completedBookings++;
+        channels[channel].revenue += b.totalPrice;
+      }
     });
 
     return Object.values(channels)
       .map(c => ({
-        ...c,
+        channel: c.channel,
+        bookings: c.bookings,
+        completedBookings: c.completedBookings,
         revenue: parseFloat(c.revenue.toFixed(2)),
-        conversionValue: parseFloat((c.revenue / c.bookings).toFixed(2))
+        conversionRate: c.bookings > 0 ? parseFloat((c.completedBookings / c.bookings * 100).toFixed(1)) : 0,
+        avgRevenuePerBooking: c.completedBookings > 0 ? parseFloat((c.revenue / c.completedBookings).toFixed(2)) : 0
       }))
       .sort((a, b) => b.bookings - a.bookings);
 }
@@ -808,45 +754,13 @@ async function getAgentPerformance(req, res) {
       };
     });
 
-    console.log(`\n========== AGENT PERFORMANCE DEBUG ==========`);
-    console.log(`Date range: Last ${days} days`);
-    console.log(`Total recent bookings: ${recentBookings.length}`);
-    if (recentBookings.length > 0) {
-      console.log('Sample booking:', {
-        agent: recentBookings[0].agent,
-        treatment: recentBookings[0].treatment,
-        totalPrice: recentBookings[0].totalPrice,
-        status: recentBookings[0].status,
-        rawPrice: dbRows[1][12]
-      });
-      console.log('Agents found:', [...new Set(recentBookings.map(b => b.agent))]);
-      console.log('Total revenue sum:', recentBookings.reduce((sum, b) => sum + b.totalPrice, 0));
-    }
-    console.log('=========================================\n');
-
     // Group by agent
     const agentStats = {};
-    
-    const normalizeStatus = (status) => (status || '')
-      .toLowerCase()
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    // Define arrival statuses for calculating arrival rate
-    const arrivalStatuses = new Set([
-      'arrived not potential',
-      'arrived & bought'
-    ]);
-
-    // Count revenue from all 3 sale statuses
-    const completedStatuses = new Set([
-      'arrived not potential',
-      'arrived & bought',
-      'comeback & bought'
-    ]);
+    const PLACEHOLDER_AGENTS = new Set(['unknown', 'no data', 'n/a', '-', '', 'none', 'unassigned']);
     
     recentBookings.forEach(booking => {
       const agent = booking.agent || 'Unknown';
+      if (PLACEHOLDER_AGENTS.has(agent.toLowerCase().trim())) return; // skip non-agents
       
       if (!agentStats[agent]) {
         agentStats[agent] = {
@@ -869,7 +783,7 @@ async function getAgentPerformance(req, res) {
       
       // Track status
       const statusNormalized = normalizeStatus(booking.status);
-      if (statusNormalized.includes('bought') || statusNormalized.includes('completed')) {
+      if (COMPLETED_STATUSES.has(statusNormalized)) {
         stats.converted++;
       } else if (statusNormalized === 'scheduled') {
         stats.scheduled++;
@@ -877,13 +791,13 @@ async function getAgentPerformance(req, res) {
         stats.cancelled++;
       }
       
-      // Track arrivals (same logic as sales report)
-      if (arrivalStatuses.has(statusNormalized)) {
+      // Track arrivals
+      if (ARRIVAL_STATUSES.has(statusNormalized)) {
         stats.arrivals++;
       }
 
       // Only add revenue for completed/visited bookings
-      if (completedStatuses.has(statusNormalized)) {
+      if (COMPLETED_STATUSES.has(statusNormalized)) {
         stats.completedBookings++;
         stats.revenue += booking.totalPrice;
       }
@@ -1120,6 +1034,7 @@ async function getAdPerformance(req, res) {
           totalRevenue: 0,
           branches: {},
           treatments: {},
+          statusMap: {},
           bookings: []
         };
       }
@@ -1127,11 +1042,19 @@ async function getAdPerformance(req, res) {
       adMap[adName].totalBookings++;
       adMap[adName].bookings.push(booking);
       
+      // Status breakdown
+      const ns = normalizeStatus(booking.status) || 'unknown';
+      if (!adMap[adName].statusMap[ns]) {
+        adMap[adName].statusMap[ns] = { count: 0, revenue: 0 };
+      }
+      adMap[adName].statusMap[ns].count++;
+
       // Count conversions (statuses that indicate successful booking)
       const statusLower = (booking.status || '').toLowerCase();
       if (statusLower.includes('bought') || statusLower.includes('arrived')) {
         adMap[adName].convertedBookings++;
         adMap[adName].totalRevenue += booking.totalPrice;
+        adMap[adName].statusMap[ns].revenue += booking.totalPrice;
       }
 
       // Track branches
@@ -1173,7 +1096,15 @@ async function getAdPerformance(req, res) {
         totalRevenue: parseFloat(ad.totalRevenue.toFixed(2)),
         avgRevenuePerBooking: parseFloat(avgRevenuePerBooking.toFixed(2)),
         topBranch,
-        topTreatment
+        topTreatment,
+        statusBreakdown: Object.entries(ad.statusMap || {})
+          .map(([status, d]) => ({
+            status,
+            count: d.count,
+            revenue: parseFloat(d.revenue.toFixed(2)),
+            pct: parseFloat(((d.count / ad.totalBookings) * 100).toFixed(1))
+          }))
+          .sort((a, b) => b.count - a.count)
       };
     });
 

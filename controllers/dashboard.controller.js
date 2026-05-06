@@ -117,7 +117,11 @@ async function getDashboardOverview(req, res) {
     const avgBookingValue = todayStats.bookings > 0 ? todayStats.revenue / todayStats.bookings : 0;
     const yesterdayAvgValue = yesterdayStats.bookings > 0 ? yesterdayStats.revenue / yesterdayStats.bookings : 0;
     
-    const completedToday = todayBookings.filter(b => b.status?.toLowerCase().includes('completed') || b.status?.toLowerCase().includes('bought')).length;
+    const COMPLETED_STATUSES = new Set(['arrived not potential', 'arrived & bought', 'comeback & bought']);
+    const completedToday = todayBookings.filter(b => {
+      const s = (b.status || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      return COMPLETED_STATUSES.has(s);
+    }).length;
     const conversionRate = todayStats.bookings > 0 ? (completedToday / todayStats.bookings * 100) : 0;
 
     // Calculate percentage changes

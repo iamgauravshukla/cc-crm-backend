@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const sheetsService = require('../services/sheets.service');
 const Joi = require('joi');
+const { invalidateUsersCache } = require('../middleware/auth.middleware');
 
 // Validation schemas
 const signupSchema = Joi.object({
@@ -57,6 +58,7 @@ class AuthController {
 
       // Append to Users sheet
       await sheetsService.appendRow('Users', newUser);
+      invalidateUsersCache();
 
       // Generate JWT token
       const token = jwt.sign(
@@ -118,6 +120,7 @@ class AuthController {
       if (rowIndex > 0) {
         userRow[6] = new Date().toISOString(); // Update last_login (column 6)
         await sheetsService.updateRow('Users', rowIndex + 1, userRow);
+        invalidateUsersCache();
       }
 
       // Generate JWT token

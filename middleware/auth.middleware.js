@@ -1,5 +1,9 @@
 const jwt = require('jsonwebtoken');
+const NodeCache = require('node-cache');
 const sheetsService = require('../services/sheets.service');
+
+// Cache users for 5 minutes to avoid reading the sheet on every request
+const usersCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
 
 const authMiddleware = async (req, res, next) => {
   try {
@@ -15,8 +19,12 @@ const authMiddleware = async (req, res, next) => {
     // Verify token
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     
-    // Fetch user data from Users sheet to get name and role
-    const users = await sheetsService.readSheet('Users');
+    // Fetch user data from Users sheet (cached for 5 min)
+    let users = usersCache.get('users_list');
+    if (!users) {
+      users = await sheetsService.readSheet('Users');
+      usersCache.set('users_list', users);
+    }
     const userRow = users.find(row => row[0] === decoded.userId && row[1] === decoded.email);
     
     if (!userRow) {
@@ -43,3 +51,4 @@ const authMiddleware = async (req, res, next) => {
 };
 
 module.exports = authMiddleware;
+module.exports.invalidateUsersCache = () => usersCache.del('users_list');
