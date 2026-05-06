@@ -750,7 +750,10 @@ async function getAgentPerformance(req, res) {
         agent: row[17] || '',
         bookingDetails: row[18] || '',
         adInteracted: row[19] || '',
-        promoHunterStatus: row[30] || ''
+        promoHunterStatus: row[30] || '',
+        // Exclusion flags — col 44 = cancel_validation, col 45 = underage_validation
+        cancelValidation:   (row[44] || '').toString().toUpperCase() === 'TRUE',
+        underageValidation: (row[45] || '').toString().toUpperCase() === 'TRUE'
       };
     });
 
@@ -791,8 +794,8 @@ async function getAgentPerformance(req, res) {
         stats.cancelled++;
       }
       
-      // Track arrivals
-      if (ARRIVAL_STATUSES.has(statusNormalized)) {
+      // Track arrivals — skip if cancel_validation or underage_validation is flagged
+      if (ARRIVAL_STATUSES.has(statusNormalized) && !booking.cancelValidation && !booking.underageValidation) {
         stats.arrivals++;
       }
 

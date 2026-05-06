@@ -113,7 +113,7 @@ class SheetsService {
       if (sheetName === 'Intake') {
         sheetRange = `A${rowIndex}:AK${rowIndex}`;
       } else if (sheetName === 'DB') {
-        sheetRange = `A${rowIndex}:AR${rowIndex}`;
+        sheetRange = `A${rowIndex}:AT${rowIndex}`; // extended to col AT (index 45) for cancel/underage validation
       } else {
         sheetRange = `A${rowIndex}:Z${rowIndex}`;
       }
@@ -129,6 +129,23 @@ class SheetsService {
     } catch (error) {
       console.error(`Error updating sheet ${sheetName}:`, error.message);
       throw new Error(`Failed to update row: ${error.message}`);
+    }
+  }
+
+  // Update a specific column range within a single row (e.g. "AS5:AT5")
+  async updateCellRange(sheetName, range, values) {
+    await this.initialize();
+    try {
+      const response = await this.sheets.spreadsheets.values.update({
+        spreadsheetId: this.spreadsheetId,
+        range: `${sheetName}!${range}`,
+        valueInputOption: 'USER_ENTERED',
+        resource: { values: [values] }
+      });
+      return response.data;
+    } catch (error) {
+      console.error(`Error updating cell range ${sheetName}!${range}:`, error.message);
+      throw new Error(`Failed to update cells: ${error.message}`);
     }
   }
 

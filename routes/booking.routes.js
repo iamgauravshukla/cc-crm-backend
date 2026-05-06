@@ -19,5 +19,6 @@ router.get('/daily-reports/tomorrow-summary', bookingController.getTomorrowSumma
 router.get('/old', bookingController.getOldBookings);
 router.get('/:id', bookingController.getBookingById);
 router.put('/:id', bookingController.updateBooking);
+router.patch('/:rowNumber/validation', bookingController.updateValidation);
 
 module.exports = router;

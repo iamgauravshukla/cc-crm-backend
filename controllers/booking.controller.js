@@ -195,7 +195,9 @@ class BookingController {
         formattedDate,                          // 40: dash_appointment_date
         bookingData.branch,                     // 41: dash_branch
         finalStatus,                            // 42: dash_booking_status (updated if promo hunter)
-        ''                                      // 43: cancellation_time (empty for new bookings)
+        '',                                     // 43: cancellation_time (empty for new bookings)
+        '',                                     // 44: cancel_validation (FALSE by default)
+        ''                                      // 45: underage_validation (FALSE by default)
       ];
       await sheetsService.appendRow('DB', masterDbRow);
 
@@ -293,7 +295,10 @@ class BookingController {
             companionLastName: row[21] || '',
             companionAge: row[22] || '',
             companionGender: row[23] || '',
-            companionFreebie: row[24] || ''
+            companionFreebie: row[24] || '',
+            // Exclusion validation flags (cols 44–45)
+            cancelValidation:   (row[44] || '').toString().toUpperCase() === 'TRUE',
+            underageValidation: (row[45] || '').toString().toUpperCase() === 'TRUE'
           };
         });
 
@@ -711,7 +716,9 @@ class BookingController {
         existingRow[40] || '',                  // 40: dash_appointment_date (preserve)
         bookingData.branch,                     // 41: dash_branch (update to match)
         bookingData.status || 'Scheduled',      // 42: dash_booking_status (update to match)
-        cancellationTime                        // 43: cancellation_time (track when cancelled)
+        cancellationTime,                        // 43: cancellation_time (track when cancelled)
+        existingRow[44] || '',                  // 44: cancel_validation (preserve)
+        existingRow[45] || ''                   // 45: underage_validation (preserve)
       ];
 
       console.log('========== UPDATED ROW COLUMNS ==========');
@@ -747,6 +754,45 @@ class BookingController {
         details: error.message,
         rowNumber: req.params.id
       });
+    }
+  }
+
+  // PATCH /bookings/:rowNumber/validation
+  // Updates only cancel_validation (col 44) and underage_validation (col 45) in the DB sheet.
+  // Admin-only — agents cannot toggle these flags.
+  async updateValidation(req, res) {
+    try {
+      const { rowNumber } = req.params;
+      const { cancelValidation, underageValidation } = req.body;
+
+      if (req.user?.role !== 'Admin') {
+        return res.status(403).json({ error: 'Only admins can set validation flags' });
+      }
+
+      const row = parseInt(rowNumber, 10);
+      if (!row || row < 2) {
+        return res.status(400).json({ error: 'Invalid row number' });
+      }
+
+      // Write only AS (col 44) and AT (col 45) for the given row.
+      // Store "TRUE"/"FALSE" strings for easy sheet readability.
+      const cancelVal   = cancelValidation   ? 'TRUE' : 'FALSE';
+      const underageVal = underageValidation ? 'TRUE' : 'FALSE';
+
+      await sheetsService.updateCellRange('DB', `AS${row}:AT${row}`, [cancelVal, underageVal]);
+
+      // Clear booking cache so OldBookings reflects the change immediately
+      cache.del('old_bookings_all');
+
+      return res.json({
+        success: true,
+        rowNumber: row,
+        cancelValidation:   cancelValidation,
+        underageValidation: underageValidation
+      });
+    } catch (error) {
+      console.error('updateValidation error:', error.message);
+      res.status(500).json({ error: 'Failed to update validation flags' });
     }
   }
 
