@@ -63,9 +63,9 @@ class SheetsService {
         if (sheetName === 'Intake') {
           sheetRange = 'A:AK';
         } 
-        // DB sheet has 46 columns (A-AT) - includes cancel_validation (AS) and underage_validation (AT)
+        // DB sheet has 47 columns (A-AU) - includes companion_area (AU) at index 46
         else if (sheetName === 'DB') {
-          sheetRange = 'A:AT';
+          sheetRange = 'A:AU';
         } 
         // Default for other sheets
         else {
@@ -113,7 +113,7 @@ class SheetsService {
       if (sheetName === 'Intake') {
         sheetRange = `A${rowIndex}:AK${rowIndex}`;
       } else if (sheetName === 'DB') {
-        sheetRange = `A${rowIndex}:AT${rowIndex}`; // extended to col AT (index 45) for cancel/underage validation
+        sheetRange = `A${rowIndex}:AU${rowIndex}`; // extended to col AU (index 46) for companion_area
       } else {
         sheetRange = `A${rowIndex}:Z${rowIndex}`;
       }

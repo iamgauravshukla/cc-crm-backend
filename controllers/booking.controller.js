@@ -46,6 +46,7 @@ const bookingSchema = Joi.object({
   companionFreebie: Joi.string().allow('').optional(),
   companionTreatment: Joi.string().allow('').optional(),
   companionGender: Joi.string().valid('Male', 'Female', '').allow('').optional(),
+  companionArea: Joi.string().allow('').optional(),
   bookingDetails: Joi.string().allow('').optional(),
   adInteracted: Joi.string().allow('').optional(),
   agent: Joi.string().required()
@@ -197,7 +198,8 @@ class BookingController {
         finalStatus,                            // 42: dash_booking_status (updated if promo hunter)
         '',                                     // 43: cancellation_time (empty for new bookings)
         '',                                     // 44: cancel_validation (FALSE by default)
-        ''                                      // 45: underage_validation (FALSE by default)
+        '',                                     // 45: underage_validation (FALSE by default)
+        bookingData.companionArea || ''          // 46: companion_area
       ];
       await sheetsService.appendRow('DB', masterDbRow);
 
@@ -296,6 +298,7 @@ class BookingController {
             companionAge: row[22] || '',
             companionGender: row[23] || '',
             companionFreebie: row[24] || '',
+            companionArea: row[46] || '',
             // Exclusion validation flags (cols 44–45)
             cancelValidation:   (row[44] || '').toString().toUpperCase() === 'TRUE',
             underageValidation: (row[45] || '').toString().toUpperCase() === 'TRUE'
@@ -725,7 +728,8 @@ class BookingController {
         bookingData.status || 'Scheduled',      // 42: dash_booking_status (update to match)
         cancellationTime,                        // 43: cancellation_time (track when cancelled)
         existingRow[44] || '',                  // 44: cancel_validation (preserve)
-        existingRow[45] || ''                   // 45: underage_validation (preserve)
+        existingRow[45] || '',                  // 45: underage_validation (preserve)
+        bookingData.companionArea || ''          // 46: companion_area
       ];
 
       console.log('========== UPDATED ROW COLUMNS ==========');
