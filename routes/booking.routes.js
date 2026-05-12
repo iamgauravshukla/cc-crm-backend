@@ -16,9 +16,11 @@ router.get('/daily-reports/next7days', bookingController.getNext7DaysBookings);
 router.get('/daily-reports/cancellations', bookingController.getCancellations);
 router.get('/daily-reports/arrivals-today', bookingController.getArrivalsToday);
 router.get('/daily-reports/tomorrow-summary', bookingController.getTomorrowSummary);
+router.get('/cc-report', bookingController.getCCReport);
 router.get('/old', bookingController.getOldBookings);
 router.get('/:id', bookingController.getBookingById);
 router.put('/:id', bookingController.updateBooking);
 router.patch('/:rowNumber/validation', bookingController.updateValidation);
+router.delete('/:rowNumber', bookingController.deleteBooking);
 
 module.exports = router;

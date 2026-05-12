@@ -242,73 +242,62 @@ class BookingController {
       const appointmentStartDate = req.query.appointmentStartDate;
       const appointmentEndDate = req.query.appointmentEndDate;
       
-      // Try to get from cache
-      let allBookings = cache.get('old_bookings_all');
+      // Always read fresh from Google Sheets (no caching)
+      const rows = await sheetsService.readSheet('DB');
 
-      if (!allBookings) {
-        // Read from Google Sheets
-        const rows = await sheetsService.readSheet('DB');
-        
-        if (rows.length < 2) {
-          return res.json({
-            bookings: [],
-            pagination: {
-              page: 1,
-              limit,
-              total: 0,
-              totalPages: 0
-            }
-          });
+      if (rows.length < 2) {
+        return res.json({
+          bookings: [],
+          pagination: {
+            page: 1,
+            limit,
+            total: 0,
+            totalPages: 0
+          }
+        });
+      }
+
+      // Parse rows into objects
+      const allBookings = rows.slice(1).map((row, index) => {
+        // Parse price - remove peso sign and any non-numeric characters except decimal point
+        let price = row[12] || '0';
+        if (typeof price === 'string') {
+          price = price.replace(/[^0-9.]/g, '');
         }
 
-        const headers = rows[0];
-        
-        // Parse rows into objects - CORRECTED COLUMN MAPPING for 44-column DB sheet
-        allBookings = rows.slice(1).map((row, index) => {
-          // Parse price - remove peso sign and any non-numeric characters except decimal point
-          let price = row[12] || '0';
-          if (typeof price === 'string') {
-            price = price.replace(/[^0-9.]/g, '');
-          }
-          
-          return {
-            rowNumber: index + 2,
-            timestamp: row[0] || '',
-            branch: row[1] || '',
-            status: row[2] || '',
-            date: row[3] || '',
-            firstName: row[4] || '',
-            lastName: row[5] || '',
-            age: row[6] || '',
-            gender: row[7] || '',
-            treatment: row[8] || '',
-            area: row[9] || '',
-            freebie: row[10] || '',
-            companionTreatment: row[11] || '',
-            totalPrice: parseFloat(price) || 0,
-            paymentMode: row[13] || '',
-            phone: row[14] || '',
-            socialMedia: row[15] || '',
-            email: row[16] || '',
-            agent: row[17] || '',
-            bookingDetails: row[18] || '',
-            adInteracted: row[19] || '',
-            companionFirstName: row[20] || '',
-            companionLastName: row[21] || '',
-            companionAge: row[22] || '',
-            companionGender: row[23] || '',
-            companionFreebie: row[24] || '',
-            companionArea: row[46] || '',
-            // Exclusion validation flags (cols 44–45)
-            cancelValidation:   (row[44] || '').toString().toUpperCase() === 'TRUE',
-            underageValidation: (row[45] || '').toString().toUpperCase() === 'TRUE'
-          };
-        });
-
-        // Note: Sheet rows are in chronological order - row 2 is oldest, last row is newest
-        // Cache for 5 minutes
-        cache.set('old_bookings_all', allBookings);
-      }
+        return {
+          rowNumber: index + 2,
+          timestamp: row[0] || '',
+          branch: row[1] || '',
+          status: row[2] || '',
+          date: row[3] || '',
+          firstName: row[4] || '',
+          lastName: row[5] || '',
+          age: row[6] || '',
+          gender: row[7] || '',
+          treatment: row[8] || '',
+          area: row[9] || '',
+          freebie: row[10] || '',
+          companionTreatment: row[11] || '',
+          totalPrice: parseFloat(price) || 0,
+          paymentMode: row[13] || '',
+          phone: row[14] || '',
+          socialMedia: row[15] || '',
+          email: row[16] || '',
+          agent: row[17] || '',
+          bookingDetails: row[18] || '',
+          adInteracted: row[19] || '',
+          companionFirstName: row[20] || '',
+          companionLastName: row[21] || '',
+          companionAge: row[22] || '',
+          companionGender: row[23] || '',
+          companionFreebie: row[24] || '',
+          companionArea: row[46] || '',
+          // Exclusion validation flags (cols 44–45)
+          cancelValidation:   (row[44] || '').toString().toUpperCase() === 'TRUE',
+          underageValidation: (row[45] || '').toString().toUpperCase() === 'TRUE'
+        };
+      });
 
       // Pre-calculate all date boundaries once (outside the filter loop for performance)
       const now = new Date();
@@ -425,7 +414,7 @@ class BookingController {
         if (applyAppointmentFilter) {
           const appointmentDate = parseDate(booking.date, false);
           if (appointmentDate && !isNaN(appointmentDate.getTime())) {
-            if (appointmentDate < appointmentDateStart || appointmentDate > appointmentDateEnd) {
+            if (appointmentDate < appointmentDateStart || appointmentDate >= appointmentDateEnd) {
               return false;
             }
           }
@@ -1448,6 +1437,191 @@ class BookingController {
     } catch (error) {
       console.error('Get tomorrow summary error:', error);
       res.status(500).json({ error: 'Failed to fetch tomorrow summary' });
+    }
+  }
+
+  // GET /bookings/cc-report
+  // All-in-one payload for the CC Booking Report dashboard.
+  // Sections:
+  //   totalSchedulesToday    – byBranch count/revenue + ots/additional split
+  //   totalArrivalsToday     – byBranch count + otsArrivals/additionalArrivals split
+  // DELETE /bookings/:rowNumber — Admin only.
+  // Deletes a booking row from the DB sheet and the matching row from the Intake sheet
+  // (matched by the bookingId UUID stored at DB col 34 / Intake col AI index 34).
+  async deleteBooking(req, res) {
+    try {
+      if (req.user?.role !== 'Admin') {
+        return res.status(403).json({ error: 'Only admins can delete bookings' });
+      }
+
+      const rowNumber = parseInt(req.params.rowNumber, 10);
+      if (!rowNumber || rowNumber < 2) {
+        return res.status(400).json({ error: 'Invalid row number' });
+      }
+
+      // Read the DB sheet to get the bookingId (record_id at col index 34)
+      const dbRows = await sheetsService.readSheet('DB');
+      const targetRow = dbRows[rowNumber - 1]; // rowNumber is 1-based, array is 0-based
+      if (!targetRow) {
+        return res.status(404).json({ error: 'Booking row not found' });
+      }
+      const bookingId = targetRow[34] || '';
+
+      // Delete from DB sheet
+      await sheetsService.deleteRow('DB', rowNumber);
+
+      // Delete matching row from Intake sheet (record_id is at col index 34 = column AI)
+      if (bookingId) {
+        const intakeRows = await sheetsService.readSheet('Intake');
+        const intakeRowIdx = intakeRows.findIndex((r, i) => i > 0 && (r[34] || '') === bookingId);
+        if (intakeRowIdx !== -1) {
+          // intakeRowIdx is 0-based; sheet row = intakeRowIdx + 1
+          await sheetsService.deleteRow('Intake', intakeRowIdx + 1);
+        }
+      }
+
+      return res.json({ success: true, message: 'Booking deleted successfully', rowNumber });
+    } catch (error) {
+      console.error('deleteBooking error:', error.message);
+      res.status(500).json({ error: 'Failed to delete booking', details: error.message });
+    }
+  }
+
+  //   totalSchedulesTomorrow – byBranch count + otsTomorrow/additionalTomorrow split
+  //   paymentModesTomorrow   – { Cash, Debit, Credit } counts for tomorrow's schedule
+  //   totalSchedulesNext7    – byBranch count + otsNext7/additionalNext7 split
+  //   totalOTS               – byBranch OTS count (today+tomorrow+next7) + grand total
+  async getCCReport(req, res) {
+    try {
+      const dbRows = await sheetsService.readSheet('DB');
+      if (dbRows.length < 2) {
+        return res.json({ success: true, data: {} });
+      }
+
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
+      const next7End  = new Date(today); next7End.setDate(today.getDate() + 7);
+
+      const parseDate = (str) => {
+        if (!str) return null;
+        const p = parseDateString(str);
+        if (!p || isNaN(p.getTime())) return null;
+        const d = new Date(p); d.setHours(0,0,0,0); return d;
+      };
+
+      const isDay  = (d, ref) => d && d.getTime() === ref.getTime();
+      const inNext7 = (d) => d && d > today && d <= next7End;
+      const inNext7Inc = (d) => d && d >= today && d <= next7End;
+
+      // branch → { count, revenue }
+      const makeBranchMap = () => ({});
+      const inc = (map, branch, revenue = 0) => {
+        if (!map[branch]) map[branch] = { count: 0, revenue: 0 };
+        map[branch].count++;
+        map[branch].revenue += revenue;
+      };
+
+      const totalSchedulesToday    = { ots: 0, additional: 0, byBranch: makeBranchMap(), otsRevenue: 0, additionalRevenue: 0 };
+      const totalArrivalsToday     = { otsArrivals: 0, additionalArrivals: 0, byBranch: makeBranchMap() };
+      const totalSchedulesTomorrow = { otsTomorrow: 0, additionalTomorrow: 0, byBranch: makeBranchMap() };
+      const paymentModesTomorrow   = { Cash: 0, Debit: 0, Credit: 0 };
+      const totalSchedulesNext7    = { otsNext7: 0, additionalNext7: 0, byBranch: makeBranchMap() };
+      const totalOTSByBranch       = makeBranchMap(); // OTS = created today
+      const arrivalsStatusMap      = {};
+
+      for (let i = 1; i < dbRows.length; i++) {
+        const row = dbRows[i];
+        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
+        if (cancelValidation) continue;
+
+        const branch      = row[1] || 'Unknown';
+        const rawStatus   = row[2] || '';
+        const statusLower = rawStatus.toLowerCase().replace(/\s+/g, ' ').trim();
+        const bookingDate = parseDate(row[3]);
+        const createdDate = parseDate(row[0]);
+        const price       = parseFloat((row[12] || '0').toString().replace(/[^0-9.]/g, '')) || 0;
+        const payMode     = (row[13] || '').trim();
+
+        if (!bookingDate) continue;
+
+        const createdToday = createdDate && isDay(createdDate, today);
+        const cancelled    = statusLower.includes('cancel');
+        const isArrived    = statusLower === 'arrived & bought' || statusLower === 'arrived not potential';
+        const underageVal  = (row[45] || '').toString().toUpperCase() === 'TRUE';
+
+        // ── Section 1: Total Schedules Today ──────────────────────────
+        if (!cancelled && isDay(bookingDate, today)) {
+          inc(totalSchedulesToday.byBranch, branch, price);
+          if (createdToday) {
+            totalSchedulesToday.ots++;
+            totalSchedulesToday.otsRevenue += price;
+            inc(totalOTSByBranch, branch);
+          } else {
+            totalSchedulesToday.additional++;
+            totalSchedulesToday.additionalRevenue += price;
+          }
+        }
+
+        // ── Section 2: Total Arrivals Today ───────────────────────────
+        if (!underageVal && isArrived && isDay(bookingDate, today)) {
+          inc(totalArrivalsToday.byBranch, branch);
+          if (!arrivalsStatusMap[rawStatus]) arrivalsStatusMap[rawStatus] = 0;
+          arrivalsStatusMap[rawStatus]++;
+          if (createdToday) totalArrivalsToday.otsArrivals++;
+          else              totalArrivalsToday.additionalArrivals++;
+        }
+
+        // ── Section 3: Total Schedules Tomorrow ───────────────────────
+        if (!cancelled && isDay(bookingDate, tomorrow)) {
+          inc(totalSchedulesTomorrow.byBranch, branch, price);
+          // Payment modes for tomorrow
+          const modeKey = payMode.toLowerCase().includes('cash') ? 'Cash'
+                        : payMode.toLowerCase().includes('debit') ? 'Debit'
+                        : payMode.toLowerCase().includes('credit') ? 'Credit' : null;
+          if (modeKey) paymentModesTomorrow[modeKey]++;
+
+          if (createdToday) totalSchedulesTomorrow.otsTomorrow++;
+          else              totalSchedulesTomorrow.additionalTomorrow++;
+
+          // OTS = created today (for OTS grand total section)
+          if (createdToday) inc(totalOTSByBranch, branch);
+        }
+
+        // ── Section 4: Total Schedules Next 7 Days ────────────────────
+        if (!cancelled && inNext7(bookingDate)) {
+          inc(totalSchedulesNext7.byBranch, branch, price);
+          if (createdToday) {
+            totalSchedulesNext7.otsNext7++;
+            inc(totalOTSByBranch, branch);
+          } else {
+            totalSchedulesNext7.additionalNext7++;
+          }
+        }
+      }
+
+      // Derived totals
+      const totalToday    = Object.values(totalSchedulesToday.byBranch).reduce((s, b) => s + b.count, 0);
+      const totalTomorrow = Object.values(totalSchedulesTomorrow.byBranch).reduce((s, b) => s + b.count, 0);
+      const totalArrivals = Object.values(totalArrivalsToday.byBranch).reduce((s, b) => s + b.count, 0);
+      const totalNext7    = Object.values(totalSchedulesNext7.byBranch).reduce((s, b) => s + b.count, 0);
+      const totalOTS      = Object.values(totalOTSByBranch).reduce((s, b) => s + b.count, 0);
+
+      return res.json({
+        success: true,
+        generatedAt: new Date().toISOString(),
+        data: {
+          totalSchedulesToday:    { ...totalSchedulesToday,    total: totalToday },
+          totalArrivalsToday:     { ...totalArrivalsToday,     total: totalArrivals, byStatus: arrivalsStatusMap },
+          totalSchedulesTomorrow: { ...totalSchedulesTomorrow, total: totalTomorrow },
+          paymentModesTomorrow,
+          totalSchedulesNext7:    { ...totalSchedulesNext7,    total: totalNext7 },
+          totalOTS:               { byBranch: totalOTSByBranch, total: totalOTS },
+        }
+      });
+    } catch (error) {
+      console.error('getCCReport error:', error.message);
+      res.status(500).json({ error: 'Failed to generate CC report' });
     }
   }
 }
