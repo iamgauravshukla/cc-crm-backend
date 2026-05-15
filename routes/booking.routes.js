@@ -17,6 +17,7 @@ router.get('/daily-reports/cancellations', bookingController.getCancellations);
 router.get('/daily-reports/arrivals-today', bookingController.getArrivalsToday);
 router.get('/daily-reports/tomorrow-summary', bookingController.getTomorrowSummary);
 router.get('/cc-report', bookingController.getCCReport);
+router.get('/cc-report/drilldown', bookingController.getCCReportDrilldown);
 router.get('/old', bookingController.getOldBookings);
 router.get('/:id', bookingController.getBookingById);
 router.put('/:id', bookingController.updateBooking);

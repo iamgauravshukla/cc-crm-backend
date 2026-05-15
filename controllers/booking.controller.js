@@ -826,10 +826,12 @@ class BookingController {
       today.setHours(0, 0, 0, 0);
       const tomorrow = new Date(today);
       tomorrow.setDate(tomorrow.getDate() + 1);
+      const dayAfterTomorrow = new Date(tomorrow);
+      dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 1);
       const nextSevenDaysEnd = new Date(today);
       nextSevenDaysEnd.setDate(nextSevenDaysEnd.getDate() + 7);
 
-      console.log(`📅 Today: ${today.toDateString()}, Tomorrow: ${tomorrow.toDateString()}`);
+      console.log(`📅 Today: ${today.toDateString()}, Tomorrow: ${tomorrow.toDateString()}, DayAfterTomorrow: ${dayAfterTomorrow.toDateString()}`);
 
 
       // Helper to extract date-only from timestamp string (e.g. "May 5 2026 10:30 AM")
@@ -859,7 +861,7 @@ class BookingController {
       const isToday = (date) => date && date.getTime() === today.getTime();
       const isTomorrow = (date) => date && date.getTime() === tomorrow.getTime();
       const isNext7Days = (date) => date && date > today && date <= nextSevenDaysEnd;
-      const isInNext7Days = (date) => date && date >= today && date <= nextSevenDaysEnd;
+      const isInNext7Days = (date) => date && date >= dayAfterTomorrow && date <= nextSevenDaysEnd;
 
       // row[43] = cancellation_time: set by updateBooking when status changed to Cancelled
       // Covers: cancelled via CRM today (any creation date) OR created+cancelled today without CRM
@@ -920,9 +922,6 @@ class BookingController {
         const lastName = row[5];
         const price = parsePrice(row[12]);
         const cancellationTime = row[43];
-        // Skip rows flagged with cancel_validation — excluded from all Daily Report sections
-        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
-        if (cancelValidation) continue;
 
         // Parse booking date from formatted date column
         const bookingDate = parseBookingDate(bookingDateStr);
@@ -942,8 +941,8 @@ class BookingController {
         
         processedCount++;
 
-        // Section 1: OTS Bookings (Created today + Scheduled for today)
-        if (createdToday && isToday(bookingDate) && !status.includes('cancel')) {
+        // Section 1: OTS Bookings (Created today + Scheduled for today, all statuses)
+        if (createdToday && isToday(bookingDate)) {
           reports.otsBookings.count++;
           reports.otsBookings.revenue += price;
           reports.otsBookings.total++;
@@ -953,8 +952,8 @@ class BookingController {
           }
         }
 
-        // Section 2: OVERALL Bookings (Created today + Scheduled for next 7 days, not today)
-        if (createdToday && isNext7Days(bookingDate) && !status.includes('cancel')) {
+        // Section 2: OVERALL Bookings (Created today + Scheduled tomorrow→+7 days, all statuses)
+        if (createdToday && isNext7Days(bookingDate)) {
           reports.overallBookings.count++;
           reports.overallBookings.revenue += price;
           reports.overallBookings.total++;
@@ -964,16 +963,16 @@ class BookingController {
           }
         }
 
-        // Section 3: Booked Tomorrow per Branch (Created today, scheduled for tomorrow)
-        if (createdToday && isTomorrow(bookingDate) && !status.includes('cancel')) {
+        // Section 3: Booked Tomorrow per Branch (Created today, scheduled tomorrow, Scheduled status only)
+        if (createdToday && isTomorrow(bookingDate) && status === 'scheduled') {
           if (reports.bookedTomorrow.byBranch[branch]) {
             reports.bookedTomorrow.byBranch[branch].count++;
             reports.bookedTomorrow.byBranch[branch].revenue += price;
           }
         }
 
-        // Section 4: Booked Next 7 Days per Branch (Any bookings next 7 days)
-        if (isInNext7Days(bookingDate) && !status.includes('cancel')) {
+        // Section 4: Booked Next 7 Days per Branch (Created today, day-after-tomorrow→+7, Scheduled only)
+        if (createdToday && isInNext7Days(bookingDate) && status === 'scheduled') {
           if (reports.bookedNext7Days.byBranch[branch]) {
             reports.bookedNext7Days.byBranch[branch].count++;
             reports.bookedNext7Days.byBranch[branch].revenue += price;
@@ -992,8 +991,8 @@ class BookingController {
           }
         }
 
-        // Section 6: Overall Bookings Tomorrow (Scheduled for tomorrow, anytime)
-        if (isTomorrow(bookingDate) && !status.includes('cancel')) {
+        // Section 6: Overall Bookings Tomorrow (Scheduled tomorrow, any creation date, Scheduled status only)
+        if (isTomorrow(bookingDate) && status === 'scheduled') {
           reports.overallBookingsTomorrow.count++;
           reports.overallBookingsTomorrow.revenue += price;
           reports.overallBookingsTomorrow.total++;
@@ -1078,8 +1077,7 @@ class BookingController {
         const createdDate = getDateFromTimestamp(timestamp);
         const createdToday = createdDate && createdDate.getTime() === today.getTime();
 
-        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
-        if (createdToday && isToday(bookingDate) && !status.includes('cancel') && !cancelValidation) {
+        if (createdToday && isToday(bookingDate)) {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',
@@ -1142,8 +1140,7 @@ class BookingController {
         const createdDate = getDateFromTimestamp(timestamp);
         const createdToday = createdDate && createdDate.getTime() === today.getTime();
 
-        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
-        if (createdToday && isNext7Days(bookingDate) && !status.includes('cancel') && !cancelValidation) {
+        if (createdToday && isNext7Days(bookingDate)) {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',
@@ -1204,8 +1201,7 @@ class BookingController {
         const createdDate = getDateFromTimestamp(timestamp);
         const createdToday = createdDate && createdDate.getTime() === today.getTime();
 
-        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
-        if (createdToday && isTomorrow(bookingDate) && !status.includes('cancel') && !cancelValidation) {
+        if (createdToday && isTomorrow(bookingDate) && status === 'scheduled') {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',
@@ -1234,6 +1230,8 @@ class BookingController {
       const dbRows = await sheetsService.readSheet('DB');
       const today = new Date();
       today.setHours(0, 0, 0, 0);
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
       const nextSevenDaysEnd = new Date(today);
       nextSevenDaysEnd.setDate(nextSevenDaysEnd.getDate() + 7);
 
@@ -1246,18 +1244,30 @@ class BookingController {
         return d;
       };
 
-      const isInNext7Days = (date) => date && date >= today && date <= nextSevenDaysEnd;
+      const dayAfterTomorrow = new Date(tomorrow);
+      dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 1);
+
+      const getDateFromTimestamp = (timestampStr) => {
+        if (!timestampStr) return null;
+        const parsed = parseDateString(timestampStr);
+        if (!parsed || isNaN(parsed.getTime())) return null;
+        return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 0, 0, 0, 0);
+      };
+
+      const isInNext7Days = (date) => date && date >= dayAfterTomorrow && date <= nextSevenDaysEnd;
 
       const bookings = [];
       for (let i = 1; i < dbRows.length; i++) {
         const row = dbRows[i];
+        const timestamp = row[0];
         const bookingDateStr = row[3];
         const status = (row[2] || '').toLowerCase();
 
         const bookingDate = parseBookingDate(bookingDateStr);
+        const createdDate = getDateFromTimestamp(timestamp);
+        const createdToday = createdDate && createdDate.getTime() === today.getTime();
 
-        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
-        if (isInNext7Days(bookingDate) && !status.includes('cancel') && !cancelValidation) {
+        if (createdToday && isInNext7Days(bookingDate) && status === 'scheduled') {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',
@@ -1361,9 +1371,8 @@ class BookingController {
 
         const bookingDate = parseBookingDate(bookingDateStr);
 
-        const cancelValidation   = (row[44] || '').toString().toUpperCase() === 'TRUE';
         const underageValidation = (row[45] || '').toString().toUpperCase() === 'TRUE';
-        if (isToday(bookingDate) && arrivalStatuses.has(normalizedStatus) && !cancelValidation && !underageValidation) {
+        if (isToday(bookingDate) && arrivalStatuses.has(normalizedStatus) && !underageValidation) {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',
@@ -1416,8 +1425,7 @@ class BookingController {
 
         const bookingDate = parseBookingDate(bookingDateStr);
 
-        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
-        if (isTomorrow(bookingDate) && !status.includes('cancel') && !cancelValidation) {
+        if (isTomorrow(bookingDate) && status === 'scheduled') {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',
@@ -1470,13 +1478,15 @@ class BookingController {
       // Delete from DB sheet
       await sheetsService.deleteRow('DB', rowNumber);
 
-      // Delete matching row from Intake sheet (record_id is at col index 34 = column AI)
+      // Delete matching row from Intake sheet (record_id at col index 34 = column AI)
       if (bookingId) {
         const intakeRows = await sheetsService.readSheet('Intake');
         const intakeRowIdx = intakeRows.findIndex((r, i) => i > 0 && (r[34] || '') === bookingId);
         if (intakeRowIdx !== -1) {
-          // intakeRowIdx is 0-based; sheet row = intakeRowIdx + 1
           await sheetsService.deleteRow('Intake', intakeRowIdx + 1);
+          console.log(`✅ Deleted Intake row ${intakeRowIdx + 1} for bookingId ${bookingId}`);
+        } else {
+          console.log(`ℹ️ No matching Intake row found for bookingId ${bookingId}`);
         }
       }
 
@@ -1622,6 +1632,87 @@ class BookingController {
     } catch (error) {
       console.error('getCCReport error:', error.message);
       res.status(500).json({ error: 'Failed to generate CC report' });
+    }
+  }
+
+  // GET /bookings/cc-report/drilldown?section=<section>
+  // Returns detailed bookings for a CC Report section (filtered by branch or payMode on the client).
+  // Sections: schedules-today | arrivals | schedules-tomorrow | payment-tomorrow | next7days | ots
+  async getCCReportDrilldown(req, res) {
+    try {
+      const { section } = req.query;
+      const validSections = ['schedules-today', 'arrivals', 'schedules-tomorrow', 'payment-tomorrow', 'next7days', 'ots'];
+      if (!validSections.includes(section)) {
+        return res.status(400).json({ error: 'Invalid section. Must be one of: ' + validSections.join(', ') });
+      }
+
+      const dbRows = await sheetsService.readSheet('DB');
+      if (dbRows.length < 2) return res.json({ success: true, bookings: [] });
+
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
+      const next7End  = new Date(today); next7End.setDate(today.getDate() + 7);
+
+      const parseDate = (str) => {
+        if (!str) return null;
+        const p = parseDateString(str);
+        if (!p || isNaN(p.getTime())) return null;
+        const d = new Date(p); d.setHours(0, 0, 0, 0); return d;
+      };
+
+      const isDay   = (d, ref) => d && d.getTime() === ref.getTime();
+      const inNext7 = (d) => d && d > today && d <= next7End;
+
+      const bookings = [];
+      for (let i = 1; i < dbRows.length; i++) {
+        const row = dbRows[i];
+        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
+        if (cancelValidation) continue;
+
+        const branch      = row[1] || 'Unknown';
+        const rawStatus   = row[2] || '';
+        const statusLower = rawStatus.toLowerCase().replace(/\s+/g, ' ').trim();
+        const bookingDate = parseDate(row[3]);
+        const createdDate = parseDate(row[0]);
+        const payMode     = (row[13] || '').trim();
+
+        if (!bookingDate) continue;
+
+        const createdToday = createdDate && isDay(createdDate, today);
+        const cancelled    = statusLower.includes('cancel');
+        const isArrived    = statusLower === 'arrived & bought' || statusLower === 'arrived not potential';
+        const underageVal  = (row[45] || '').toString().toUpperCase() === 'TRUE';
+
+        let include = false;
+        if (section === 'schedules-today'    && !cancelled && isDay(bookingDate, today))    include = true;
+        else if (section === 'arrivals'      && !underageVal && isArrived && isDay(bookingDate, today)) include = true;
+        else if (section === 'schedules-tomorrow' && !cancelled && isDay(bookingDate, tomorrow)) include = true;
+        else if (section === 'payment-tomorrow'   && !cancelled && isDay(bookingDate, tomorrow)) include = true;
+        else if (section === 'next7days'     && !cancelled && inNext7(bookingDate))         include = true;
+        else if (section === 'ots'           && !cancelled && createdToday &&
+                 (isDay(bookingDate, today) || isDay(bookingDate, tomorrow) || inNext7(bookingDate))) include = true;
+
+        if (include) {
+          bookings.push({
+            firstName:   row[4]  || '',
+            lastName:    row[5]  || '',
+            branch,
+            date:        row[3]  || '',
+            treatment:   row[8]  || '',
+            totalPrice:  row[12] || 0,
+            status:      rawStatus,
+            phone:       row[14] || '',
+            email:       row[16] || '',
+            agent:       row[17] || '',
+            paymentMode: payMode,
+          });
+        }
+      }
+
+      res.json({ success: true, bookings });
+    } catch (error) {
+      console.error('getCCReportDrilldown error:', error.message);
+      res.status(500).json({ error: 'Failed to fetch drill-down bookings' });
     }
   }
 }

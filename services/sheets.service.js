@@ -6,6 +6,7 @@ class SheetsService {
     this.sheets = null;
     this.spreadsheetId = process.env.GOOGLE_SHEET_ID;
     this.initialized = false;
+    this._sheetNameCache = null; // { normalizedName -> actualTitle }
   }
 
   async initialize() {
@@ -45,6 +46,7 @@ class SheetsService {
 
       this.sheets = google.sheets({ version: 'v4', auth: this.auth });
       this.initialized = true;
+      this._sheetNameCache = null; // reset on re-init
       console.log('✅ Google Sheets API initialized');
     } catch (error) {
       console.error('❌ Failed to initialize Google Sheets API:', error.message);
@@ -52,31 +54,54 @@ class SheetsService {
     }
   }
 
+  // Resolves the actual tab title for a given name (case-insensitive).
+  // Caches the full list so subsequent calls are free.
+  async resolveSheetName(sheetName) {
+    if (!this._sheetNameCache) {
+      const response = await this.sheets.spreadsheets.get({
+        spreadsheetId: this.spreadsheetId
+      });
+      this._sheetNameCache = {};
+      for (const s of (response.data.sheets || [])) {
+        this._sheetNameCache[s.properties.title.toLowerCase()] = s.properties.title;
+      }
+      console.log('📋 Available sheet tabs:', Object.values(this._sheetNameCache).join(', '));
+    }
+    const actual = this._sheetNameCache[sheetName.toLowerCase()];
+    if (!actual) {
+      const available = Object.values(this._sheetNameCache).join(', ');
+      throw new Error(`Sheet "${sheetName}" not found. Available: ${available}`);
+    }
+    return actual;
+  }
+
   async readSheet(sheetName, range = null) {
     await this.initialize();
 
     try {
+      const actualName = await this.resolveSheetName(sheetName);
+
       // Default range based on sheet name
       let sheetRange = range;
       if (!sheetRange) {
         // Intake sheet has 37 columns (A-AK)
-        if (sheetName === 'Intake') {
+        if (sheetName.toLowerCase() === 'intake') {
           sheetRange = 'A:AK';
-        } 
+        }
         // DB sheet has 47 columns (A-AU) - includes companion_area (AU) at index 46
-        else if (sheetName === 'DB') {
+        else if (sheetName.toLowerCase() === 'db') {
           sheetRange = 'A:AU';
-        } 
+        }
         // Default for other sheets
         else {
           sheetRange = 'A:Z';
         }
       }
 
-      console.log(`Reading ${sheetName} sheet with range: ${sheetRange}`);
+      console.log(`Reading ${actualName} sheet with range: ${sheetRange}`);
       const response = await this.sheets.spreadsheets.values.get({
         spreadsheetId: this.spreadsheetId,
-        range: `${sheetName}!${sheetRange}`
+        range: `${actualName}!${sheetRange}`
       });
 
       return response.data.values || [];
@@ -167,20 +192,17 @@ class SheetsService {
 
   async getSheetId(sheetName) {
     await this.initialize();
-
     try {
+      // resolveSheetName uses cached list and handles case-insensitive matching
+      const actualName = await this.resolveSheetName(sheetName);
+      // Re-use the cache to find sheetId
       const response = await this.sheets.spreadsheets.get({
         spreadsheetId: this.spreadsheetId
       });
-
-      const sheet = response.data.sheets.find(
-        s => s.properties.title === sheetName
+      const sheet = (response.data.sheets || []).find(
+        s => s.properties.title === actualName
       );
-
-      if (!sheet) {
-        throw new Error(`Sheet ${sheetName} not found`);
-      }
-
+      if (!sheet) throw new Error(`Sheet ${sheetName} not found`);
       return sheet.properties.sheetId;
     } catch (error) {
       console.error(`Error getting sheet ID for ${sheetName}:`, error.message);
