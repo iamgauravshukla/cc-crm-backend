@@ -293,6 +293,7 @@ class BookingController {
           companionGender: row[23] || '',
           companionFreebie: row[24] || '',
           companionArea: row[46] || '',
+          promoHunterStatus: row[30] || '',
           // Exclusion validation flags (cols 44–45)
           cancelValidation:   (row[44] || '').toString().toUpperCase() === 'TRUE',
           underageValidation: (row[45] || '').toString().toUpperCase() === 'TRUE'
