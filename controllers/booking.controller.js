@@ -650,7 +650,9 @@ class BookingController {
       });
 
       // Prepare updated row for DB sheet (44 columns total, indices 0-43)
-      const timestamp = getCurrentTimestamp();
+      // NOTE: preserve the original creation timestamp (col 0) — do NOT overwrite it on edit
+      const originalTimestamp = existingRow[0] || '';
+      const nowTimestamp = getCurrentTimestamp(); // used only for cancellation_time
       
       // Handle dateTime - if provided, use it; otherwise preserve existing
       const dateTimeValue = bookingData.dateTime || existingRow[3] || '';
@@ -667,12 +669,12 @@ class BookingController {
       // Track cancellation time if status is being set to Cancelled
       let cancellationTime = existingRow[43] || ''; // preserve existing cancellation_time
       if (bookingData.status && bookingData.status.toLowerCase() === 'cancelled') {
-        cancellationTime = timestamp; // set cancellation time to now if cancelled
+        cancellationTime = nowTimestamp; // set cancellation time to now if cancelled
         console.log('Setting cancellation_time to:', cancellationTime);
       }
       
       const updatedDbRow = [
-        timestamp,                              // 0: Timestamp (updated)
+        originalTimestamp,                      // 0: Timestamp (PRESERVED — original creation time)
         bookingData.branch,                     // 1: Branch
         bookingData.status || 'Scheduled',      // 2: Booking Status
         dateTimeValue,                          // 3: Date (updated or preserved)
