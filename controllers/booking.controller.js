@@ -650,7 +650,15 @@ class BookingController {
         console.log(`${columnNames[index]}: ${value}`);
       });
 
-      // Prepare updated row for DB sheet (44 columns total, indices 0-43)
+      // ===== BOOKING DETAILS DEBUG =====
+      console.log('========== BOOKING DETAILS DEBUG ==========');
+      console.log(`Existing bookingDetails (col 18): "${existingRow[18]}"`);
+      console.log(`Incoming bookingDetails from request: "${bookingData.bookingDetails}"`);
+      console.log(`Existing adInteracted (col 19): "${existingRow[19]}"`);
+      console.log(`Incoming adInteracted from request: "${bookingData.adInteracted}"`);
+      console.log('============================================');
+
+      // Prepare updated row for DB sheet (47 columns total, indices 0-46)
       // NOTE: preserve the original creation timestamp (col 0) — do NOT overwrite it on edit
       const originalTimestamp = existingRow[0] || '';
       const nowTimestamp = getCurrentTimestamp(); // used only for cancellation_time
@@ -904,8 +912,8 @@ class BookingController {
 
       // Process each booking row
       // VALIDATION LOGIC:
-      // 1. OTS: Created TODAY + Scheduled TODAY + NOT cancelled
-      // 2. OVERALL: Created TODAY + Scheduled (Next7Days \ {TODAY}) + NOT cancelled
+      // 1. OTS: Created TODAY + Scheduled TODAY (all statuses)
+      // 2. OVERALL: Created TODAY + Scheduled TODAY→+7 days (all statuses, OTS ⊆ Overall)
       // 3. Tomorrow: Created TODAY + Scheduled TOMORROW + NOT cancelled
       // 4. Next7Days: Scheduled (Next7Days incl TODAY) + NOT cancelled (ignores when created)
       // 5. Cancellations: cancelled via CRM today OR created+cancelled today (no CRM update)
@@ -955,8 +963,9 @@ class BookingController {
           }
         }
 
-        // Section 2: OVERALL Bookings (Created today + Scheduled tomorrow→+7 days, all statuses)
-        if (createdToday && isNext7Days(bookingDate)) {
+        // Section 2: OVERALL Bookings (Created today + Scheduled today→+7 days, all statuses)
+        // Includes OTS (today) + next 7 days so Overall is always >= OTS
+        if (createdToday && (isToday(bookingDate) || isNext7Days(bookingDate))) {
           reports.overallBookings.count++;
           reports.overallBookings.revenue += price;
           reports.overallBookings.total++;
@@ -1130,6 +1139,7 @@ class BookingController {
         return d;
       };
 
+      const isToday = (date) => date && date.getTime() === today.getTime();
       const isNext7Days = (date) => date && date > today && date <= nextSevenDaysEnd;
 
       const bookings = [];
@@ -1143,7 +1153,8 @@ class BookingController {
         const createdDate = getDateFromTimestamp(timestamp);
         const createdToday = createdDate && createdDate.getTime() === today.getTime();
 
-        if (createdToday && isNext7Days(bookingDate)) {
+        // Include today (OTS) + next 7 days so Overall is always >= OTS
+        if (createdToday && (isToday(bookingDate) || isNext7Days(bookingDate))) {
           bookings.push({
             firstName: row[4] || '',
             lastName: row[5] || '',

@@ -133,20 +133,25 @@ class SheetsService {
     await this.initialize();
 
     try {
+      // Resolve actual sheet name (case-insensitive, same as readSheet)
+      const actualName = await this.resolveSheetName(sheetName);
+
       // Determine range based on sheet name (same as readSheet)
       let sheetRange;
-      if (sheetName === 'Intake') {
+      if (sheetName.toLowerCase() === 'intake') {
         sheetRange = `A${rowIndex}:AK${rowIndex}`;
-      } else if (sheetName === 'DB') {
+      } else if (sheetName.toLowerCase() === 'db') {
         sheetRange = `A${rowIndex}:AU${rowIndex}`; // extended to col AU (index 46) for companion_area
       } else {
         sheetRange = `A${rowIndex}:Z${rowIndex}`;
       }
 
+      console.log(`Updating ${actualName} sheet row ${rowIndex} with range: ${sheetRange}`);
+
       const response = await this.sheets.spreadsheets.values.update({
         spreadsheetId: this.spreadsheetId,
-        range: `${sheetName}!${sheetRange}`,
-        valueInputOption: 'USER_ENTERED',
+        range: `${actualName}!${sheetRange}`,
+        valueInputOption: 'RAW',
         resource: { values: [values] }
       });
 
@@ -161,10 +166,11 @@ class SheetsService {
   async updateCellRange(sheetName, range, values) {
     await this.initialize();
     try {
+      const actualName = await this.resolveSheetName(sheetName);
       const response = await this.sheets.spreadsheets.values.update({
         spreadsheetId: this.spreadsheetId,
-        range: `${sheetName}!${range}`,
-        valueInputOption: 'USER_ENTERED',
+        range: `${actualName}!${range}`,
+        valueInputOption: 'RAW',
         resource: { values: [values] }
       });
       return response.data;
