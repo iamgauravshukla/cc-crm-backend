@@ -428,6 +428,7 @@ class BookingController {
             booking.lastName.toLowerCase().includes(searchLower) ||
             booking.email.toLowerCase().includes(searchLower) ||
             booking.phone.includes(search) ||
+            booking.socialMedia.toLowerCase().includes(searchLower) ||
             booking.agent.toLowerCase().includes(searchLower) ||
             booking.treatment.toLowerCase().includes(searchLower) ||
             booking.branch.toLowerCase().includes(searchLower)
@@ -690,17 +691,17 @@ class BookingController {
         bookingData.firstName,                  // 4: First Name
         bookingData.lastName,                   // 5: Last Name
         bookingData.age,                        // 6: Age
-        bookingData.gender,                     // 7: Gender
-        bookingData.treatment,                  // 8: Promo/Treatment
+        bookingData.gender || existingRow[7] || '',     // 7: Gender (preserve if incoming is empty)
+        bookingData.treatment || existingRow[8] || '',  // 8: Promo/Treatment (preserve if incoming is empty)
         bookingData.area || '',                 // 9: Area
         bookingData.freebie || '',              // 10: Freebie
         bookingData.companionTreatment || '',   // 11: Companion Promo/Treatment
         bookingData.totalPrice,                 // 12: Total Price
-        bookingData.paymentMode,                // 13: Mode of payment
+        bookingData.paymentMode || existingRow[13] || '',  // 13: Mode of payment (preserve if incoming is empty)
         bookingData.phone,                      // 14: Phone
         bookingData.socialMedia || '',          // 15: Facebook / Instagram Name
         bookingData.email || '',                // 16: Email
-        bookingData.agent,                      // 17: Agent
+        bookingData.agent || existingRow[17] || '',     // 17: Agent (preserve if incoming is empty)
         bookingData.bookingDetails || '',       // 18: Booking Details
         bookingData.adInteracted || '',         // 19: Ad Interacted
         bookingData.companionFirstName || '',   // 20: Companion First Name
@@ -723,7 +724,7 @@ class BookingController {
         existingRow[37] || '',                  // 37: legacy_full_name (preserve)
         existingRow[38] || '',                  // 38: exclude_from_dashboards (preserve)
         existingRow[39] || '',                  // 39: dash_booking_created_at (preserve)
-        existingRow[40] || '',                  // 40: dash_appointment_date (preserve)
+        dateTimeValue || existingRow[40] || '', // 40: dash_appointment_date (sync with updated date)
         bookingData.branch,                     // 41: dash_branch (update to match)
         bookingData.status || 'Scheduled',      // 42: dash_booking_status (update to match)
         cancellationTime,                        // 43: cancellation_time (track when cancelled)

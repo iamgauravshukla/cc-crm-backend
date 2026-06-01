@@ -115,10 +115,26 @@ class SheetsService {
     await this.initialize();
 
     try {
+      const actualName = await this.resolveSheetName(sheetName);
+
+      // Use the correct column range per sheet (same as readSheet) so the API
+      // scans the full data extent when locating the append position.
+      let sheetRange;
+      if (sheetName.toLowerCase() === 'intake') {
+        sheetRange = 'A:AK';   // 37 columns
+      } else if (sheetName.toLowerCase() === 'db') {
+        sheetRange = 'A:AU';   // 47 columns
+      } else {
+        sheetRange = 'A:Z';
+      }
+
+      console.log(`Appending row to ${actualName} sheet with range: ${sheetRange}`);
+
       const response = await this.sheets.spreadsheets.values.append({
         spreadsheetId: this.spreadsheetId,
-        range: `${sheetName}!A:Z`,
+        range: `${actualName}!${sheetRange}`,
         valueInputOption: 'USER_ENTERED',
+        insertDataOption: 'INSERT_ROWS',
         resource: { values: [values] }
       });
 
