@@ -35,6 +35,31 @@ const bookingSchema = Joi.object({
   agent:               Joi.string().required()
 });
 
+// ── Activity log helper ───────────────────────────────────────────────────────
+async function logActivity(bookingId, user, action, changes = {}) {
+  try {
+    await pool.query(
+      `INSERT INTO booking_activity_log (booking_id, user_id, user_name, action, changes)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        bookingId,
+        user?.userId || null,
+        user?.name   || user?.email || 'System',
+        action,
+        JSON.stringify(changes)
+      ]
+    );
+  } catch (err) {
+    console.error('Activity log write failed:', err.message);
+  }
+}
+
+const normDate = v => {
+  if (v == null) return '';
+  if (v instanceof Date) return v.toISOString().split('T')[0];
+  return String(v).split('T')[0];
+};
+
 class BookingController {
 
   // ── createBooking ──────────────────────────────────────────────────────────
@@ -85,7 +110,7 @@ class BookingController {
           agent, booking_details, remarks, ad_interacted,
           email_norm, phone_norm, social_norm, full_name_norm, companion_full_name_norm,
           promo_hunter_status, match_reason, matched_source, matched_row, last_checked_at,
-          is_ots, is_ad_id, is_companion, is_high_priority,
+          is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion,
           follow_up_date
         ) VALUES (
           $1,'ACTIVE',$2,
@@ -117,6 +142,11 @@ class BookingController {
           d.followUpDate || null
         ]
       );
+
+      await logActivity(recordId, req.user, 'CREATED', {
+        branch: { to: d.branch }, booking_status: { to: finalStatus },
+        treatment: { to: d.treatment }, total_price: { to: d.totalPrice }
+      });
 
       res.status(201).json({
         message: 'Booking created successfully',
@@ -245,7 +275,7 @@ class BookingController {
             promo_hunter_status,
             cancel_validation, underage_cancellation,
             remarks, purchase_details,
-            is_ots, is_ad_id, is_companion, is_high_priority,
+            is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion,
             follow_up_date
           FROM bookings ${WHERE}
           ORDER BY appointment_date ${ORDER} NULLS LAST, created_at ${ORDER}
@@ -291,10 +321,11 @@ class BookingController {
         underageValidation: r.underage_cancellation || false,
         remarks:            r.remarks              || '',
         purchaseDetails:    r.purchase_details      || '',
-        isOts:              r.is_ots               || false,
-        isAdId:             r.is_ad_id             || false,
-        isCompanion:        r.is_companion         || false,
-        isHighPriority:     r.is_high_priority     || false,
+        isOts:             r.is_ots              || false,
+        isAdId:            r.is_ad_id            || false,
+        isCompanion:       r.is_companion        || false,
+        isHighPriority:    r.is_high_priority    || false,
+        isMetaConversion:  r.is_meta_conversion  || false,
         followUpDate:       r.follow_up_date       || null,
       }));
 
@@ -356,10 +387,11 @@ class BookingController {
           promoHunterStatus:  r.promo_hunter_status   || '',
           cancelValidation:   r.cancel_validation     || false,
           underageValidation: r.underage_cancellation || false,
-          isOts:              r.is_ots               || false,
-          isAdId:             r.is_ad_id             || false,
-          isCompanion:        r.is_companion         || false,
-          isHighPriority:     r.is_high_priority     || false
+          isOts:             r.is_ots             || false,
+          isAdId:            r.is_ad_id           || false,
+          isCompanion:       r.is_companion       || false,
+          isHighPriority:    r.is_high_priority   || false,
+          isMetaConversion:  r.is_meta_conversion || false,
         }
       });
     } catch (err) {
@@ -449,13 +481,14 @@ class BookingController {
           is_ad_id           = $31,
           is_companion       = $32,
           is_high_priority   = $33,
-          email_norm         = $34,
-          phone_norm         = $35,
-          social_norm        = $36,
-          full_name_norm     = $37,
-          companion_full_name_norm = $38,
-          follow_up_date   = $39
-        WHERE record_id = $40
+          is_meta_conversion = $34,
+          email_norm         = $35,
+          phone_norm         = $36,
+          social_norm        = $37,
+          full_name_norm     = $38,
+          companion_full_name_norm = $39,
+          follow_up_date   = $40
+        WHERE record_id = $41
       `, [
         d.branch           || cur.branch,
         d.status           || cur.booking_status,
@@ -486,14 +519,44 @@ class BookingController {
         d.companionArea      !== undefined ? (d.companionArea      || null) : cur.companion_area,
         d.remarks            !== undefined ? (d.remarks            || null) : cur.remarks,
         d.purchaseDetails    !== undefined ? (d.purchaseDetails    || null) : cur.purchase_details,
-        d.isOts         !== undefined ? d.isOts         : cur.is_ots,
-        d.isAdId        !== undefined ? d.isAdId        : cur.is_ad_id,
-        d.isCompanion   !== undefined ? d.isCompanion   : cur.is_companion,
-        d.isHighPriority !== undefined ? d.isHighPriority : cur.is_high_priority,
+        d.isOts              !== undefined ? d.isOts              : cur.is_ots,
+        d.isAdId             !== undefined ? d.isAdId             : cur.is_ad_id,
+        d.isCompanion        !== undefined ? d.isCompanion        : cur.is_companion,
+        d.isHighPriority     !== undefined ? d.isHighPriority     : cur.is_high_priority,
+        d.isMetaConversion   !== undefined ? d.isMetaConversion   : cur.is_meta_conversion,
         emailNorm, phoneNorm, socialNorm, fullName, companionFN,
         d.followUpDate !== undefined ? (d.followUpDate || null) : cur.follow_up_date,
         recordId
       ]);
+
+      // Compute diff and log activity
+      const diffPairs = [
+        ['booking_status',   d.status        || cur.booking_status, cur.booking_status],
+        ['branch',           d.branch        || cur.branch,          cur.branch],
+        ['appointment_date', newApptDate,                            normDate(cur.appointment_date)],
+        ['appointment_time', newApptTime,                            cur.appointment_time],
+        ['first_name',       d.firstName     || cur.first_name,      cur.first_name],
+        ['last_name',        d.lastName      || cur.last_name,       cur.last_name],
+        ['treatment',        d.treatment     || cur.treatment,       cur.treatment],
+        ['total_price',      String(d.totalPrice    !== undefined ? d.totalPrice    : cur.total_price),  String(cur.total_price)],
+        ['payment_mode',     d.paymentMode   || cur.payment_mode,    cur.payment_mode],
+        ['agent',            d.agent         || cur.agent,           cur.agent],
+        ['phone',            d.phone         || cur.phone,           cur.phone],
+        ['remarks',          d.remarks          !== undefined ? (d.remarks          || '') : (cur.remarks          || ''), cur.remarks          || ''],
+        ['purchase_details', d.purchaseDetails  !== undefined ? (d.purchaseDetails  || '') : (cur.purchase_details || ''), cur.purchase_details || ''],
+        ['follow_up_date',   normDate(d.followUpDate !== undefined ? d.followUpDate : cur.follow_up_date), normDate(cur.follow_up_date)],
+        ['is_ots',            String(d.isOts             !== undefined ? d.isOts             : cur.is_ots),             String(cur.is_ots)],
+        ['is_high_priority',  String(d.isHighPriority    !== undefined ? d.isHighPriority    : cur.is_high_priority),    String(cur.is_high_priority)],
+        ['is_meta_conversion',String(d.isMetaConversion  !== undefined ? d.isMetaConversion  : cur.is_meta_conversion),  String(cur.is_meta_conversion)],
+      ];
+      const changes = {};
+      for (const [field, nv, ov] of diffPairs) {
+        if (String(nv ?? '') !== String(ov ?? '')) changes[field] = { from: ov, to: nv };
+      }
+      const logAction = changes.booking_status ? 'STATUS_CHANGED'
+                      : Object.keys(changes).length > 0 ? 'UPDATED'
+                      : null;
+      if (logAction) await logActivity(recordId, user, logAction, changes);
 
       res.json({ success: true, message: 'Booking updated successfully', recordId, cancellationTime });
     } catch (err) {
@@ -1055,7 +1118,7 @@ class BookingController {
                first_name, last_name, age, gender, phone, email, social_media, treatment, area, freebie,
                total_price, payment_mode, agent, ad_interacted, booking_details, remarks, purchase_details,
                companion_first_name, companion_last_name, companion_age, companion_gender,
-               companion_freebie, companion_treatment, is_ots, is_ad_id, is_companion, is_high_priority,
+               companion_freebie, companion_treatment, is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion,
                promo_hunter_status, follow_up_date
         FROM bookings ${WHERE}
         ORDER BY appointment_date DESC NULLS LAST, created_at DESC
@@ -1153,6 +1216,24 @@ class BookingController {
         params
       );
 
+      if (rowCount > 0 && recordIds.length <= 200) {
+        const logChanges = {};
+        if (status)        logChanges.booking_status = { to: status };
+        if (followUpDate !== undefined) logChanges.follow_up_date = { to: followUpDate || null };
+        const logRows  = recordIds.map((_, i) => `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4}, $${i * 4 + 5})`);
+        const logParams = recordIds.flatMap(rid => [
+          rid,
+          req.user?.userId || null,
+          req.user?.name   || req.user?.email || 'System',
+          'BULK_STATUS',
+          JSON.stringify(logChanges)
+        ]);
+        await pool.query(
+          `INSERT INTO booking_activity_log (booking_id, user_id, user_name, action, changes) VALUES ${recordIds.map((_, i) => `($${i*5+1},$${i*5+2},$${i*5+3},$${i*5+4},$${i*5+5})`).join(',')}`,
+          logParams
+        ).catch(e => console.error('Bulk activity log failed:', e.message));
+      }
+
       res.json({ success: true, updated: rowCount, message: `${rowCount} booking(s) updated` });
     } catch (err) {
       console.error('Bulk update error:', err);
@@ -1177,7 +1258,7 @@ class BookingController {
                first_name, last_name, age, gender, phone, email, social_media, treatment, area, freebie,
                total_price, payment_mode, agent, booking_details, remarks, purchase_details,
                companion_first_name, companion_last_name,
-               promo_hunter_status, match_reason, is_ots, is_high_priority, follow_up_date
+               promo_hunter_status, match_reason, is_ots, is_high_priority, is_meta_conversion, follow_up_date
         FROM bookings
         WHERE record_status != 'DELETED'
           AND (
@@ -1230,8 +1311,9 @@ class BookingController {
         remarks:        r.remarks          || '',
         purchaseDetails: r.purchase_details || '',
         followUpDate:   r.follow_up_date   || null,
-        isOts:          r.is_ots           || false,
-        isHighPriority: r.is_high_priority  || false,
+        isOts:             r.is_ots             || false,
+        isHighPriority:    r.is_high_priority   || false,
+        isMetaConversion:  r.is_meta_conversion || false,
         promoHunterStatus: r.promo_hunter_status || '',
         createdAt:      r.created_at,
       }));
@@ -1240,6 +1322,74 @@ class BookingController {
     } catch (err) {
       console.error('Customer history error:', err);
       res.status(500).json({ error: 'Failed to fetch customer history' });
+    }
+  }
+
+  // ── getActivityLog ─────────────────────────────────────────────────────────
+  async getActivityLog(req, res) {
+    try {
+      const { id } = req.params;
+      const { rows } = await pool.query(
+        `SELECT id, user_name, action, changes, created_at
+         FROM booking_activity_log
+         WHERE booking_id = $1
+         ORDER BY created_at DESC
+         LIMIT 200`,
+        [id]
+      );
+      res.json({ success: true, log: rows });
+    } catch (err) {
+      console.error('Activity log error:', err);
+      res.status(500).json({ error: 'Failed to load activity log' });
+    }
+  }
+
+  // ── getKanbanBookings ──────────────────────────────────────────────────────
+  async getKanbanBookings(req, res) {
+    try {
+      const date   = req.query.date   || new Date().toISOString().split('T')[0];
+      const branch = (req.query.branch || '').trim();
+
+      const conds  = ["record_status != 'DELETED'", `appointment_date = $1::date`];
+      const params = [date];
+      if (branch && branch !== 'All') {
+        conds.push(`branch = $2`);
+        params.push(branch);
+      }
+
+      const { rows } = await pool.query(`
+        SELECT
+          record_id, booking_status, branch, appointment_time,
+          first_name, last_name, treatment, total_price, payment_mode,
+          agent, phone, is_ots, is_high_priority, is_meta_conversion, follow_up_date, remarks
+        FROM bookings
+        WHERE ${conds.join(' AND ')}
+        ORDER BY appointment_time ASC NULLS LAST, created_at ASC
+      `, params);
+
+      const bookings = rows.map(r => ({
+        recordId:      r.record_id,
+        status:        r.booking_status   || '',
+        branch:        r.branch           || '',
+        time:          r.appointment_time || '',
+        firstName:     r.first_name       || '',
+        lastName:      r.last_name        || '',
+        treatment:     r.treatment        || '',
+        totalPrice:    parseFloat(r.total_price) || 0,
+        paymentMode:   r.payment_mode     || '',
+        agent:         r.agent            || '',
+        phone:         r.phone            || '',
+        isOts:            r.is_ots             || false,
+        isHighPriority:   r.is_high_priority   || false,
+        isMetaConversion: r.is_meta_conversion || false,
+        followUpDate:     r.follow_up_date     || null,
+        remarks:       r.remarks          || '',
+      }));
+
+      res.json({ success: true, date, bookings });
+    } catch (err) {
+      console.error('Kanban error:', err);
+      res.status(500).json({ error: 'Failed to load kanban data' });
     }
   }
 }

@@ -3,11 +3,15 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../db/pool');
 
+const APP_VERSION = '1.0.0';
+
+// ── Quick health check ────────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   const health = {
     status: 'OK',
+    version: APP_VERSION,
     timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
+    uptime: Math.round(process.uptime()),
     environment: process.env.NODE_ENV || 'development',
     checks: { server: 'OK', environment: 'OK', database: 'CHECKING' }
   };
@@ -22,8 +26,11 @@ router.get('/', async (req, res) => {
     }
 
     try {
+      const t0 = Date.now();
       const { rows } = await pool.query('SELECT 1 AS ok');
+      const latencyMs = Date.now() - t0;
       health.checks.database = rows[0].ok === 1 ? 'OK' : 'ERROR';
+      health.checks.dbLatencyMs = latencyMs;
     } catch (err) {
       health.checks.database = 'ERROR';
       health.checks.databaseDetails = err.message;
@@ -36,21 +43,31 @@ router.get('/', async (req, res) => {
   }
 });
 
+// ── Detailed health check ─────────────────────────────────────────────────────
 router.get('/detailed', async (req, res) => {
+  const mem = process.memoryUsage();
   const detail = {
     status: 'OK',
+    version: APP_VERSION,
     timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
+    uptime: Math.round(process.uptime()),
+    pid: process.pid,
     memory: {
-      used:     Math.round(process.memoryUsage().heapUsed  / 1024 / 1024) + ' MB',
-      total:    Math.round(process.memoryUsage().heapTotal / 1024 / 1024) + ' MB',
-      external: Math.round(process.memoryUsage().external  / 1024 / 1024) + ' MB'
+      heapUsedMB:  Math.round(mem.heapUsed  / 1024 / 1024),
+      heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
+      rssMB:       Math.round(mem.rss       / 1024 / 1024),
+      externalMB:  Math.round(mem.external  / 1024 / 1024)
     },
     environment: {
       nodeVersion: process.version,
       platform:    process.platform,
       env:         process.env.NODE_ENV || 'development',
       port:        process.env.PORT     || 5001
+    },
+    pool: {
+      total:   pool.totalCount,
+      idle:    pool.idleCount,
+      waiting: pool.waitingCount
     },
     checks: { server: 'OK', environment: 'OK', database: 'CHECKING' }
   };
@@ -60,18 +77,49 @@ router.get('/detailed', async (req, res) => {
     const envStatus = {};
     required.forEach(v => { envStatus[v] = process.env[v] ? 'SET' : 'MISSING'; });
     detail.checks.environmentVariables = envStatus;
-
     const missing = required.filter(v => !process.env[v]);
     if (missing.length) { detail.checks.environment = 'WARNING'; detail.status = 'DEGRADED'; }
 
     try {
       const client = await pool.connect();
       try {
-        const { rows: cnt } = await client.query('SELECT COUNT(*) AS cnt FROM bookings LIMIT 1');
-        const { rows: uc }  = await client.query('SELECT COUNT(*) AS cnt FROM users LIMIT 1');
-        detail.checks.database = 'OK';
-        detail.checks.bookingsTable = { status: 'OK', rowCount: parseInt(cnt[0].cnt) };
-        detail.checks.usersTable    = { status: 'OK', rowCount: parseInt(uc[0].cnt)  };
+        const t0 = Date.now();
+
+        const [
+          { rows: ping },
+          { rows: bookingsCnt },
+          { rows: usersCnt },
+          { rows: savedViewsCnt },
+          { rows: tableList },
+          { rows: followUpCol }
+        ] = await Promise.all([
+          client.query('SELECT 1 AS ok'),
+          client.query('SELECT COUNT(*) AS cnt FROM bookings'),
+          client.query('SELECT COUNT(*) AS cnt FROM users'),
+          client.query("SELECT COUNT(*) AS cnt FROM saved_views"),
+          client.query(`
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+            ORDER BY table_name
+          `),
+          client.query(`
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'bookings' AND column_name = 'follow_up_date'
+          `)
+        ]);
+
+        detail.checks.dbLatencyMs = Date.now() - t0;
+        detail.checks.database = ping[0].ok === 1 ? 'OK' : 'ERROR';
+        detail.checks.tables   = tableList.map(r => r.table_name);
+        detail.checks.rowCounts = {
+          bookings:   parseInt(bookingsCnt[0].cnt),
+          users:      parseInt(usersCnt[0].cnt),
+          savedViews: parseInt(savedViewsCnt[0].cnt)
+        };
+        detail.checks.schema = {
+          followUpDateColumn: followUpCol.length > 0 ? 'PRESENT' : 'MISSING'
+        };
       } finally {
         client.release();
       }
@@ -81,9 +129,9 @@ router.get('/detailed', async (req, res) => {
       detail.status = 'ERROR';
     }
 
-    const allChecks  = Object.values(detail.checks);
-    if (allChecks.some(c => typeof c === 'string' && c === 'ERROR'))   detail.status = 'ERROR';
-    else if (allChecks.some(c => typeof c === 'string' && c === 'WARNING')) detail.status = 'DEGRADED';
+    const flatChecks = Object.values(detail.checks).filter(c => typeof c === 'string');
+    if      (flatChecks.some(c => c === 'ERROR'))   detail.status = 'ERROR';
+    else if (flatChecks.some(c => c === 'WARNING')) detail.status = 'DEGRADED';
 
     res.status(detail.status === 'OK' ? 200 : 503).json(detail);
   } catch (err) {

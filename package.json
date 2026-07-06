@@ -9,6 +9,7 @@
     "validate": "node utils/validate-sheets.js",
     "check-env": "node check-env.js",
     "db:setup": "node scripts/db-setup.js",
+    "db:migrate": "node scripts/migrate.js",
     "db:seed": "node scripts/migrate-from-excel.js"
   },
   "keywords": [
