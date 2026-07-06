@@ -14,7 +14,7 @@ const authMiddleware = async (req, res, next) => {
     }
 
     const token = authHeader.slice(7);
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
 
     const cacheKey = `user:${decoded.userId}`;
     let user = userCache.get(cacheKey);

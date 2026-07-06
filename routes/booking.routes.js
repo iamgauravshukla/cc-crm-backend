@@ -6,8 +6,11 @@ const authMiddleware = require('../middleware/auth.middleware');
 // All routes require authentication
 router.use(authMiddleware);
 
-// Booking routes
+// Booking routes — static paths must come before /:id
 router.post('/', bookingController.createBooking);
+router.post('/bulk-status', bookingController.bulkUpdateStatus);
+router.get('/export',  bookingController.exportBookings);
+router.get('/customer', bookingController.getCustomerHistory);
 router.get('/daily-reports', bookingController.getDailyReports);
 router.get('/daily-reports/ots', bookingController.getOTSBookings);
 router.get('/daily-reports/overall', bookingController.getOverallBookings);

@@ -4,6 +4,7 @@ const pool = require('../db/pool');
 const COMPLETED_STATUSES = ["'arrived not potential'", "'arrived & bought'", "'comeback & bought'"];
 const COMPLETED_SQL = `LOWER(booking_status) IN (${COMPLETED_STATUSES.join(',')})`;
 const ARRIVAL_SQL   = `LOWER(booking_status) IN ('arrived not potential', 'arrived & bought')`;
+const COMPLETED_STATUSES_JS = new Set(['arrived not potential', 'arrived & bought', 'comeback & bought']);
 
 /**
  * GET /api/dashboard/overview
@@ -251,15 +252,13 @@ async function getBookingTrend(req, res) {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-const COMPLETED_STATUSES_JS = new Set(['arrived not potential', 'arrived & bought', 'comeback & bought']);
-
 function mapBooking(r) {
   return {
     recordId:           r.record_id,
     createdAt:          r.created_at,
     branch:             r.branch || '',
     status:             r.status || '',
-    date:               r.date   ? r.date.toISOString().split('T')[0] : '',
+    date:               r.date   ? String(r.date).split('T')[0] : '',
     time:               r.time   || '',
     firstName:          r.first_name    || '',
     lastName:           r.last_name     || '',

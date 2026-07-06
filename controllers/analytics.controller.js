@@ -35,6 +35,27 @@ function buildFilter(branch, range, startDate, endDate) {
 
 function w(conds) { return `WHERE ${conds.join(' AND ')}`; }
 
+// Builds WHERE for the period immediately before the current filter window
+function buildPrevFilter(branch, range, startDate, endDate) {
+  const c = ["record_status != 'DELETED'"];
+  const p = [];
+  let i = 1;
+  if (branch && branch !== 'All') { c.push(`branch = $${i++}`); p.push(branch); }
+  if (startDate && endDate) {
+    const ms   = new Date(endDate) - new Date(startDate) + 86400000;
+    const pEnd = new Date(new Date(startDate) - 86400000);
+    const pSt  = new Date(pEnd - ms + 86400000);
+    c.push(`appointment_date >= $${i++}::date AND appointment_date <= $${i++}::date`);
+    p.push(pSt.toISOString().split('T')[0], pEnd.toISOString().split('T')[0]);
+  } else {
+    const d = { today: 1, week: 7, month: 30, quarter: 90 }[range] || 0;
+    if (!d) { c.push('1=0'); return { conds: c, params: p }; } // year: no meaningful prev
+    if (d === 1) c.push('appointment_date = CURRENT_DATE - 1');
+    else c.push(`appointment_date >= CURRENT_DATE - INTERVAL '${d * 2} days' AND appointment_date < CURRENT_DATE - INTERVAL '${d} days'`);
+  }
+  return { conds: c, params: p };
+}
+
 function rangeDays(range, startDate, endDate) {
   if (startDate && endDate) return Math.max(1, Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1);
   return { today: 1, week: 7, month: 30, quarter: 90, year: 365 }[range] || 365;
@@ -59,6 +80,10 @@ async function getAnalytics(req, res) {
     const { conds: bConds, params: bP } = buildFilter('All', range, startDate, endDate);
     const bWHERE = w(bConds);
 
+    // Previous period for delta comparison
+    const { conds: pvConds, params: pvP } = buildPrevFilter(branch, range, startDate, endDate);
+    const pvWHERE = w(pvConds);
+
     const [
       { rows: ovRows },
       { rows: brRows },
@@ -69,7 +94,10 @@ async function getAnalytics(req, res) {
       { rows: gnRows },
       { rows: agAgeRows },
       { rows: soRows },
-      { rows: tmRows }
+      { rows: tmRows },
+      { rows: pvRows },
+      { rows: fnRows },
+      { rows: dwRows }
     ] = await Promise.all([
       // 1. Overview: status breakdown + revenue (completed) + unique customers
       pool.query(`
@@ -157,7 +185,33 @@ async function getAnalytics(req, res) {
                    TO_CHAR(appointment_date,'DD Mon') AS label,
                    COUNT(*) AS cnt, SUM(total_price) AS revenue
             FROM bookings ${WHERE}
-            GROUP BY appointment_date ORDER BY appointment_date`, P)
+            GROUP BY appointment_date ORDER BY appointment_date`, P),
+
+      // 11. Previous period overview for delta comparison
+      pool.query(`
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE ${COMPLETED_IN}) AS completed,
+               SUM(CASE WHEN ${COMPLETED_IN} THEN total_price ELSE 0 END) AS revenue
+        FROM bookings ${pvWHERE}`, pvP),
+
+      // 12. Conversion funnel counts
+      pool.query(`
+        SELECT COUNT(*) AS total_bookings,
+               COUNT(*) FILTER (WHERE LOWER(booking_status) = 'scheduled') AS scheduled,
+               COUNT(*) FILTER (WHERE ${ARRIVAL_IN}) AS arrived,
+               COUNT(*) FILTER (WHERE LOWER(booking_status) IN ('arrived & bought','comeback & bought')) AS bought,
+               COUNT(*) FILTER (WHERE LOWER(booking_status) LIKE '%cancel%') AS cancelled,
+               COUNT(*) FILTER (WHERE LOWER(booking_status) = 'promo hunter') AS promo_hunters
+        FROM bookings ${WHERE}`, P),
+
+      // 13. Bookings by day of week
+      pool.query(`
+        SELECT EXTRACT(DOW FROM appointment_date) AS dow,
+               COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE ${ARRIVAL_IN}) AS arrived
+        FROM bookings ${WHERE}
+        GROUP BY EXTRACT(DOW FROM appointment_date)
+        ORDER BY dow`, P)
     ]);
 
     // ── assemble overview ──
@@ -167,7 +221,10 @@ async function getAnalytics(req, res) {
       const n = parseInt(r.total);
       totalBookings += n;
       statusBreakdown[r.status] = n;
-      if (parseFloat(r.rev) > 0) { completedRevenue += parseFloat(r.rev); completedBookings += n; }
+      if (SALE_STATUSES.has(r.status)) {
+        completedRevenue += parseFloat(r.rev || 0);
+        completedBookings += n;
+      }
     }
     // Unique customers via separate lightweight query
     const { rows: uniqRows } = await pool.query(
@@ -244,8 +301,67 @@ async function getAnalytics(req, res) {
 
     // ── time series ──
     const byMonth = tmRows.map(r => ({
-      month: r.label, count: parseInt(r.cnt), revenue: +parseFloat(r.revenue).toFixed(2)
+      month: r.label, count: parseInt(r.cnt), revenue: +parseFloat(r.revenue || 0).toFixed(2)
     }));
+
+    // ── previous period ──
+    const pvRow = pvRows[0] || {};
+    const previousOverview = {
+      totalBookings:     parseInt(pvRow.total    || 0),
+      completedBookings: parseInt(pvRow.completed|| 0),
+      totalRevenue:      +parseFloat(pvRow.revenue || 0).toFixed(2)
+    };
+
+    // ── funnel ──
+    const fnRow = fnRows[0] || {};
+    const funnelData = {
+      totalBookings: parseInt(fnRow.total_bookings || 0),
+      scheduled:     parseInt(fnRow.scheduled      || 0),
+      arrived:       parseInt(fnRow.arrived        || 0),
+      bought:        parseInt(fnRow.bought         || 0),
+      cancelled:     parseInt(fnRow.cancelled      || 0),
+      promoHunters:  parseInt(fnRow.promo_hunters  || 0)
+    };
+
+    // ── day of week ──
+    const DOW_LABELS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const dayOfWeekData = DOW_LABELS.map((day, idx) => {
+      const r = dwRows.find(r => parseInt(r.dow) === idx) || {};
+      return { dow: idx, day, total: parseInt(r.total || 0), arrived: parseInt(r.arrived || 0) };
+    });
+
+    // ── auto insights ──
+    const insights = [];
+    if (previousOverview.totalRevenue > 0) {
+      const pct = (overview.totalRevenue - previousOverview.totalRevenue) / previousOverview.totalRevenue * 100;
+      insights.push({ type: pct >= 0 ? 'positive' : 'negative',
+        text: `Revenue ${pct >= 0 ? '▲' : '▼'}${Math.abs(pct).toFixed(1)}% vs previous period (₱${Math.round(previousOverview.totalRevenue).toLocaleString()} → ₱${Math.round(overview.totalRevenue).toLocaleString()})` });
+    }
+    if (funnelData.totalBookings > 0) {
+      const arrRate  = (funnelData.arrived / funnelData.totalBookings * 100).toFixed(1);
+      const convRate = funnelData.arrived > 0 ? (funnelData.bought / funnelData.arrived * 100).toFixed(1) : '0';
+      insights.push({ type: parseFloat(arrRate) >= 55 ? 'positive' : 'warning',
+        text: `${arrRate}% arrival rate · ${convRate}% of arrivals converted to sales` });
+    }
+    if (branch === 'All' && branchPerformance.length > 0) {
+      const best = branchPerformance[0];
+      insights.push({ type: 'positive',
+        text: `Top branch: ${best.name} — ₱${best.revenue.toLocaleString()} revenue, ${best.arrivalRate}% arrival rate` });
+      const byArr = [...branchPerformance].filter(b => b.totalBookings >= 10).sort((a, b) => a.arrivalRate - b.arrivalRate);
+      if (byArr.length > 0 && byArr[0].arrivalRate < 50)
+        insights.push({ type: 'warning',
+          text: `${byArr[0].name} has the lowest arrival rate at ${byArr[0].arrivalRate}% — may need follow-up attention` });
+    }
+    if (dayOfWeekData.some(d => d.total > 0)) {
+      const peak = dayOfWeekData.reduce((a, b) => b.total > a.total ? b : a);
+      insights.push({ type: 'info',
+        text: `Busiest day: ${peak.day} with ${peak.total} bookings` });
+    }
+    if (marketingChannels.length > 0) {
+      const top = [...marketingChannels].filter(c => c.bookings >= 5).sort((a, b) => b.conversionRate - a.conversionRate)[0];
+      if (top) insights.push({ type: 'positive',
+        text: `Best channel: "${top.channel}" at ${top.conversionRate}% conversion rate` });
+    }
 
     res.json({
       success: true,
@@ -261,7 +377,11 @@ async function getAnalytics(req, res) {
         agentPerformance,
         demographicAnalysis: { byGender, byAgeGroup },
         timeSeriesData: { byMonth },
-        marketingChannels
+        marketingChannels,
+        previousOverview,
+        funnelData,
+        dayOfWeekData,
+        insights
       }
     });
   } catch (err) {
@@ -274,7 +394,7 @@ async function getAnalytics(req, res) {
 
 async function getAgentPerformance(req, res) {
   try {
-    const days      = parseInt(req.query.days) || 30;
+    const days      = Math.max(1, Math.min(365, Math.floor(parseInt(req.query.days) || 30)));
     const startDate = req.query.startDate;
     const endDate   = req.query.endDate;
 
@@ -345,7 +465,7 @@ async function getAgentPerformance(req, res) {
 
 async function getAdPerformance(req, res) {
   try {
-    const days      = parseInt(req.query.days) || 30;
+    const days      = Math.max(1, Math.min(365, Math.floor(parseInt(req.query.days) || 30)));
     const startDate = req.query.startDate;
     const endDate   = req.query.endDate;
     const branch    = req.query.branch;

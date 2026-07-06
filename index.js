@@ -11,7 +11,9 @@ const bookingRoutes = require('./routes/booking.routes');
 const analyticsRoutes = require('./routes/analytics.routes');
 const dashboardRoutes = require('./routes/dashboard.routes');
 const healthRoutes = require('./routes/health.routes');
-const leadsRoutes = require('./routes/leads.routes');
+const leadsRoutes      = require('./routes/leads.routes');
+const configRoutes     = require('./routes/config.routes');
+const savedViewsRoutes = require('./routes/savedViews.routes');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -58,7 +60,9 @@ app.use('/api/auth', authRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/analytics', analyticsRoutes);
-app.use('/api/leads', leadsRoutes);
+app.use('/api/leads',  leadsRoutes);
+app.use('/api/config', configRoutes);
+app.use('/api/saved-views', savedViewsRoutes);
 
 // Health check routes
 app.use('/health', healthRoutes);

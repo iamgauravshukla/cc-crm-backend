@@ -31,6 +31,7 @@ const bookingSchema = Joi.object({
   bookingDetails:      Joi.string().allow('').optional(),
   adInteracted:        Joi.string().allow('').optional(),
   remarks:             Joi.string().allow('').optional(),
+  followUpDate:        Joi.string().allow('', null).optional(),
   agent:               Joi.string().required()
 });
 
@@ -84,7 +85,8 @@ class BookingController {
           agent, booking_details, remarks, ad_interacted,
           email_norm, phone_norm, social_norm, full_name_norm, companion_full_name_norm,
           promo_hunter_status, match_reason, matched_source, matched_row, last_checked_at,
-          is_ots, is_ad_id, is_companion, is_high_priority
+          is_ots, is_ad_id, is_companion, is_high_priority,
+          follow_up_date
         ) VALUES (
           $1,'ACTIVE',$2,
           $3,$4,
@@ -97,7 +99,8 @@ class BookingController {
           $28,$29,$30,$31,
           $32,$33,$34,$35,$36,
           $37,$38,$39,$40,$2,
-          false,false,false,false
+          false,false,false,false,
+          $41
         )`,
         [
           recordId, now,
@@ -110,7 +113,8 @@ class BookingController {
           d.companionAge || null, d.companionGender || null, d.companionFreebie || null, d.companionArea || null,
           d.agent, d.bookingDetails || null, d.remarks || null, d.adInteracted || null,
           emailNorm, phoneNorm, socialNorm, fullName, companionFN,
-          promoResult.status, promoResult.matchReason || null, promoResult.matchedSource || null, promoResult.matchedRow || null
+          promoResult.status, promoResult.matchReason || null, promoResult.matchedSource || null, promoResult.matchedRow || null,
+          d.followUpDate || null
         ]
       );
 
@@ -241,7 +245,8 @@ class BookingController {
             promo_hunter_status,
             cancel_validation, underage_cancellation,
             remarks, purchase_details,
-            is_ots, is_ad_id, is_companion, is_high_priority
+            is_ots, is_ad_id, is_companion, is_high_priority,
+            follow_up_date
           FROM bookings ${WHERE}
           ORDER BY appointment_date ${ORDER} NULLS LAST, created_at ${ORDER}
           LIMIT ${limit} OFFSET ${OFFSET}
@@ -289,7 +294,8 @@ class BookingController {
         isOts:              r.is_ots               || false,
         isAdId:             r.is_ad_id             || false,
         isCompanion:        r.is_companion         || false,
-        isHighPriority:     r.is_high_priority     || false
+        isHighPriority:     r.is_high_priority     || false,
+        followUpDate:       r.follow_up_date       || null,
       }));
 
       res.json({
@@ -380,10 +386,10 @@ class BookingController {
 
       // RBAC: agents cannot change status or agent assignment
       if (user?.role !== 'Admin') {
-        if (d.status !== undefined && d.status !== cur.booking_status) {
+        if (d.status !== undefined && (d.status || '').toLowerCase() !== (cur.booking_status || '').toLowerCase()) {
           return res.status(403).json({ error: 'Agents cannot modify booking status', code: 'RESTRICTED_FIELDS' });
         }
-        if (d.agent !== undefined && d.agent !== cur.agent) {
+        if (d.agent !== undefined && (d.agent || '').toLowerCase() !== (cur.agent || '').toLowerCase()) {
           return res.status(403).json({ error: 'Agents cannot modify agent assignment', code: 'RESTRICTED_FIELDS' });
         }
       }
@@ -447,8 +453,9 @@ class BookingController {
           phone_norm         = $35,
           social_norm        = $36,
           full_name_norm     = $37,
-          companion_full_name_norm = $38
-        WHERE record_id = $39
+          companion_full_name_norm = $38,
+          follow_up_date   = $39
+        WHERE record_id = $40
       `, [
         d.branch           || cur.branch,
         d.status           || cur.booking_status,
@@ -484,6 +491,7 @@ class BookingController {
         d.isCompanion   !== undefined ? d.isCompanion   : cur.is_companion,
         d.isHighPriority !== undefined ? d.isHighPriority : cur.is_high_priority,
         emailNorm, phoneNorm, socialNorm, fullName, companionFN,
+        d.followUpDate !== undefined ? (d.followUpDate || null) : cur.follow_up_date,
         recordId
       ]);
 
@@ -549,7 +557,7 @@ class BookingController {
       // Fetch all rows needed for the 7 report sections in one query
       const { rows } = await pool.query(`
         SELECT branch, booking_status, appointment_date, created_at, total_price,
-               cancellation_time, underage_cancellation
+               cancellation_time, underage_cancellation, follow_up_date
         FROM bookings
         WHERE record_status != 'DELETED'
           AND (
@@ -557,7 +565,10 @@ class BookingController {
             OR appointment_date = CURRENT_DATE + 1
             OR (appointment_date > CURRENT_DATE + 1 AND appointment_date <= CURRENT_DATE + 7)
             OR (LOWER(booking_status) LIKE '%cancel%')
-            OR (appointment_date = CURRENT_DATE AND LOWER(booking_status) IN ('arrived & bought','arrived not potential'))
+            OR (appointment_date = CURRENT_DATE AND LOWER(booking_status) IN (
+                'arrived & bought','arrived not potential','comeback & bought','promo hunter','scheduled','no show'
+            ))
+            OR (follow_up_date = CURRENT_DATE)
           )
       `);
 
@@ -566,14 +577,19 @@ class BookingController {
       const d7End    = new Date(today); d7End.setDate(today.getDate() + 7);
       const d7After  = new Date(tomorrow); d7After.setDate(tomorrow.getDate() + 1);
 
+      const todayStr = today.toISOString().split('T')[0];
       const rpts = {
-        otsBookings:           { total: 0, revenue: 0, count: 0, byBranch: {} },
-        overallBookings:       { total: 0, revenue: 0, count: 0, byBranch: {} },
-        bookedTomorrow:        { byBranch: {} },
-        bookedNext7Days:       { byBranch: {} },
-        cancellations:         { total: 0, revenue: 0, count: 0, byBranch: {} },
+        otsBookings:             { total: 0, revenue: 0, count: 0, byBranch: {} },
+        overallBookings:         { total: 0, revenue: 0, count: 0, byBranch: {} },
+        bookedTomorrow:          { byBranch: {} },
+        bookedNext7Days:         { byBranch: {} },
+        cancellations:           { total: 0, revenue: 0, count: 0, byBranch: {} },
         overallBookingsTomorrow: { total: 0, revenue: 0, count: 0 },
-        arrivalsToday:         { count: 0, byBranch: {}, byStatus: { 'Arrived & bought': 0, 'Arrived not potential': 0 } }
+        arrivalsToday:           { count: 0, byBranch: {}, byStatus: { 'Arrived & bought': 0, 'Arrived not potential': 0 } },
+        boughtToday:             { count: 0, revenue: 0, comebackCount: 0 },
+        noShowsToday:            0,
+        promoHuntersToday:       0,
+        followUpsDueToday:       0
       };
 
       const inc = (map, branch, revenue = 0) => {
@@ -645,9 +661,33 @@ class BookingController {
           const label = r.booking_status || '';
           rpts.arrivalsToday.byStatus[label] = (rpts.arrivalsToday.byStatus[label] || 0) + 1;
         }
+
+        // Section 8: Bought Today (actual revenue-generating visits)
+        if (isToday && !r.underage_cancellation &&
+            (status === 'arrived & bought' || status === 'comeback & bought')) {
+          rpts.boughtToday.count++;
+          rpts.boughtToday.revenue += price;
+          if (status === 'comeback & bought') rpts.boughtToday.comebackCount++;
+        }
+
+        // Section 9: No-shows today
+        if (isToday && status === 'no show') rpts.noShowsToday++;
+
+        // Section 10: Promo hunters today
+        if (isToday && status === 'promo hunter') rpts.promoHuntersToday++;
+
+        // Section 11: Follow-ups due today
+        const fuDate = r.follow_up_date ? String(r.follow_up_date).split('T')[0] : null;
+        if (fuDate && fuDate === todayStr) rpts.followUpsDueToday++;
       }
 
-      res.json({ success: true, date: today.toISOString().split('T')[0], reports: rpts });
+      // Compute derived rates
+      const schedulesToday = Object.values(rpts.arrivalsToday.byBranch).reduce((s, v) => s + v.count, 0) +
+        Object.values(rpts.otsBookings.byBranch).reduce((s, v) => s + v.count, 0);
+      const arrivalRateToday   = schedulesToday   > 0 ? +(rpts.arrivalsToday.count / schedulesToday   * 100).toFixed(1) : null;
+      const conversionRateToday = rpts.arrivalsToday.count > 0 ? +(rpts.boughtToday.count / rpts.arrivalsToday.count * 100).toFixed(1) : null;
+
+      res.json({ success: true, date: todayStr, reports: { ...rpts, arrivalRateToday, conversionRateToday } });
     } catch (err) {
       console.error('getDailyReports error:', err);
       res.status(500).json({ error: 'Failed to fetch daily reports' });
@@ -803,11 +843,13 @@ class BookingController {
 
       const schedToday = {}, arrToday = {}, schedTomorrow = {}, next7 = {}, otsMap = {};
       const payModesTomorrow = { Cash: 0, Debit: 0, Credit: 0 };
+      const payModeRevTomorrow = { Cash: 0, Debit: 0, Credit: 0 };
       const arrStatusMap = {};
       let otsT = 0, otsAddit = 0, otsRev = 0, additRev = 0;
       let arrOTS = 0, arrAddit = 0;
       let schedTomOTS = 0, schedTomAddit = 0;
       let otsNext7 = 0, additNext7 = 0;
+      let boughtTodayCount = 0, boughtTodayRevenue = 0, promoHuntersToday = 0;
 
       const inc = (map, branch, rev = 0) => {
         if (!map[branch]) map[branch] = { count: 0, revenue: 0 };
@@ -848,19 +890,29 @@ class BookingController {
           if (createdToday) arrOTS++; else arrAddit++;
         }
 
+        // Bought today (arrived & bought + comeback & bought)
+        if (!r.underage_cancellation && isToday &&
+            (status === 'arrived & bought' || status === 'comeback & bought')) {
+          boughtTodayCount++;
+          boughtTodayRevenue += price;
+        }
+
+        // Promo hunters today
+        if (isToday && status === 'promo hunter') promoHuntersToday++;
+
         // Schedules tomorrow
         if (!cancelled && isTomorrow) {
           inc(schedTomorrow, branch, price);
           const mk = pm.toLowerCase().includes('cash') ? 'Cash'
                    : pm.toLowerCase().includes('debit') ? 'Debit'
                    : pm.toLowerCase().includes('credit') ? 'Credit' : null;
-          if (mk) payModesTomorrow[mk]++;
+          if (mk) { payModesTomorrow[mk]++; payModeRevTomorrow[mk] += price; }
           if (createdToday) { schedTomOTS++; inc(otsMap, branch); }
           else               schedTomAddit++;
         }
 
-        // Next 7 days
-        if (!cancelled && inNext7) {
+        // Next 7 days (excludes tomorrow to avoid double-counting with schedTomorrow/otsMap)
+        if (!cancelled && inNext7 && !isTomorrow) {
           inc(next7, branch, price);
           if (createdToday) { otsNext7++; inc(otsMap, branch); }
           else               additNext7++;
@@ -868,17 +920,30 @@ class BookingController {
       }
 
       const sumCount = map => Object.values(map).reduce((s, b) => s + b.count, 0);
+      const sumRev   = map => +Object.values(map).reduce((s, b) => s + b.revenue, 0).toFixed(2);
+
+      const schedTodayTotal   = sumCount(schedToday);
+      const arrTodayTotal     = sumCount(arrToday);
+      const arrivalRateToday   = schedTodayTotal   > 0 ? +(arrTodayTotal     / schedTodayTotal   * 100).toFixed(1) : 0;
+      const conversionRateToday = arrTodayTotal    > 0 ? +(boughtTodayCount  / arrTodayTotal     * 100).toFixed(1) : 0;
 
       return res.json({
         success: true,
         generatedAt: new Date().toISOString(),
         data: {
-          totalSchedulesToday:    { ots: otsT, additional: otsAddit, otsRevenue: otsRev, additionalRevenue: additRev, byBranch: schedToday, total: sumCount(schedToday) },
-          totalArrivalsToday:     { otsArrivals: arrOTS, additionalArrivals: arrAddit, byBranch: arrToday, total: sumCount(arrToday), byStatus: arrStatusMap },
-          totalSchedulesTomorrow: { otsTomorrow: schedTomOTS, additionalTomorrow: schedTomAddit, byBranch: schedTomorrow, total: sumCount(schedTomorrow) },
-          paymentModesTomorrow,
-          totalSchedulesNext7:    { otsNext7, additionalNext7, byBranch: next7, total: sumCount(next7) },
-          totalOTS:               { byBranch: otsMap, total: sumCount(otsMap) }
+          totalSchedulesToday:    { ots: otsT, additional: otsAddit, otsRevenue: otsRev, additionalRevenue: additRev, byBranch: schedToday, total: schedTodayTotal },
+          totalArrivalsToday:     { otsArrivals: arrOTS, additionalArrivals: arrAddit, byBranch: arrToday, total: arrTodayTotal, byStatus: arrStatusMap },
+          totalSchedulesTomorrow: { otsTomorrow: schedTomOTS, additionalTomorrow: schedTomAddit, byBranch: schedTomorrow, total: sumCount(schedTomorrow), potentialRevenue: sumRev(schedTomorrow) },
+          paymentModesTomorrow: payModesTomorrow,
+          paymentModeRevenueTomorrow: payModeRevTomorrow,
+          totalSchedulesNext7:    { otsNext7, additionalNext7: additNext7, byBranch: next7, total: sumCount(next7) },
+          totalOTS:               { byBranch: otsMap, total: sumCount(otsMap) },
+          performance: {
+            boughtToday:          { count: boughtTodayCount, revenue: +boughtTodayRevenue.toFixed(2) },
+            arrivalRateToday,
+            conversionRateToday,
+            promoHuntersToday
+          }
         }
       });
     } catch (err) {
@@ -921,6 +986,260 @@ class BookingController {
     } catch (err) {
       console.error('getCCReportDrilldown error:', err);
       res.status(500).json({ error: 'Failed to fetch drill-down bookings' });
+    }
+  }
+
+  // ── exportBookings ─────────────────────────────────────────────────────────
+  // GET /api/bookings/export  — same filters as getOldBookings, returns CSV
+  async exportBookings(req, res) {
+    try {
+      const search    = (req.query.search    || '').trim();
+      const branch    = (req.query.branch    || '').trim();
+      const status    = (req.query.status    || '').trim();
+      const agent     = (req.query.agent     || '').trim();
+      const gender    = (req.query.gender    || '').trim();
+
+      const createdDateRange    = req.query.createdDateRange;
+      const createdStartDate    = req.query.createdStartDate;
+      const createdEndDate      = req.query.createdEndDate;
+      const appointmentDateRange = req.query.appointmentDateRange;
+      const appointmentStartDate = req.query.appointmentStartDate;
+      const appointmentEndDate   = req.query.appointmentEndDate;
+
+      const conds  = ["record_status != 'DELETED'"];
+      const params = [];
+      let   idx    = 1;
+
+      if (branch && branch !== 'All') {
+        const isNot = branch.startsWith('NOT:');
+        const vals  = (isNot ? branch.slice(4) : branch).split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+        if (vals.length) { conds.push(isNot ? `NOT (LOWER(branch) = ANY($${idx++}::text[]))` : `LOWER(branch) = ANY($${idx++}::text[])`); params.push(vals); }
+      }
+      if (status && status !== 'All') {
+        const isNot = status.startsWith('NOT:');
+        const vals  = (isNot ? status.slice(4) : status).split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+        if (vals.length) { conds.push(isNot ? `NOT (LOWER(booking_status) = ANY($${idx++}::text[]))` : `LOWER(booking_status) = ANY($${idx++}::text[])`); params.push(vals); }
+      }
+      if (agent && agent !== 'All') {
+        const vals = agent.split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+        conds.push(`LOWER(COALESCE(agent,'')) = ANY($${idx++}::text[])`); params.push(vals);
+      }
+      if (gender && gender !== 'All') {
+        conds.push(`LOWER(COALESCE(gender,'')) = $${idx++}`); params.push(gender.toLowerCase());
+      }
+      if (createdStartDate && createdEndDate) {
+        conds.push(`DATE(created_at) >= $${idx++}::date AND DATE(created_at) <= $${idx++}::date`);
+        params.push(createdStartDate, createdEndDate);
+      } else if (createdDateRange && createdDateRange !== 'all') {
+        if (createdDateRange === 'today') conds.push('DATE(created_at) = CURRENT_DATE');
+        else { const d = { last7: 7, last30: 30, last90: 90 }[createdDateRange]; if (d) conds.push(`DATE(created_at) >= CURRENT_DATE - INTERVAL '${d} days'`); }
+      }
+      if (appointmentStartDate && appointmentEndDate) {
+        conds.push(`appointment_date >= $${idx++}::date AND appointment_date <= $${idx++}::date`);
+        params.push(appointmentStartDate, appointmentEndDate);
+      } else if (appointmentDateRange && appointmentDateRange !== 'all') {
+        if (appointmentDateRange === 'today')    conds.push('appointment_date = CURRENT_DATE');
+        else if (appointmentDateRange === 'tomorrow') conds.push('appointment_date = CURRENT_DATE + 1');
+        else if (appointmentDateRange === 'thisWeek') conds.push('appointment_date >= CURRENT_DATE AND appointment_date <= CURRENT_DATE + (6 - EXTRACT(DOW FROM CURRENT_DATE)::int)');
+      }
+      if (search) {
+        const q = `%${search.toLowerCase()}%`;
+        conds.push(`(LOWER(COALESCE(first_name,'')) LIKE $${idx} OR LOWER(COALESCE(last_name,'')) LIKE $${idx} OR LOWER(COALESCE(email,'')) LIKE $${idx} OR phone LIKE $${idx} OR LOWER(COALESCE(social_media,'')) LIKE $${idx} OR LOWER(COALESCE(agent,'')) LIKE $${idx} OR LOWER(COALESCE(treatment,'')) LIKE $${idx} OR LOWER(COALESCE(branch,'')) LIKE $${idx})`);
+        params.push(q); idx++;
+      }
+
+      const WHERE = `WHERE ${conds.join(' AND ')}`;
+
+      const { rows } = await pool.query(`
+        SELECT record_id, created_at, branch, booking_status, appointment_date, appointment_time,
+               first_name, last_name, age, gender, phone, email, social_media, treatment, area, freebie,
+               total_price, payment_mode, agent, ad_interacted, booking_details, remarks, purchase_details,
+               companion_first_name, companion_last_name, companion_age, companion_gender,
+               companion_freebie, companion_treatment, is_ots, is_ad_id, is_companion, is_high_priority,
+               promo_hunter_status, follow_up_date
+        FROM bookings ${WHERE}
+        ORDER BY appointment_date DESC NULLS LAST, created_at DESC
+      `, params);
+
+      const CSV_COLS = [
+        ['Record ID','record_id'], ['Created At','created_at'], ['Branch','branch'],
+        ['Status','booking_status'], ['Appointment Date','appointment_date'],
+        ['Appointment Time','appointment_time'], ['First Name','first_name'],
+        ['Last Name','last_name'], ['Age','age'], ['Gender','gender'],
+        ['Phone','phone'], ['Email','email'], ['Social Media','social_media'],
+        ['Treatment','treatment'], ['Area','area'], ['Freebie','freebie'],
+        ['Total Price','total_price'], ['Payment Mode','payment_mode'],
+        ['Agent','agent'], ['Ad Interacted','ad_interacted'],
+        ['Booking Details','booking_details'], ['Remarks','remarks'],
+        ['Purchase Details','purchase_details'],
+        ['Companion First Name','companion_first_name'],
+        ['Companion Last Name','companion_last_name'],
+        ['Companion Age','companion_age'], ['Companion Gender','companion_gender'],
+        ['Companion Freebie','companion_freebie'], ['Companion Treatment','companion_treatment'],
+        ['OTS','is_ots'], ['Ad ID','is_ad_id'], ['Companion Flag','is_companion'],
+        ['High Priority','is_high_priority'], ['Promo Hunter Status','promo_hunter_status'],
+        ['Follow-up Date','follow_up_date'],
+      ];
+
+      const escCsv = v => {
+        if (v === null || v === undefined) return '';
+        const s = String(v);
+        return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s;
+      };
+
+      const header = CSV_COLS.map(([h]) => h).join(',');
+      const lines  = rows.map(r => CSV_COLS.map(([, k]) => escCsv(r[k])).join(','));
+      const csv    = [header, ...lines].join('\r\n');
+
+      const dateStr = new Date().toISOString().slice(0, 10);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="bookings-${dateStr}.csv"`);
+      res.send('﻿' + csv); // BOM for Excel UTF-8 compatibility
+    } catch (err) {
+      console.error('Export bookings error:', err);
+      res.status(500).json({ error: 'Failed to export bookings' });
+    }
+  }
+
+  // ── bulkUpdateStatus ───────────────────────────────────────────────────────
+  // POST /api/bookings/bulk-status
+  // Body: { recordIds: ['BK-...'], status: 'Arrived & Bought' }
+  async bulkUpdateStatus(req, res) {
+    try {
+      const { recordIds, status, followUpDate } = req.body;
+
+      if (!Array.isArray(recordIds) || recordIds.length === 0) {
+        return res.status(400).json({ error: 'recordIds must be a non-empty array' });
+      }
+      if (recordIds.length > 200) {
+        return res.status(400).json({ error: 'Cannot bulk-update more than 200 bookings at once' });
+      }
+
+      // Agents can only set their own bookings to limited statuses
+      const agentAllowedStatuses = new Set([
+        'arrived & bought', 'arrived not potential', 'scheduled', 'cancelled', 'comeback'
+      ]);
+      if (req.user?.role !== 'Admin') {
+        if (status && !agentAllowedStatuses.has(status.toLowerCase())) {
+          return res.status(403).json({ error: 'Agents cannot set this status in bulk' });
+        }
+      }
+
+      const setClauses = [];
+      const params     = [];
+      let   idx        = 1;
+
+      if (status) {
+        let cancellationClause = '';
+        if (status.toLowerCase() === 'cancelled') {
+          cancellationClause = `, cancellation_time = CASE WHEN cancellation_time IS NULL THEN NOW() ELSE cancellation_time END`;
+        }
+        setClauses.push(`booking_status = $${idx++}${cancellationClause}`);
+        params.push(status);
+      }
+      if (followUpDate !== undefined) {
+        setClauses.push(`follow_up_date = $${idx++}`);
+        params.push(followUpDate || null);
+      }
+      if (setClauses.length === 0) {
+        return res.status(400).json({ error: 'No fields to update' });
+      }
+
+      setClauses.push(`updated_at = NOW()`);
+      params.push(recordIds);
+      const { rowCount } = await pool.query(
+        `UPDATE bookings SET ${setClauses.join(', ')}
+         WHERE record_id = ANY($${idx}::text[]) AND record_status != 'DELETED'`,
+        params
+      );
+
+      res.json({ success: true, updated: rowCount, message: `${rowCount} booking(s) updated` });
+    } catch (err) {
+      console.error('Bulk update error:', err);
+      res.status(500).json({ error: 'Failed to bulk update bookings' });
+    }
+  }
+
+  // ── getCustomerHistory ─────────────────────────────────────────────────────
+  // GET /api/bookings/customer?query=<phone|email|name>
+  async getCustomerHistory(req, res) {
+    try {
+      const query = (req.query.query || '').trim();
+      if (!query || query.length < 3) {
+        return res.status(400).json({ error: 'Query must be at least 3 characters' });
+      }
+
+      const norm   = query.toLowerCase().replace(/\s+/g, ' ').trim();
+      const likePat = `%${norm}%`;
+
+      const { rows } = await pool.query(`
+        SELECT record_id, created_at, branch, booking_status, appointment_date, appointment_time,
+               first_name, last_name, age, gender, phone, email, social_media, treatment, area, freebie,
+               total_price, payment_mode, agent, booking_details, remarks, purchase_details,
+               companion_first_name, companion_last_name,
+               promo_hunter_status, match_reason, is_ots, is_high_priority, follow_up_date
+        FROM bookings
+        WHERE record_status != 'DELETED'
+          AND (
+            phone = $1
+            OR LOWER(COALESCE(email,'')) = $2
+            OR LOWER(COALESCE(social_media,'')) = $2
+            OR (LOWER(COALESCE(first_name,'')) || ' ' || LOWER(COALESCE(last_name,''))) LIKE $3
+            OR full_name_norm LIKE $3
+          )
+        ORDER BY appointment_date DESC NULLS LAST, created_at DESC
+        LIMIT 500
+      `, [query, norm, likePat]);
+
+      if (!rows.length) {
+        return res.json({ success: true, customer: null, bookings: [] });
+      }
+
+      const latest    = rows[0];
+      const allPrices = rows.map(r => parseFloat(r.total_price) || 0);
+      const SOLD      = new Set(['arrived & bought', 'comeback & bought', 'arrived not potential']);
+      const soldRows  = rows.filter(r => SOLD.has((r.booking_status || '').toLowerCase()));
+
+      const summary = {
+        name:          `${latest.first_name || ''} ${latest.last_name || ''}`.trim(),
+        phone:         latest.phone         || '',
+        email:         latest.email         || '',
+        socialMedia:   latest.social_media  || '',
+        gender:        latest.gender        || '',
+        totalBookings: rows.length,
+        totalSpend:    +soldRows.reduce((s, r) => s + (parseFloat(r.total_price) || 0), 0).toFixed(2),
+        avgSpend:      soldRows.length > 0 ? +(soldRows.reduce((s, r) => s + (parseFloat(r.total_price) || 0), 0) / soldRows.length).toFixed(2) : 0,
+        completedBookings: soldRows.length,
+        firstVisit:    rows[rows.length - 1]?.appointment_date || null,
+        lastVisit:     rows[0]?.appointment_date || null,
+        isRepeat:      rows.length > 1,
+        branches:      [...new Set(rows.map(r => r.branch).filter(Boolean))],
+      };
+
+      const bookingList = rows.map(r => ({
+        recordId:       r.record_id,
+        date:           r.appointment_date || '',
+        time:           r.appointment_time || '',
+        branch:         r.branch           || '',
+        status:         r.booking_status   || '',
+        treatment:      r.treatment        || '',
+        area:           r.area             || '',
+        totalPrice:     parseFloat(r.total_price) || 0,
+        paymentMode:    r.payment_mode     || '',
+        agent:          r.agent            || '',
+        remarks:        r.remarks          || '',
+        purchaseDetails: r.purchase_details || '',
+        followUpDate:   r.follow_up_date   || null,
+        isOts:          r.is_ots           || false,
+        isHighPriority: r.is_high_priority  || false,
+        promoHunterStatus: r.promo_hunter_status || '',
+        createdAt:      r.created_at,
+      }));
+
+      res.json({ success: true, customer: summary, bookings: bookingList });
+    } catch (err) {
+      console.error('Customer history error:', err);
+      res.status(500).json({ error: 'Failed to fetch customer history' });
     }
   }
 }

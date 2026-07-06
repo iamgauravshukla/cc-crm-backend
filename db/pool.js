@@ -1,6 +1,10 @@
 'use strict';
 require('dotenv').config();
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// Return DATE columns as plain 'YYYY-MM-DD' strings instead of Date objects,
+// preventing UTC conversion from shifting dates for PH timezone (UTC+8).
+types.setTypeParser(1082, val => val);
 
 const isRemote =
   process.env.NODE_ENV === 'production' ||

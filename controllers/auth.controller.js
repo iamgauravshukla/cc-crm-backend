@@ -25,6 +25,25 @@ class AuthController {
 
       const { email, password, name, role } = value;
 
+      // Admin accounts can only be created by an authenticated Admin
+      if (role === 'Admin') {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+          return res.status(403).json({ error: 'Admin accounts can only be created by an existing Admin' });
+        }
+        try {
+          const decoded = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET, { algorithms: ['HS256'] });
+          const { rows: callerRows } = await pool.query(
+            'SELECT role FROM users WHERE user_id = $1', [decoded.userId]
+          );
+          if (!callerRows.length || callerRows[0].role !== 'Admin') {
+            return res.status(403).json({ error: 'Only Admins can create Admin accounts' });
+          }
+        } catch {
+          return res.status(403).json({ error: 'Valid Admin authentication required to create Admin accounts' });
+        }
+      }
+
       const existing = await pool.query(
         'SELECT user_id FROM users WHERE email = $1',
         [email.toLowerCase()]
@@ -182,7 +201,7 @@ class AuthController {
         return res.status(400).json({ error: 'Invalid role. Must be Admin or Agent.' });
       }
 
-      if (req.user.userId === targetUserId) {
+      if (String(req.user.userId) === String(targetUserId)) {
         return res.status(400).json({ error: 'Cannot change your own role' });
       }
 
@@ -247,7 +266,7 @@ class AuthController {
 
       const { userId: targetUserId } = req.params;
 
-      if (req.user.userId === targetUserId) {
+      if (String(req.user.userId) === String(targetUserId)) {
         return res.status(400).json({ error: 'Cannot delete your own account' });
       }
 
