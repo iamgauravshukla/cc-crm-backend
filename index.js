@@ -31,22 +31,26 @@ app.use(helmet({
 const rawAllowed = process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000';
 const allowedOrigins = rawAllowed.split(',').map(o => o.trim().replace(/\/+$/, '')).filter(Boolean);
 
-// CORS: only the root POST /api/leads is public (website form submissions).
-// All sub-paths (/call, /booking, /centers, /:type/:rowIndex) are CRM-only → restricted.
-app.use(cors(function (req, callback) {
-  const isPublicLeads = req.path === '/api/leads';
-  if (isPublicLeads) {
-    return callback(null, { origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] });
+// CORS — explicit manual headers so preflight and credentialed requests both work reliably.
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const isLeads = req.path === '/api/leads';
+
+  if (isLeads) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  } else if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Vary', 'Origin');
   }
-  callback(null, {
-    origin: function (origin, cb) {
-      if (!origin) return cb(null, true);
-      if (allowedOrigins.indexOf(origin) !== -1) return cb(null, true);
-      return cb(new Error('CORS policy: origin not allowed'), false);
-    },
-    credentials: true
-  });
-}));
+
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 // Rate limiting
 const limiter = rateLimit({
