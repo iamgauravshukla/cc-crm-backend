@@ -188,18 +188,19 @@ async function getAnalytics(req, res) {
         GROUP BY social_media ORDER BY bookings DESC`, P),
 
       // 10. Time series (monthly for year/quarter; daily otherwise)
+      // appointment_date IS NOT NULL guard prevents null x-axis labels (ApexCharts crashes on null.toString())
       (!startDate && (range === 'year' || range === 'quarter'))
         ? pool.query(`
             SELECT TO_CHAR(appointment_date,'YYYY-MM') AS period,
                    TO_CHAR(MIN(appointment_date),'Mon YYYY') AS label,
                    COUNT(*) AS cnt, SUM(total_price) AS revenue
-            FROM bookings ${WHERE}
+            FROM bookings ${WHERE} AND appointment_date IS NOT NULL
             GROUP BY TO_CHAR(appointment_date,'YYYY-MM') ORDER BY period`, P)
         : pool.query(`
             SELECT appointment_date::text AS period,
                    TO_CHAR(appointment_date,'DD Mon') AS label,
                    COUNT(*) AS cnt, SUM(total_price) AS revenue
-            FROM bookings ${WHERE}
+            FROM bookings ${WHERE} AND appointment_date IS NOT NULL
             GROUP BY appointment_date ORDER BY appointment_date`, P),
 
       // 11. Previous period overview for delta comparison

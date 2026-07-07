@@ -18,6 +18,10 @@ const savedViewsRoutes = require('./routes/savedViews.routes');
 const app = express();
 const PORT = process.env.PORT || 5001;
 
+// Railway (and most cloud hosts) sit behind a reverse proxy that sets X-Forwarded-For.
+// Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set('trust proxy', 1);
+
 // Security middleware — disable crossOriginResourcePolicy for public endpoints
 // so external websites can read the response (CORP 'same-origin' would block it)
 app.use(helmet({
@@ -25,7 +29,7 @@ app.use(helmet({
 }));
 
 const rawAllowed = process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000';
-const allowedOrigins = rawAllowed.split(',').map(o => o.trim()).filter(Boolean);
+const allowedOrigins = rawAllowed.split(',').map(o => o.trim().replace(/\/+$/, '')).filter(Boolean);
 
 // CORS: only the root POST /api/leads is public (website form submissions).
 // All sub-paths (/call, /booking, /centers, /:type/:rowIndex) are CRM-only → restricted.
