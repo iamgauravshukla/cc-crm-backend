@@ -6,6 +6,21 @@ const ARRIVAL_IN   = `LOWER(booking_status) IN ('arrived not potential','arrived
 const SALE_STATUSES = new Set(['arrived & bought','comeback & bought','arrived not potential']);
 const ARRIVAL_STATUSES = new Set(['arrived not potential','arrived & bought']);
 
+// Normalize helper expressions for SQL GROUP BY — keeps data consistent regardless of import casing
+const SQL_GENDER = `
+  CASE WHEN LOWER(gender) = 'female' THEN 'Female'
+       WHEN LOWER(gender) = 'male'   THEN 'Male'
+       ELSE COALESCE(NULLIF(TRIM(gender),''), 'Unknown') END`;
+
+const SQL_PAYMENT_MODE = `
+  CASE WHEN LOWER(payment_mode) LIKE 'cash%'   THEN 'Cash'
+       WHEN LOWER(payment_mode) LIKE 'debit%'  THEN 'Debit'
+       WHEN LOWER(payment_mode) LIKE 'credit%' THEN 'Credit'
+       ELSE COALESCE(NULLIF(TRIM(payment_mode),''), 'Unknown') END`;
+
+const SQL_TREATMENT = `UPPER(TRIM(treatment))`;
+const SQL_AGENT     = `UPPER(TRIM(agent))`;
+
 // ── WHERE clause builder ─────────────────────────────────────────────────────
 // Returns { conditions: string[], params: any[] } with record_status guard included.
 function buildFilter(branch, range, startDate, endDate) {
@@ -24,9 +39,9 @@ function buildFilter(branch, range, startDate, endDate) {
   } else if (range && range !== 'year') {
     const dMap = { today: 0, week: 7, month: 30, quarter: 90 };
     if (range === 'today') {
-      c.push('appointment_date = CURRENT_DATE');
+      c.push("appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date");
     } else if (dMap[range]) {
-      c.push(`appointment_date >= CURRENT_DATE - INTERVAL '${dMap[range]} days'`);
+      c.push(`appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${dMap[range]} days'`);
     }
   }
 
@@ -50,8 +65,8 @@ function buildPrevFilter(branch, range, startDate, endDate) {
   } else {
     const d = { today: 1, week: 7, month: 30, quarter: 90 }[range] || 0;
     if (!d) { c.push('1=0'); return { conds: c, params: p }; } // year: no meaningful prev
-    if (d === 1) c.push('appointment_date = CURRENT_DATE - 1');
-    else c.push(`appointment_date >= CURRENT_DATE - INTERVAL '${d * 2} days' AND appointment_date < CURRENT_DATE - INTERVAL '${d} days'`);
+    if (d === 1) c.push("appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date - 1");
+    else c.push(`appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${d * 2} days' AND appointment_date < (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${d} days'`);
   }
   return { conds: c, params: p };
 }
@@ -116,17 +131,17 @@ async function getAnalytics(req, res) {
         FROM bookings ${bWHERE}
         GROUP BY branch`, bP),
 
-      // 3. Treatment analysis (completed bookings only)
+      // 3. Treatment analysis (completed bookings only) — normalized to UPPER so case variants merge
       pool.query(`
-        SELECT treatment, COUNT(*) AS cnt, SUM(total_price) AS revenue
+        SELECT ${SQL_TREATMENT} AS treatment, COUNT(*) AS cnt, SUM(total_price) AS revenue
         FROM bookings ${WHERE} AND ${COMPLETED_IN}
-        GROUP BY treatment ORDER BY cnt DESC LIMIT 15`, P),
+        GROUP BY 1 ORDER BY cnt DESC LIMIT 15`, P),
 
-      // 4. Revenue by payment mode (completed only)
+      // 4. Revenue by payment mode (completed only) — normalized so "Cash Payment" → "Cash" etc.
       pool.query(`
-        SELECT payment_mode, SUM(total_price) AS revenue
+        SELECT ${SQL_PAYMENT_MODE} AS payment_mode, SUM(total_price) AS revenue
         FROM bookings ${WHERE} AND ${COMPLETED_IN}
-        GROUP BY payment_mode ORDER BY revenue DESC`, P),
+        GROUP BY 1 ORDER BY revenue DESC`, P),
 
       // 5. Price range distribution (completed only)
       pool.query(`
@@ -138,20 +153,20 @@ async function getAnalytics(req, res) {
           SUM(CASE WHEN total_price > 5000                           THEN 1 ELSE 0 END) AS r5000plus
         FROM bookings ${WHERE} AND ${COMPLETED_IN}`, P),
 
-      // 6. Agent performance
+      // 6. Agent performance — normalized to UPPER so "Raiza" and "RAIZA" merge
       pool.query(`
-        SELECT agent,
+        SELECT ${SQL_AGENT} AS agent,
                COUNT(*) AS total_bookings,
                COUNT(*) FILTER (WHERE ${COMPLETED_IN}) AS completed,
                COUNT(*) FILTER (WHERE ${ARRIVAL_IN})   AS arrivals,
                SUM(CASE WHEN ${COMPLETED_IN} THEN total_price ELSE 0 END) AS revenue
         FROM bookings ${WHERE}
-        GROUP BY agent ORDER BY revenue DESC`, P),
+        GROUP BY 1 ORDER BY revenue DESC`, P),
 
-      // 7. Gender distribution
+      // 7. Gender distribution — normalized so "FEMALE" and "Female" merge
       pool.query(`
-        SELECT gender, COUNT(*) AS cnt FROM bookings ${WHERE}
-        GROUP BY gender`, P),
+        SELECT ${SQL_GENDER} AS gender, COUNT(*) AS cnt FROM bookings ${WHERE}
+        GROUP BY 1`, P),
 
       // 8. Age groups
       pool.query(`
@@ -406,13 +421,13 @@ async function getAgentPerformance(req, res) {
       WHERE  = `WHERE record_status != 'DELETED' AND ${VAL_FILTER} AND appointment_date >= $1::date AND appointment_date <= $2::date AND ${SKIP_AGENTS}`;
       params = [startDate, endDate];
     } else {
-      WHERE  = `WHERE record_status != 'DELETED' AND ${VAL_FILTER} AND appointment_date >= CURRENT_DATE - INTERVAL '${days} days' AND ${SKIP_AGENTS}`;
+      WHERE  = `WHERE record_status != 'DELETED' AND ${VAL_FILTER} AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${days} days' AND ${SKIP_AGENTS}`;
       params = [];
     }
 
     const { rows } = await pool.query(`
       SELECT
-        agent,
+        ${SQL_AGENT} AS agent,
         COUNT(*) AS bookings,
         COUNT(*) FILTER (WHERE ${COMPLETED_IN})    AS completed,
         COUNT(*) FILTER (WHERE ${ARRIVAL_IN})      AS arrivals,
@@ -421,7 +436,7 @@ async function getAgentPerformance(req, res) {
         COUNT(*) FILTER (WHERE LOWER(booking_status) = 'promo hunter' OR (promo_hunter_status IS NOT NULL AND promo_hunter_status != '')) AS promo_hunters,
         SUM(CASE WHEN ${COMPLETED_IN} THEN total_price ELSE 0 END) AS revenue
       FROM bookings ${WHERE}
-      GROUP BY agent ORDER BY revenue DESC
+      GROUP BY 1 ORDER BY revenue DESC
     `, params);
 
     const rd = startDate && endDate
@@ -480,7 +495,7 @@ async function getAdPerformance(req, res) {
       conds.push(`appointment_date >= $${i++}::date AND appointment_date <= $${i++}::date`);
       params.push(startDate, endDate);
     } else {
-      conds.push(`appointment_date >= CURRENT_DATE - INTERVAL '${days} days'`);
+      conds.push(`appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${days} days'`);
     }
 
     const WHERE = `WHERE ${conds.join(' AND ')}`;

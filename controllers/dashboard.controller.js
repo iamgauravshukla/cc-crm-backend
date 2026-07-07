@@ -6,6 +6,21 @@ const COMPLETED_SQL = `LOWER(booking_status) IN (${COMPLETED_STATUSES.join(',')}
 const ARRIVAL_SQL   = `LOWER(booking_status) IN ('arrived not potential', 'arrived & bought')`;
 const COMPLETED_STATUSES_JS = new Set(['arrived not potential', 'arrived & bought', 'comeback & bought']);
 
+const normalizeGender = v => {
+  const l = (v || '').toLowerCase();
+  if (l === 'female') return 'Female';
+  if (l === 'male')   return 'Male';
+  return v || '';
+};
+
+const normalizePaymentMode = v => {
+  const l = (v || '').toLowerCase();
+  if (l.startsWith('cash'))   return 'Cash';
+  if (l.startsWith('debit'))  return 'Debit';
+  if (l.startsWith('credit')) return 'Credit';
+  return v || '';
+};
+
 /**
  * GET /api/dashboard/overview
  * Today's bookings + yesterday comparison + KPIs
@@ -19,6 +34,8 @@ async function getDashboardOverview(req, res) {
         created_at,
         branch,
         booking_status   AS status,
+        booking_date,
+        booking_time,
         appointment_date AS date,
         appointment_time AS time,
         first_name,
@@ -47,7 +64,7 @@ async function getDashboardOverview(req, res) {
         matched_source,
         matched_row
       FROM bookings
-      WHERE DATE(created_at) >= CURRENT_DATE - INTERVAL '1 day'
+      WHERE (created_at AT TIME ZONE 'Asia/Manila')::date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '1 day'
         AND record_status != 'DELETED'
       ORDER BY created_at DESC
     `);
@@ -55,11 +72,12 @@ async function getDashboardOverview(req, res) {
     const todayBookings = [];
     const yesterdayBookings = [];
 
-    const todayStr = new Date().toISOString().split('T')[0];
-    const yestStr  = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    const phFmt    = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
+    const todayStr = phFmt.format(new Date());
+    const yestStr  = phFmt.format(new Date(Date.now() - 86400000));
 
     for (const r of rows) {
-      const day = r.created_at ? new Date(r.created_at).toISOString().split('T')[0] : null;
+      const day = r.created_at ? phFmt.format(new Date(r.created_at)) : null;
       const mapped = mapBooking(r);
       if (day === todayStr)     todayBookings.push(mapped);
       else if (day === yestStr) yesterdayBookings.push(mapped);
@@ -122,6 +140,8 @@ async function getDashboardOverview(req, res) {
       data: {
         todayBookings: todayBookings.map(b => ({
           timestamp:        b.createdAt,
+          bookingDate:      b.bookingDate,
+          bookingTime:      b.bookingTime,
           branch:           b.branch,
           customer:         `${b.firstName} ${b.lastName}`,
           age:              b.age,
@@ -133,6 +153,7 @@ async function getDashboardOverview(req, res) {
           area:             b.area,
           freebie:          b.freebie,
           date:             b.date,
+          appointmentTime:  b.time,
           paymentMode:      b.paymentMode,
           price:            b.totalPrice,
           agent:            b.agent,
@@ -210,8 +231,8 @@ async function getBookingTrend(req, res) {
         TO_CHAR(appointment_date, 'DD Mon')     AS label,
         COUNT(*)                                AS cnt
       FROM bookings
-      WHERE appointment_date >= CURRENT_DATE - ($1 - 1) * INTERVAL '1 day'
-        AND appointment_date <= CURRENT_DATE
+      WHERE appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - ($1 - 1) * INTERVAL '1 day'
+        AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date
         AND record_status != 'DELETED'
       GROUP BY appointment_date
       ORDER BY appointment_date
@@ -258,12 +279,14 @@ function mapBooking(r) {
     createdAt:          r.created_at,
     branch:             r.branch || '',
     status:             r.status || '',
-    date:               r.date   ? String(r.date).split('T')[0] : '',
-    time:               r.time   || '',
+    date:               r.date        ? String(r.date).split('T')[0] : '',
+    time:               r.time        || '',
+    bookingDate:        r.booking_date ? String(r.booking_date).split('T')[0] : '',
+    bookingTime:        r.booking_time || '',
     firstName:          r.first_name    || '',
     lastName:           r.last_name     || '',
     age:                r.age           || 0,
-    gender:             r.gender        || '',
+    gender:             normalizeGender(r.gender),
     phone:              r.phone         || '',
     email:              r.email         || '',
     socialMedia:        r.social_media  || '',
@@ -271,14 +294,14 @@ function mapBooking(r) {
     area:               r.area          || '',
     freebie:            r.freebie       || '',
     totalPrice:         parseFloat(r.total_price) || 0,
-    paymentMode:        r.payment_mode  || '',
+    paymentMode:        normalizePaymentMode(r.payment_mode),
     agent:              r.agent         || '',
     bookingDetails:     r.booking_details || '',
     adInteracted:       r.ad_interacted  || '',
     companionFirstName: r.companion_first_name  || '',
     companionLastName:  r.companion_last_name   || '',
     companionAge:       r.companion_age         || '',
-    companionGender:    r.companion_gender       || '',
+    companionGender:    normalizeGender(r.companion_gender),
     companionFreebie:   r.companion_freebie      || '',
     companionTreatment: r.companion_treatment    || '',
     promoHunterStatus:  r.promo_hunter_status    || '',

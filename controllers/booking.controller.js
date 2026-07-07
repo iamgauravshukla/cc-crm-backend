@@ -7,31 +7,31 @@ const pool = require('../db/pool');
 const bookingSchema = Joi.object({
   branch:              Joi.string().required(),
   status:              Joi.string().default('Scheduled'),
-  firstName:           Joi.string().required(),
-  lastName:            Joi.string().required(),
+  firstName:           Joi.string().trim().required(),
+  lastName:            Joi.string().trim().required(),
   age:                 Joi.number().integer().min(1).max(150).required(),
-  phone:               Joi.string().required(),
-  socialMedia:         Joi.string().allow('').optional(),
-  email:               Joi.string().email().required(),
+  phone:               Joi.string().trim().required(),
+  socialMedia:         Joi.string().allow('', null).optional(),
+  email:               Joi.string().allow('', null).optional(),   // freeform — agents may write "N/A" or leave blank
   treatment:           Joi.string().required(),
-  area:                Joi.string().allow('').optional(),
-  freebie:             Joi.string().allow('').optional(),
-  date:                Joi.string().required(),         // YYYY-MM-DD
-  time:                Joi.string().required(),         // HH:MM (24h)
-  paymentMode:         Joi.string().valid('Cash', 'Debit', 'Credit').required(),
+  area:                Joi.string().allow('', null).optional(),
+  freebie:             Joi.string().allow('', null).optional(),
+  date:                Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required(),  // YYYY-MM-DD
+  time:                Joi.string().pattern(/^\d{2}:\d{2}$/).required(),        // HH:MM (24h)
+  paymentMode:         Joi.string().required(),
   totalPrice:          Joi.number().min(0).required(),
   gender:              Joi.string().valid('Male', 'Female').required(),
-  companionFirstName:  Joi.string().allow('').optional(),
-  companionLastName:   Joi.string().allow('').optional(),
-  companionAge:        Joi.alternatives().try(Joi.number(), Joi.string().allow('')).optional(),
-  companionFreebie:    Joi.string().allow('').optional(),
-  companionTreatment:  Joi.string().allow('').optional(),
-  companionGender:     Joi.string().valid('Male', 'Female', '').allow('').optional(),
-  companionArea:       Joi.string().allow('').optional(),
-  bookingDetails:      Joi.string().allow('').optional(),
-  adInteracted:        Joi.string().allow('').optional(),
-  remarks:             Joi.string().allow('').optional(),
-  followUpDate:        Joi.string().allow('', null).optional(),
+  companionFirstName:  Joi.string().allow('', null).optional(),
+  companionLastName:   Joi.string().allow('', null).optional(),
+  companionAge:        Joi.alternatives().try(Joi.number().integer().min(1), Joi.string().allow('')).optional(),
+  companionFreebie:    Joi.string().allow('', null).optional(),
+  companionTreatment:  Joi.string().allow('', null).optional(),
+  companionGender:     Joi.string().valid('Male', 'Female', '').allow('', null).optional(),
+  companionArea:       Joi.string().allow('', null).optional(),
+  bookingDetails:      Joi.string().allow('', null).optional(),
+  adInteracted:        Joi.string().allow('', null).optional(),
+  remarks:             Joi.string().allow('', null).optional(),
+  followUpDate:        Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).allow('', null).optional(),
   agent:               Joi.string().required()
 });
 
@@ -56,8 +56,25 @@ async function logActivity(bookingId, user, action, changes = {}) {
 
 const normDate = v => {
   if (v == null) return '';
-  if (v instanceof Date) return v.toISOString().split('T')[0];
-  return String(v).split('T')[0];
+  const d = v instanceof Date ? v : new Date(v);
+  if (isNaN(d.getTime())) return '';
+  // Use UTC methods — PostgreSQL DATE columns come back as midnight UTC, so UTC parts = stored date
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
+};
+
+const normalizeGender = v => {
+  const l = (v || '').toLowerCase();
+  if (l === 'female') return 'Female';
+  if (l === 'male')   return 'Male';
+  return v || '';
+};
+
+const normalizePaymentMode = v => {
+  const l = (v || '').toLowerCase();
+  if (l.startsWith('cash'))   return 'Cash';
+  if (l.startsWith('debit'))  return 'Debit';
+  if (l.startsWith('credit')) return 'Credit';
+  return v || '';
 };
 
 class BookingController {
@@ -75,10 +92,12 @@ class BookingController {
       // Parse appointment date + time into separate DB columns
       const appointmentDate = d.date;  // YYYY-MM-DD
       const appointmentTime = formatTime12h(d.time); // "HH:MM" → "H:MM AM/PM"
-      const bookingDate     = now.toISOString().split('T')[0];
-      const bookingTime     = formatTime12h(
-        `${now.getHours()}:${String(now.getMinutes()).padStart(2, '0')}`
-      );
+
+      // booking_date/time = when this booking was created, in Philippine time (UTC+8)
+      const phFmt       = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
+      const phTimeFmt   = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit', hour12: false });
+      const bookingDate = phFmt.format(now);                  // "YYYY-MM-DD"
+      const bookingTime = formatTime12h(phTimeFmt.format(now)); // "HH:MM" → "H:MM AM/PM"
 
       // Promo hunter check
       const promoResult = await checkPromoHunter(
@@ -124,7 +143,7 @@ class BookingController {
           $28,$29,$30,$31,
           $32,$33,$34,$35,$36,
           $37,$38,$39,$40,$2,
-          false,false,false,false,
+          false,false,false,false,false,
           $41
         )`,
         [
@@ -132,7 +151,7 @@ class BookingController {
           d.branch, finalStatus,
           bookingDate, bookingTime, appointmentDate, appointmentTime,
           d.firstName, d.lastName, d.age, d.gender,
-          d.phone, d.email, d.socialMedia || null,
+          d.phone, d.email || null, d.socialMedia || null,
           d.treatment, d.area || null, d.freebie || null, d.totalPrice, d.paymentMode,
           d.companionTreatment || null, d.companionFirstName || null, d.companionLastName || null,
           d.companionAge || null, d.companionGender || null, d.companionFreebie || null, d.companionArea || null,
@@ -229,11 +248,11 @@ class BookingController {
         params.push(createdStartDate, createdEndDate);
       } else if (createdDateRange && createdDateRange !== 'all') {
         if (createdDateRange === 'today') {
-          conds.push('DATE(created_at) = CURRENT_DATE');
+          conds.push("(created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date");
         } else {
           const daysMap = { last7: 7, last30: 30, last90: 90 };
           const d = daysMap[createdDateRange];
-          if (d) conds.push(`DATE(created_at) >= CURRENT_DATE - INTERVAL '${d} days'`);
+          if (d) conds.push(`(created_at AT TIME ZONE 'Asia/Manila')::date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${d} days'`);
         }
       }
 
@@ -242,9 +261,9 @@ class BookingController {
         conds.push(`appointment_date >= $${idx++}::date AND appointment_date <= $${idx++}::date`);
         params.push(appointmentStartDate, appointmentEndDate);
       } else if (appointmentDateRange && appointmentDateRange !== 'all') {
-        if (appointmentDateRange === 'today')    conds.push('appointment_date = CURRENT_DATE');
-        else if (appointmentDateRange === 'tomorrow')  conds.push('appointment_date = CURRENT_DATE + 1');
-        else if (appointmentDateRange === 'thisWeek')  conds.push('appointment_date >= CURRENT_DATE AND appointment_date <= CURRENT_DATE + (6 - EXTRACT(DOW FROM CURRENT_DATE)::int)');
+        if (appointmentDateRange === 'today')    conds.push("appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date");
+        else if (appointmentDateRange === 'tomorrow')  conds.push("appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1");
+        else if (appointmentDateRange === 'thisWeek')  conds.push("appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + (6 - EXTRACT(DOW FROM (NOW() AT TIME ZONE 'Asia/Manila'))::int)");
       }
 
       // Search filter
@@ -276,7 +295,7 @@ class BookingController {
             cancel_validation, underage_cancellation,
             remarks, purchase_details,
             is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion,
-            follow_up_date
+            follow_up_date, booking_date, booking_time
           FROM bookings ${WHERE}
           ORDER BY appointment_date ${ORDER} NULLS LAST, created_at ${ORDER}
           LIMIT ${limit} OFFSET ${OFFSET}
@@ -292,18 +311,18 @@ class BookingController {
         timestamp:          r.created_at,
         branch:             r.branch             || '',
         status:             r.status             || '',
-        date:               r.appointment_date ? new Date(r.appointment_date).toISOString().split('T')[0] : '',
+        date:               normDate(r.appointment_date),
         time:               r.appointment_time   || '',
         firstName:          r.first_name         || '',
         lastName:           r.last_name          || '',
-        age:                r.age                || '',
-        gender:             r.gender             || '',
+        age:                r.age                ?? '',
+        gender:             normalizeGender(r.gender),
         treatment:          r.treatment          || '',
         area:               r.area               || '',
         freebie:            r.freebie            || '',
         companionTreatment: r.companion_treatment || '',
-        totalPrice:         parseFloat(r.total_price) || 0,
-        paymentMode:        r.payment_mode        || '',
+        totalPrice:         parseFloat(r.total_price) ?? 0,
+        paymentMode:        normalizePaymentMode(r.payment_mode),
         phone:              r.phone              || '',
         socialMedia:        r.social_media        || '',
         email:              r.email              || '',
@@ -312,8 +331,8 @@ class BookingController {
         adInteracted:       r.ad_interacted       || '',
         companionFirstName: r.companion_first_name  || '',
         companionLastName:  r.companion_last_name   || '',
-        companionAge:       r.companion_age         || '',
-        companionGender:    r.companion_gender      || '',
+        companionAge:       r.companion_age         ?? '',
+        companionGender:    normalizeGender(r.companion_gender),
         companionFreebie:   r.companion_freebie     || '',
         companionArea:      r.companion_area        || '',
         promoHunterStatus:  r.promo_hunter_status   || '',
@@ -326,7 +345,9 @@ class BookingController {
         isCompanion:       r.is_companion        || false,
         isHighPriority:    r.is_high_priority    || false,
         isMetaConversion:  r.is_meta_conversion  || false,
-        followUpDate:       r.follow_up_date       || null,
+        followUpDate:       normDate(r.follow_up_date) || null,
+        bookingDate:        normDate(r.booking_date)   || null,
+        bookingTime:        r.booking_time             || '',
       }));
 
       res.json({
@@ -355,21 +376,22 @@ class BookingController {
       res.json({
         booking: {
           recordId:           r.record_id,
+          rowNumber:          r.record_id,
           timestamp:          r.created_at,
           branch:             r.branch             || '',
           status:             r.booking_status     || '',
-          date:               r.appointment_date ? new Date(r.appointment_date).toISOString().split('T')[0] : '',
+          date:               normDate(r.appointment_date),
           time:               r.appointment_time   || '',
           firstName:          r.first_name         || '',
           lastName:           r.last_name          || '',
-          age:                r.age,
-          gender:             r.gender             || '',
+          age:                r.age                ?? '',
+          gender:             normalizeGender(r.gender),
           treatment:          r.treatment          || '',
           area:               r.area               || '',
           freebie:            r.freebie            || '',
           companionTreatment: r.companion_treatment || '',
-          totalPrice:         parseFloat(r.total_price) || 0,
-          paymentMode:        r.payment_mode        || '',
+          totalPrice:         parseFloat(r.total_price) ?? 0,
+          paymentMode:        normalizePaymentMode(r.payment_mode),
           phone:              r.phone              || '',
           socialMedia:        r.social_media        || '',
           email:              r.email              || '',
@@ -378,8 +400,8 @@ class BookingController {
           adInteracted:       r.ad_interacted       || '',
           companionFirstName: r.companion_first_name  || '',
           companionLastName:  r.companion_last_name   || '',
-          companionAge:       r.companion_age         || '',
-          companionGender:    r.companion_gender      || '',
+          companionAge:       r.companion_age         ?? '',
+          companionGender:    normalizeGender(r.companion_gender),
           companionFreebie:   r.companion_freebie     || '',
           companionArea:      r.companion_area        || '',
           remarks:            r.remarks              || '',
@@ -392,6 +414,9 @@ class BookingController {
           isCompanion:       r.is_companion       || false,
           isHighPriority:    r.is_high_priority   || false,
           isMetaConversion:  r.is_meta_conversion || false,
+          followUpDate:       normDate(r.follow_up_date) || null,
+          bookingDate:        normDate(r.booking_date)   || null,
+          bookingTime:        r.booking_time             || '',
         }
       });
     } catch (err) {
@@ -487,8 +512,10 @@ class BookingController {
           social_norm        = $37,
           full_name_norm     = $38,
           companion_full_name_norm = $39,
-          follow_up_date   = $40
-        WHERE record_id = $41
+          follow_up_date   = $40,
+          booking_date     = $41,
+          booking_time     = $42
+        WHERE record_id = $43
       `, [
         d.branch           || cur.branch,
         d.status           || cur.booking_status,
@@ -526,28 +553,47 @@ class BookingController {
         d.isMetaConversion   !== undefined ? d.isMetaConversion   : cur.is_meta_conversion,
         emailNorm, phoneNorm, socialNorm, fullName, companionFN,
         d.followUpDate !== undefined ? (d.followUpDate || null) : cur.follow_up_date,
+        d.bookingDate  !== undefined ? (d.bookingDate  || null) : cur.booking_date,
+        d.bookingTime  !== undefined ? (d.bookingTime  || null) : cur.booking_time,
         recordId
       ]);
 
       // Compute diff and log activity
+      const nv = (incoming, current) => incoming !== undefined ? (incoming ?? '') : (current ?? '');
       const diffPairs = [
-        ['booking_status',   d.status        || cur.booking_status, cur.booking_status],
-        ['branch',           d.branch        || cur.branch,          cur.branch],
-        ['appointment_date', newApptDate,                            normDate(cur.appointment_date)],
-        ['appointment_time', newApptTime,                            cur.appointment_time],
-        ['first_name',       d.firstName     || cur.first_name,      cur.first_name],
-        ['last_name',        d.lastName      || cur.last_name,       cur.last_name],
-        ['treatment',        d.treatment     || cur.treatment,       cur.treatment],
-        ['total_price',      String(d.totalPrice    !== undefined ? d.totalPrice    : cur.total_price),  String(cur.total_price)],
-        ['payment_mode',     d.paymentMode   || cur.payment_mode,    cur.payment_mode],
-        ['agent',            d.agent         || cur.agent,           cur.agent],
-        ['phone',            d.phone         || cur.phone,           cur.phone],
-        ['remarks',          d.remarks          !== undefined ? (d.remarks          || '') : (cur.remarks          || ''), cur.remarks          || ''],
-        ['purchase_details', d.purchaseDetails  !== undefined ? (d.purchaseDetails  || '') : (cur.purchase_details || ''), cur.purchase_details || ''],
-        ['follow_up_date',   normDate(d.followUpDate !== undefined ? d.followUpDate : cur.follow_up_date), normDate(cur.follow_up_date)],
-        ['is_ots',            String(d.isOts             !== undefined ? d.isOts             : cur.is_ots),             String(cur.is_ots)],
-        ['is_high_priority',  String(d.isHighPriority    !== undefined ? d.isHighPriority    : cur.is_high_priority),    String(cur.is_high_priority)],
-        ['is_meta_conversion',String(d.isMetaConversion  !== undefined ? d.isMetaConversion  : cur.is_meta_conversion),  String(cur.is_meta_conversion)],
+        ['booking_status',        d.status        || cur.booking_status,    cur.booking_status],
+        ['branch',                d.branch        || cur.branch,            cur.branch],
+        ['appointment_date',      newApptDate,                              normDate(cur.appointment_date)],
+        ['appointment_time',      newApptTime,                              cur.appointment_time],
+        ['first_name',            d.firstName     || cur.first_name,        cur.first_name],
+        ['last_name',             d.lastName      || cur.last_name,         cur.last_name],
+        ['age',                   String(d.age          !== undefined ? (d.age    ?? '') : (cur.age          ?? '')), String(cur.age          ?? '')],
+        ['gender',                nv(d.gender,          cur.gender),                   cur.gender          ?? ''],
+        ['email',                 nv(d.email,           cur.email),                    cur.email           ?? ''],
+        ['phone',                 d.phone         || cur.phone,             cur.phone],
+        ['social_media',          nv(d.socialMedia,     cur.social_media),             cur.social_media    ?? ''],
+        ['treatment',             d.treatment     || cur.treatment,         cur.treatment],
+        ['area',                  nv(d.area,            cur.area),                     cur.area            ?? ''],
+        ['freebie',               nv(d.freebie,         cur.freebie),                  cur.freebie         ?? ''],
+        ['total_price',           String(d.totalPrice   !== undefined ? d.totalPrice   : cur.total_price),  String(cur.total_price)],
+        ['payment_mode',          d.paymentMode   || cur.payment_mode,      cur.payment_mode],
+        ['agent',                 d.agent         || cur.agent,             cur.agent],
+        ['booking_details',       nv(d.bookingDetails,  cur.booking_details),          cur.booking_details ?? ''],
+        ['ad_interacted',         nv(d.adInteracted,    cur.ad_interacted),            cur.ad_interacted   ?? ''],
+        ['companion_treatment',   nv(d.companionTreatment, cur.companion_treatment),   cur.companion_treatment ?? ''],
+        ['companion_first_name',  nv(d.companionFirstName, cur.companion_first_name),  cur.companion_first_name ?? ''],
+        ['companion_last_name',   nv(d.companionLastName,  cur.companion_last_name),   cur.companion_last_name  ?? ''],
+        ['companion_age',         String(d.companionAge !== undefined ? (d.companionAge ?? '') : (cur.companion_age ?? '')), String(cur.companion_age ?? '')],
+        ['companion_gender',      nv(d.companionGender, cur.companion_gender),         cur.companion_gender ?? ''],
+        ['companion_freebie',     nv(d.companionFreebie,cur.companion_freebie),        cur.companion_freebie ?? ''],
+        ['remarks',               nv(d.remarks,         cur.remarks),                  cur.remarks         ?? ''],
+        ['purchase_details',      nv(d.purchaseDetails, cur.purchase_details),         cur.purchase_details ?? ''],
+        ['follow_up_date',        normDate(d.followUpDate !== undefined ? d.followUpDate : cur.follow_up_date), normDate(cur.follow_up_date)],
+        ['booking_date',          normDate(d.bookingDate !== undefined ? d.bookingDate : cur.booking_date),    normDate(cur.booking_date)],
+        ['booking_time',          nv(d.bookingTime,     cur.booking_time),             cur.booking_time    ?? ''],
+        ['is_ots',                String(d.isOts            !== undefined ? d.isOts            : cur.is_ots),            String(cur.is_ots)],
+        ['is_high_priority',      String(d.isHighPriority   !== undefined ? d.isHighPriority   : cur.is_high_priority),  String(cur.is_high_priority)],
+        ['is_meta_conversion',    String(d.isMetaConversion !== undefined ? d.isMetaConversion : cur.is_meta_conversion), String(cur.is_meta_conversion)],
       ];
       const changes = {};
       for (const [field, nv, ov] of diffPairs) {
@@ -624,23 +670,23 @@ class BookingController {
         FROM bookings
         WHERE record_status != 'DELETED'
           AND (
-            DATE(created_at) = CURRENT_DATE
-            OR appointment_date = CURRENT_DATE + 1
-            OR (appointment_date > CURRENT_DATE + 1 AND appointment_date <= CURRENT_DATE + 7)
+            (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+            OR appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
+            OR (appointment_date > (NOW() AT TIME ZONE 'Asia/Manila')::date + 1 AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7)
             OR (LOWER(booking_status) LIKE '%cancel%')
-            OR (appointment_date = CURRENT_DATE AND LOWER(booking_status) IN (
+            OR (appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date AND LOWER(booking_status) IN (
                 'arrived & bought','arrived not potential','comeback & bought','promo hunter','scheduled','no show'
             ))
-            OR (follow_up_date = CURRENT_DATE)
+            OR (follow_up_date = (NOW() AT TIME ZONE 'Asia/Manila')::date)
           )
       `);
 
-      const today    = new Date(); today.setHours(0,0,0,0);
-      const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
-      const d7End    = new Date(today); d7End.setDate(today.getDate() + 7);
-      const d7After  = new Date(tomorrow); d7After.setDate(tomorrow.getDate() + 1);
-
-      const todayStr = today.toISOString().split('T')[0];
+      const phFmt      = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
+      const now        = Date.now();
+      const todayStr   = phFmt.format(now);
+      const tomorrowStr = phFmt.format(now + 86400000);
+      const d7EndStr   = phFmt.format(now + 7 * 86400000);
+      const d7AfterStr = phFmt.format(now + 2 * 86400000);
       const rpts = {
         otsBookings:             { total: 0, revenue: 0, count: 0, byBranch: {} },
         overallBookings:         { total: 0, revenue: 0, count: 0, byBranch: {} },
@@ -664,17 +710,15 @@ class BookingController {
       for (const r of rows) {
         const branch  = r.branch || 'Unknown';
         const status  = (r.booking_status || '').toLowerCase();
-        const appt    = r.appointment_date ? new Date(r.appointment_date) : null;
-        const price   = parseFloat(r.total_price) || 0;
-        const created = r.created_at ? new Date(r.created_at) : null;
+        const apptStr    = r.appointment_date ? new Date(r.appointment_date).toISOString().split('T')[0] : null;
+        const price      = parseFloat(r.total_price) || 0;
+        const created    = r.created_at ? new Date(r.created_at) : null;
 
-        if (appt) appt.setHours(0,0,0,0);
-        const createdToday = created && new Date(created.getFullYear(), created.getMonth(), created.getDate()).getTime() === today.getTime();
-
-        const isToday    = appt && appt.getTime() === today.getTime();
-        const isTomorrow = appt && appt.getTime() === tomorrow.getTime();
-        const isNext7    = appt && appt > today && appt <= d7End;
-        const isD7After  = appt && appt >= d7After && appt <= d7End;
+        const createdToday = created && phFmt.format(created) === todayStr;
+        const isToday    = apptStr === todayStr;
+        const isTomorrow = apptStr === tomorrowStr;
+        const isNext7    = apptStr != null && apptStr > todayStr && apptStr <= d7EndStr;
+        const isD7After  = apptStr != null && apptStr >= d7AfterStr && apptStr <= d7EndStr;
 
         // Section 1: OTS
         if (createdToday && isToday) {
@@ -701,8 +745,7 @@ class BookingController {
         // Section 5: Cancellations
         if (status.includes('cancel')) {
           const cancelDay = r.cancellation_time ? new Date(r.cancellation_time) : null;
-          if (cancelDay) cancelDay.setHours(0,0,0,0);
-          const cancelledToday = cancelDay && cancelDay.getTime() === today.getTime();
+          const cancelledToday = cancelDay && phFmt.format(cancelDay) === todayStr;
           if (cancelledToday || (!r.cancellation_time && createdToday)) {
             rpts.cancellations.count++; rpts.cancellations.revenue += price; rpts.cancellations.total++;
             inc(rpts.cancellations.byBranch, branch, price);
@@ -766,8 +809,8 @@ class BookingController {
                treatment, total_price, booking_status, phone, email, agent
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND DATE(created_at) = CURRENT_DATE
-          AND appointment_date = CURRENT_DATE
+          AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
       `);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
     } catch (err) {
@@ -783,9 +826,9 @@ class BookingController {
                treatment, total_price, booking_status, phone, email, agent
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND DATE(created_at) = CURRENT_DATE
-          AND appointment_date >= CURRENT_DATE
-          AND appointment_date <= CURRENT_DATE + 7
+          AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
       `);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
     } catch (err) {
@@ -801,8 +844,8 @@ class BookingController {
                treatment, total_price, booking_status, phone, email, agent
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND DATE(created_at) = CURRENT_DATE
-          AND appointment_date = CURRENT_DATE + 1
+          AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
           AND LOWER(booking_status) = 'scheduled'
       `);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
@@ -819,9 +862,9 @@ class BookingController {
                treatment, total_price, booking_status, phone, email, agent
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND DATE(created_at) = CURRENT_DATE
-          AND appointment_date > CURRENT_DATE + 1
-          AND appointment_date <= CURRENT_DATE + 7
+          AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND appointment_date > (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
+          AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
           AND LOWER(booking_status) = 'scheduled'
       `);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
@@ -841,8 +884,8 @@ class BookingController {
         WHERE record_status != 'DELETED'
           AND LOWER(booking_status) LIKE '%cancel%'
           AND (
-            DATE(cancellation_time) = CURRENT_DATE
-            OR (cancellation_time IS NULL AND DATE(created_at) = CURRENT_DATE)
+            (cancellation_time AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+            OR (cancellation_time IS NULL AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date)
           )
       `);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
@@ -859,7 +902,7 @@ class BookingController {
                treatment, total_price, booking_status, phone, email, agent
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND appointment_date = CURRENT_DATE
+          AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND LOWER(booking_status) IN ('arrived & bought','arrived not potential')
           AND underage_cancellation = FALSE
       `);
@@ -877,7 +920,7 @@ class BookingController {
                treatment, total_price, booking_status, phone, email, agent
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND appointment_date = CURRENT_DATE + 1
+          AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
           AND LOWER(booking_status) = 'scheduled'
       `);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
@@ -896,13 +939,15 @@ class BookingController {
         FROM bookings
         WHERE record_status != 'DELETED'
           AND cancel_validation = FALSE
-          AND appointment_date >= CURRENT_DATE
-          AND appointment_date <= CURRENT_DATE + 7
+          AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
       `);
 
-      const today    = new Date(); today.setHours(0,0,0,0);
-      const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
-      const d7End    = new Date(today); d7End.setDate(today.getDate() + 7);
+      const phFmt      = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
+      const now        = Date.now();
+      const todayStr   = phFmt.format(now);
+      const tomorrowStr = phFmt.format(now + 86400000);
+      const d7EndStr   = phFmt.format(now + 7 * 86400000);
 
       const schedToday = {}, arrToday = {}, schedTomorrow = {}, next7 = {}, otsMap = {};
       const payModesTomorrow = { Cash: 0, Debit: 0, Credit: 0 };
@@ -923,20 +968,19 @@ class BookingController {
       for (const r of rows) {
         const branch  = r.branch || 'Unknown';
         const status  = (r.booking_status || '').toLowerCase().replace(/\s+/g, ' ').trim();
-        const appt    = r.appointment_date ? new Date(r.appointment_date) : null;
-        const created = r.created_at      ? new Date(r.created_at)       : null;
-        const price   = parseFloat(r.total_price) || 0;
-        const pm      = (r.payment_mode || '').trim();
+        const apptStr    = r.appointment_date ? new Date(r.appointment_date).toISOString().split('T')[0] : null;
+        const created    = r.created_at      ? new Date(r.created_at)       : null;
+        const price      = parseFloat(r.total_price) || 0;
+        const pm         = (r.payment_mode || '').trim();
 
-        if (appt) appt.setHours(0,0,0,0);
-        const createdToday = created && new Date(created.getFullYear(), created.getMonth(), created.getDate()).getTime() === today.getTime();
+        const createdToday = created && phFmt.format(created) === todayStr;
         const cancelled    = status.includes('cancel');
         const isArrived    = status === 'arrived & bought' || status === 'arrived not potential';
 
-        if (!appt) continue;
-        const isToday    = appt.getTime() === today.getTime();
-        const isTomorrow = appt.getTime() === tomorrow.getTime();
-        const inNext7    = appt > today && appt <= d7End;
+        if (!apptStr) continue;
+        const isToday    = apptStr === todayStr;
+        const isTomorrow = apptStr === tomorrowStr;
+        const inNext7    = apptStr > todayStr && apptStr <= d7EndStr;
 
         // Schedules today
         if (!cancelled && isToday) {
@@ -1032,20 +1076,21 @@ class BookingController {
         WHERE record_status != 'DELETED' AND cancel_validation = FALSE
       `;
 
+      const phToday = `(NOW() AT TIME ZONE 'Asia/Manila')::date`;
       if (section === 'schedules-today') {
-        SQL += ` AND appointment_date = CURRENT_DATE AND LOWER(booking_status) NOT LIKE '%cancel%'`;
+        SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) NOT LIKE '%cancel%'`;
       } else if (section === 'arrivals') {
-        SQL += ` AND appointment_date = CURRENT_DATE AND LOWER(booking_status) IN ('arrived & bought','arrived not potential') AND underage_cancellation = FALSE`;
+        SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) IN ('arrived & bought','arrived not potential') AND underage_cancellation = FALSE`;
       } else if (section === 'schedules-tomorrow' || section === 'payment-tomorrow') {
-        SQL += ` AND appointment_date = CURRENT_DATE + 1 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
+        SQL += ` AND appointment_date = ${phToday} + 1 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
       } else if (section === 'next7days') {
-        SQL += ` AND appointment_date > CURRENT_DATE AND appointment_date <= CURRENT_DATE + 7 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
+        SQL += ` AND appointment_date > ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
       } else if (section === 'ots') {
-        SQL += ` AND DATE(created_at) = CURRENT_DATE AND appointment_date >= CURRENT_DATE AND appointment_date <= CURRENT_DATE + 7 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
+        SQL += ` AND (created_at AT TIME ZONE 'Asia/Manila')::date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
       }
 
       const { rows } = await pool.query(SQL);
-      res.json({ success: true, bookings: rows.map(r => ({ ...mapDrilldown(r), paymentMode: r.payment_mode || '' })) });
+      res.json({ success: true, bookings: rows.map(r => ({ ...mapDrilldown(r), paymentMode: normalizePaymentMode(r.payment_mode) })) });
     } catch (err) {
       console.error('getCCReportDrilldown error:', err);
       res.status(500).json({ error: 'Failed to fetch drill-down bookings' });
@@ -1094,16 +1139,16 @@ class BookingController {
         conds.push(`DATE(created_at) >= $${idx++}::date AND DATE(created_at) <= $${idx++}::date`);
         params.push(createdStartDate, createdEndDate);
       } else if (createdDateRange && createdDateRange !== 'all') {
-        if (createdDateRange === 'today') conds.push('DATE(created_at) = CURRENT_DATE');
-        else { const d = { last7: 7, last30: 30, last90: 90 }[createdDateRange]; if (d) conds.push(`DATE(created_at) >= CURRENT_DATE - INTERVAL '${d} days'`); }
+        if (createdDateRange === 'today') conds.push("(created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date");
+        else { const d = { last7: 7, last30: 30, last90: 90 }[createdDateRange]; if (d) conds.push(`(created_at AT TIME ZONE 'Asia/Manila')::date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${d} days'`); }
       }
       if (appointmentStartDate && appointmentEndDate) {
         conds.push(`appointment_date >= $${idx++}::date AND appointment_date <= $${idx++}::date`);
         params.push(appointmentStartDate, appointmentEndDate);
       } else if (appointmentDateRange && appointmentDateRange !== 'all') {
-        if (appointmentDateRange === 'today')    conds.push('appointment_date = CURRENT_DATE');
-        else if (appointmentDateRange === 'tomorrow') conds.push('appointment_date = CURRENT_DATE + 1');
-        else if (appointmentDateRange === 'thisWeek') conds.push('appointment_date >= CURRENT_DATE AND appointment_date <= CURRENT_DATE + (6 - EXTRACT(DOW FROM CURRENT_DATE)::int)');
+        if (appointmentDateRange === 'today')    conds.push("appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date");
+        else if (appointmentDateRange === 'tomorrow') conds.push("appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1");
+        else if (appointmentDateRange === 'thisWeek') conds.push("appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + (6 - EXTRACT(DOW FROM (NOW() AT TIME ZONE 'Asia/Manila'))::int)");
       }
       if (search) {
         const q = `%${search.toLowerCase()}%`;
@@ -1114,7 +1159,8 @@ class BookingController {
       const WHERE = `WHERE ${conds.join(' AND ')}`;
 
       const { rows } = await pool.query(`
-        SELECT record_id, created_at, branch, booking_status, appointment_date, appointment_time,
+        SELECT record_id, created_at, branch, booking_status, booking_date, booking_time,
+               appointment_date, appointment_time,
                first_name, last_name, age, gender, phone, email, social_media, treatment, area, freebie,
                total_price, payment_mode, agent, ad_interacted, booking_details, remarks, purchase_details,
                companion_first_name, companion_last_name, companion_age, companion_gender,
@@ -1126,7 +1172,8 @@ class BookingController {
 
       const CSV_COLS = [
         ['Record ID','record_id'], ['Created At','created_at'], ['Branch','branch'],
-        ['Status','booking_status'], ['Appointment Date','appointment_date'],
+        ['Status','booking_status'], ['Booking Date','booking_date'], ['Booking Time','booking_time'],
+        ['Appointment Date','appointment_date'],
         ['Appointment Time','appointment_time'], ['First Name','first_name'],
         ['Last Name','last_name'], ['Age','age'], ['Gender','gender'],
         ['Phone','phone'], ['Email','email'], ['Social Media','social_media'],
@@ -1299,18 +1346,18 @@ class BookingController {
 
       const bookingList = rows.map(r => ({
         recordId:       r.record_id,
-        date:           r.appointment_date || '',
+        date:           normDate(r.appointment_date),
         time:           r.appointment_time || '',
         branch:         r.branch           || '',
         status:         r.booking_status   || '',
         treatment:      r.treatment        || '',
         area:           r.area             || '',
-        totalPrice:     parseFloat(r.total_price) || 0,
-        paymentMode:    r.payment_mode     || '',
+        totalPrice:     parseFloat(r.total_price) ?? 0,
+        paymentMode:    normalizePaymentMode(r.payment_mode),
         agent:          r.agent            || '',
         remarks:        r.remarks          || '',
         purchaseDetails: r.purchase_details || '',
-        followUpDate:   r.follow_up_date   || null,
+        followUpDate:   normDate(r.follow_up_date) || null,
         isOts:             r.is_ots             || false,
         isHighPriority:    r.is_high_priority   || false,
         isMetaConversion:  r.is_meta_conversion || false,
@@ -1347,7 +1394,7 @@ class BookingController {
   // ── getKanbanBookings ──────────────────────────────────────────────────────
   async getKanbanBookings(req, res) {
     try {
-      const date   = req.query.date   || new Date().toISOString().split('T')[0];
+      const date   = req.query.date   || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date());
       const branch = (req.query.branch || '').trim();
 
       const conds  = ["record_status != 'DELETED'", `appointment_date = $1::date`];
@@ -1375,14 +1422,14 @@ class BookingController {
         firstName:     r.first_name       || '',
         lastName:      r.last_name        || '',
         treatment:     r.treatment        || '',
-        totalPrice:    parseFloat(r.total_price) || 0,
-        paymentMode:   r.payment_mode     || '',
+        totalPrice:    parseFloat(r.total_price) ?? 0,
+        paymentMode:   normalizePaymentMode(r.payment_mode),
         agent:         r.agent            || '',
         phone:         r.phone            || '',
         isOts:            r.is_ots             || false,
         isHighPriority:   r.is_high_priority   || false,
         isMetaConversion: r.is_meta_conversion || false,
-        followUpDate:     r.follow_up_date     || null,
+        followUpDate:     normDate(r.follow_up_date) || null,
         remarks:       r.remarks          || '',
       }));
 
