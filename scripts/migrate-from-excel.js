@@ -124,8 +124,9 @@ const INSERT_COLS = [
   'cancel_validation', 'underage_status', 'underage_cancellation', 'db_status',
   'legacy_full_name', 'exclude_from_dashboards',
   'is_ots', 'is_ad_id', 'is_companion', 'is_high_priority',
+  'do_not_call', 'is_rescheduled',
 ];
-const N = INSERT_COLS.length; // 54
+const N = INSERT_COLS.length; // 56
 
 /** Map one raw Excel row → 54-element values array */
 function rowToValues(row) {
@@ -190,6 +191,8 @@ function rowToValues(row) {
     /* 52 */ false,   // is_ad_id
     /* 53 */ false,   // is_companion
     /* 54 */ false,   // is_high_priority
+    /* 55 */ false,   // do_not_call
+    /* 56 */ false,   // is_rescheduled
   ];
 }
 
@@ -206,6 +209,8 @@ async function migrate() {
     console.error('❌ DATABASE_URL is not set in .env');
     process.exit(1);
   }
+
+  const replaceMode = process.argv.includes('--replace');
 
   console.log('📖 Reading Excel file…');
   console.log('   Path:', EXCEL_PATH);
@@ -226,6 +231,12 @@ async function migrate() {
     ssl: { rejectUnauthorized: false },
     max: 5,
   });
+
+  if (replaceMode) {
+    console.log('\n⚠️  --replace mode: wiping bookings table before import…');
+    await pool.query('TRUNCATE TABLE bookings RESTART IDENTITY CASCADE');
+    console.log('✅ Table cleared.\n');
+  }
 
   let inserted = 0;
   let skipped  = 0;

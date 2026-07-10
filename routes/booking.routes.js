@@ -1,7 +1,17 @@
 const express = require('express');
-const router = express.Router();
+const router  = express.Router();
+const multer  = require('multer');
 const bookingController = require('../controllers/booking.controller');
-const authMiddleware = require('../middleware/auth.middleware');
+const authMiddleware    = require('../middleware/auth.middleware');
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 50 * 1024 * 1024 }, // 50 MB max
+  fileFilter: (_req, file, cb) => {
+    if (file.originalname.match(/\.(xlsx|xls)$/i)) cb(null, true);
+    else cb(new Error('Only .xlsx / .xls files are accepted'));
+  },
+});
 
 // All routes require authentication
 router.use(authMiddleware);
@@ -23,6 +33,7 @@ router.get('/cc-report', bookingController.getCCReport);
 router.get('/cc-report/drilldown', bookingController.getCCReportDrilldown);
 router.get('/kanban', bookingController.getKanbanBookings);
 router.get('/old', bookingController.getOldBookings);
+router.post('/import', upload.single('file'), bookingController.importBookings);
 router.get('/:id/activity', bookingController.getActivityLog);
 router.get('/:id', bookingController.getBookingById);
 router.put('/:id', bookingController.updateBooking);

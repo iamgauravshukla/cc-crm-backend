@@ -6,10 +6,11 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-"check-env": "node check-env.js",
+    "check-env": "node check-env.js",
     "db:setup": "node scripts/db-setup.js",
     "db:migrate": "node scripts/migrate.js",
-    "db:seed": "node scripts/migrate-from-excel.js"
+    "db:seed": "node scripts/migrate-from-excel.js",
+    "db:replace": "node scripts/migrate-from-excel.js --replace"
   },
   "keywords": [
     "booking",
@@ -25,9 +26,10 @@
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "express-rate-limit": "^7.1.5",
-"helmet": "^7.1.0",
+    "helmet": "^7.1.0",
     "joi": "^17.11.0",
     "jsonwebtoken": "^9.0.2",
+    "multer": "^2.2.0",
     "node-cache": "^5.1.2",
     "pg": "^8.22.0",
     "uuid": "^9.0.1",

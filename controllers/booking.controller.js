@@ -295,6 +295,7 @@ class BookingController {
             cancel_validation, underage_cancellation,
             remarks, purchase_details,
             is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion,
+            do_not_call, is_rescheduled,
             follow_up_date, booking_date, booking_time
           FROM bookings ${WHERE}
           ORDER BY appointment_date ${ORDER} NULLS LAST, created_at ${ORDER}
@@ -345,6 +346,8 @@ class BookingController {
         isCompanion:       r.is_companion        || false,
         isHighPriority:    r.is_high_priority    || false,
         isMetaConversion:  r.is_meta_conversion  || false,
+        doNotCall:         r.do_not_call         || false,
+        isRescheduled:     r.is_rescheduled      || false,
         followUpDate:       normDate(r.follow_up_date) || null,
         bookingDate:        normDate(r.booking_date)   || null,
         bookingTime:        r.booking_time             || '',
@@ -414,9 +417,11 @@ class BookingController {
           isCompanion:       r.is_companion       || false,
           isHighPriority:    r.is_high_priority   || false,
           isMetaConversion:  r.is_meta_conversion || false,
-          followUpDate:       normDate(r.follow_up_date) || null,
-          bookingDate:        normDate(r.booking_date)   || null,
-          bookingTime:        r.booking_time             || '',
+          doNotCall:         r.do_not_call        || false,
+          isRescheduled:     r.is_rescheduled     || false,
+          followUpDate:      normDate(r.follow_up_date) || null,
+          bookingDate:       normDate(r.booking_date)   || null,
+          bookingTime:       r.booking_time             || '',
         }
       });
     } catch (err) {
@@ -514,8 +519,10 @@ class BookingController {
           companion_full_name_norm = $39,
           follow_up_date   = $40,
           booking_date     = $41,
-          booking_time     = $42
-        WHERE record_id = $43
+          booking_time     = $42,
+          do_not_call      = $43,
+          is_rescheduled   = $44
+        WHERE record_id = $45
       `, [
         d.branch           || cur.branch,
         d.status           || cur.booking_status,
@@ -555,6 +562,8 @@ class BookingController {
         d.followUpDate !== undefined ? (d.followUpDate || null) : cur.follow_up_date,
         d.bookingDate  !== undefined ? (d.bookingDate  || null) : cur.booking_date,
         d.bookingTime  !== undefined ? (d.bookingTime  || null) : cur.booking_time,
+        d.doNotCall      !== undefined ? d.doNotCall      : cur.do_not_call,
+        d.isRescheduled  !== undefined ? d.isRescheduled  : cur.is_rescheduled,
         recordId
       ]);
 
@@ -594,6 +603,8 @@ class BookingController {
         ['is_ots',                String(d.isOts            !== undefined ? d.isOts            : cur.is_ots),            String(cur.is_ots)],
         ['is_high_priority',      String(d.isHighPriority   !== undefined ? d.isHighPriority   : cur.is_high_priority),  String(cur.is_high_priority)],
         ['is_meta_conversion',    String(d.isMetaConversion !== undefined ? d.isMetaConversion : cur.is_meta_conversion), String(cur.is_meta_conversion)],
+        ['do_not_call',           String(d.doNotCall     !== undefined ? d.doNotCall     : cur.do_not_call),     String(cur.do_not_call)],
+        ['is_rescheduled',        String(d.isRescheduled !== undefined ? d.isRescheduled : cur.is_rescheduled),  String(cur.is_rescheduled)],
       ];
       const changes = {};
       for (const [field, nv, ov] of diffPairs) {
@@ -1305,7 +1316,8 @@ class BookingController {
                first_name, last_name, age, gender, phone, email, social_media, treatment, area, freebie,
                total_price, payment_mode, agent, booking_details, remarks, purchase_details,
                companion_first_name, companion_last_name,
-               promo_hunter_status, match_reason, is_ots, is_high_priority, is_meta_conversion, follow_up_date
+               promo_hunter_status, match_reason, is_ots, is_high_priority, is_meta_conversion,
+               do_not_call, is_rescheduled, follow_up_date
         FROM bookings
         WHERE record_status != 'DELETED'
           AND (
@@ -1361,6 +1373,8 @@ class BookingController {
         isOts:             r.is_ots             || false,
         isHighPriority:    r.is_high_priority   || false,
         isMetaConversion:  r.is_meta_conversion || false,
+        doNotCall:         r.do_not_call        || false,
+        isRescheduled:     r.is_rescheduled     || false,
         promoHunterStatus: r.promo_hunter_status || '',
         createdAt:      r.created_at,
       }));
@@ -1408,7 +1422,8 @@ class BookingController {
         SELECT
           record_id, booking_status, branch, appointment_time,
           first_name, last_name, treatment, total_price, payment_mode,
-          agent, phone, is_ots, is_high_priority, is_meta_conversion, follow_up_date, remarks
+          agent, phone, is_ots, is_high_priority, is_meta_conversion,
+          do_not_call, is_rescheduled, follow_up_date, remarks
         FROM bookings
         WHERE ${conds.join(' AND ')}
         ORDER BY appointment_time ASC NULLS LAST, created_at ASC
@@ -1429,8 +1444,10 @@ class BookingController {
         isOts:            r.is_ots             || false,
         isHighPriority:   r.is_high_priority   || false,
         isMetaConversion: r.is_meta_conversion || false,
+        doNotCall:        r.do_not_call        || false,
+        isRescheduled:    r.is_rescheduled     || false,
         followUpDate:     normDate(r.follow_up_date) || null,
-        remarks:       r.remarks          || '',
+        remarks:          r.remarks            || '',
       }));
 
       res.json({ success: true, date, bookings });
@@ -1500,6 +1517,145 @@ async function checkPromoHunter(firstName, lastName, email, phone, socialMedia, 
   }
 }
 
+// ── Excel Import helpers (mirrors migrate-from-excel.js) ─────────────────────
+
+function _str(v) {
+  if (v === null || v === undefined) return null;
+  if (v instanceof Date) return null;
+  const s = String(v).trim();
+  return (s === '' || s === 'NaN' || s === 'undefined' || s === 'null') ? null : s;
+}
+function _bool(v) {
+  if (typeof v === 'boolean') return v;
+  if (v === null || v === undefined) return false;
+  return ['TRUE', '1', 'YES'].includes(String(v).toUpperCase().trim());
+}
+function _price(v) {
+  if (v === null || v === undefined) return 0;
+  if (typeof v === 'number' && !isNaN(v)) return v;
+  const n = parseFloat(String(v).replace(/[₱,\s]/g, ''));
+  return isNaN(n) ? 0 : n;
+}
+function _int(v) {
+  const n = parseInt(v, 10);
+  return isNaN(n) ? null : n;
+}
+function _isoTs(v) {
+  if (!v) return null;
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : v.toISOString();
+  const d = new Date(String(v));
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+function _dateOnly(v) {
+  if (!v) return null;
+  const d = v instanceof Date ? v : new Date(String(v));
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString().split('T')[0];
+}
+function _timeOnly(v) {
+  if (!v) return null;
+  const d = v instanceof Date ? v : new Date(String(v));
+  if (isNaN(d.getTime())) return null;
+  const h = d.getHours(), m = d.getMinutes();
+  return `${h % 12 || 12}:${String(m).padStart(2, '0')} ${h >= 12 ? 'PM' : 'AM'}`;
+}
+
+let _importIdCounter = 0;
+function _genRecordId(createdAt) {
+  const d = (createdAt instanceof Date && !isNaN(createdAt)) ? createdAt : new Date();
+  const p = n => String(n).padStart(2, '0');
+  const rand = (++_importIdCounter).toString(36).toUpperCase().padStart(3, '0')
+             + Math.random().toString(36).toUpperCase().slice(2, 4);
+  return `BK-${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}`
+       + `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+       + `-${rand.slice(0, 5)}`;
+}
+
+const IMPORT_COLS = [
+  'record_id', 'record_status', 'created_at', 'branch', 'booking_status',
+  'booking_date', 'booking_time', 'appointment_date', 'appointment_time',
+  'cancellation_time',
+  'first_name', 'last_name', 'age', 'gender', 'phone', 'email', 'social_media',
+  'treatment', 'area', 'freebie', 'total_price', 'payment_mode',
+  'companion_treatment', 'companion_first_name', 'companion_last_name',
+  'companion_age', 'companion_gender', 'companion_freebie', 'companion_area',
+  'agent', 'booking_details', 'remarks', 'purchase_details', 'ad_interacted',
+  'email_norm', 'phone_norm', 'social_norm', 'full_name_norm',
+  'companion_full_name_norm',
+  'promo_hunter_status', 'match_reason', 'matched_source', 'matched_row',
+  'last_checked_at',
+  'cancel_validation', 'underage_status', 'underage_cancellation', 'db_status',
+  'legacy_full_name', 'exclude_from_dashboards',
+  'is_ots', 'is_ad_id', 'is_companion', 'is_high_priority',
+  'do_not_call', 'is_rescheduled',
+];
+const IMPORT_N = IMPORT_COLS.length;
+
+const IMPORT_SINGLE_SQL = `
+  INSERT INTO bookings (${IMPORT_COLS.join(', ')})
+  VALUES (${Array.from({ length: IMPORT_N }, (_, i) => `$${i + 1}`).join(', ')})
+  ON CONFLICT (record_id) DO NOTHING
+`;
+
+function _rowToValues(row) {
+  const createdAt = row[0] instanceof Date ? row[0] : null;
+  const apptDt    = row[3] instanceof Date ? row[3] : null;
+  const rawId     = _str(row[38]);
+  return [
+    rawId || _genRecordId(createdAt),
+    _str(row[39]) || 'ACTIVE',
+    _isoTs(createdAt),
+    _str(row[1])  || '',
+    _str(row[2])  || 'Scheduled',
+    _dateOnly(createdAt),
+    _timeOnly(createdAt),
+    _dateOnly(apptDt),
+    _timeOnly(apptDt),
+    null,
+    _str(row[4])  || '',
+    _str(row[5])  || '',
+    _int(row[6]),
+    _str(row[7]),
+    _str(row[14]),
+    _str(row[16]),
+    _str(row[15]),
+    _str(row[8]),
+    _str(row[9]),
+    _str(row[10]),
+    _price(row[12]),
+    _str(row[13]),
+    _str(row[11]),
+    _str(row[20]),
+    _str(row[21]),
+    _int(row[22]),
+    _str(row[23]),
+    _str(row[24]),
+    null,
+    _str(row[17]),
+    _str(row[18]),
+    null,
+    _str(row[43]),
+    _str(row[19]),
+    _str(row[29]),
+    _str(row[30]),
+    _str(row[31]),
+    _str(row[32]),
+    _str(row[33]),
+    _str(row[34]),
+    _str(row[35]),
+    _str(row[36]),
+    _str(row[37]),
+    _isoTs(row[40] instanceof Date ? row[40] : null),
+    _bool(row[25]),
+    _str(row[26]),
+    _bool(row[27]),
+    _str(row[28]),
+    _str(row[41]),
+    _bool(row[42]),
+    false, false, false, false, false, false,
+  ];
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function formatTime12h(timeStr) {
@@ -1528,4 +1684,73 @@ function mapDrilldown(r) {
   };
 }
 
+// ── Import (attached outside class so it can be used as standalone middleware) ─
+BookingController.prototype.importBookings = async function(req, res) {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const XLSX = require('xlsx');
+    const wb = XLSX.read(req.file.buffer, { cellDates: true });
+    const ws = wb.Sheets['MASTER_RECORDS'];
+    if (!ws) {
+      return res.status(400).json({
+        error: `Sheet "MASTER_RECORDS" not found. Available sheets: ${wb.SheetNames.join(', ')}`
+      });
+    }
+
+    const allRows  = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+    const dataRows = allRows
+      .slice(1)
+      .filter(r => r && r.some(v => v !== null && v !== undefined && v !== ''));
+
+    const total     = dataRows.length;
+    const BATCH     = 200;
+    let inserted    = 0;
+    let skipped     = 0;
+    let errCount    = 0;
+    const errDetails = [];
+
+    for (let b = 0; b < total; b += BATCH) {
+      const batch   = dataRows.slice(b, b + BATCH);
+      const rowVals = batch.map(_rowToValues);
+
+      const groups = rowVals.map((_, i) => {
+        const start = i * IMPORT_N + 1;
+        return `(${Array.from({ length: IMPORT_N }, (_, j) => `$${start + j}`).join(', ')})`;
+      });
+
+      const batchSql = `
+        INSERT INTO bookings (${IMPORT_COLS.join(', ')})
+        VALUES ${groups.join(',\n')}
+        ON CONFLICT (record_id) DO NOTHING
+      `;
+
+      try {
+        const result = await pool.query(batchSql, rowVals.flat());
+        inserted += result.rowCount || 0;
+        skipped  += batch.length - (result.rowCount || 0);
+      } catch {
+        for (let r = 0; r < rowVals.length; r++) {
+          try {
+            const res2 = await pool.query(IMPORT_SINGLE_SQL, rowVals[r]);
+            inserted += res2.rowCount || 0;
+          } catch (rowErr) {
+            errCount++;
+            if (errDetails.length < 20) {
+              errDetails.push(`Row ${b + r + 2} (${rowVals[r][0]}): ${rowErr.message}`);
+            }
+            skipped++;
+          }
+        }
+      }
+    }
+
+    return res.json({ total, inserted, skipped, errors: errCount, errDetails });
+  } catch (err) {
+    console.error('[importBookings] Fatal:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+// Re-export the singleton with the patched method
 module.exports = new BookingController();

@@ -316,9 +316,11 @@ async function getAnalytics(req, res) {
     });
 
     // ── time series ──
-    const byMonth = tmRows.map(r => ({
-      month: r.label, count: parseInt(r.cnt), revenue: +parseFloat(r.revenue || 0).toFixed(2)
-    }));
+    const byMonth = tmRows
+      .filter(r => r.label != null)
+      .map(r => ({
+        month: r.label, count: parseInt(r.cnt), revenue: +parseFloat(r.revenue || 0).toFixed(2)
+      }));
 
     // ── previous period ──
     const pvRow = pvRows[0] || {};
@@ -348,10 +350,11 @@ async function getAnalytics(req, res) {
 
     // ── auto insights ──
     const insights = [];
+    const currentRevenue = +completedRevenue.toFixed(2);
     if (previousOverview.totalRevenue > 0) {
-      const pct = (overview.totalRevenue - previousOverview.totalRevenue) / previousOverview.totalRevenue * 100;
+      const pct = (currentRevenue - previousOverview.totalRevenue) / previousOverview.totalRevenue * 100;
       insights.push({ type: pct >= 0 ? 'positive' : 'negative',
-        text: `Revenue ${pct >= 0 ? '▲' : '▼'}${Math.abs(pct).toFixed(1)}% vs previous period (₱${Math.round(previousOverview.totalRevenue).toLocaleString()} → ₱${Math.round(overview.totalRevenue).toLocaleString()})` });
+        text: `Revenue ${pct >= 0 ? '▲' : '▼'}${Math.abs(pct).toFixed(1)}% vs previous period (₱${Math.round(previousOverview.totalRevenue).toLocaleString()} → ₱${Math.round(currentRevenue).toLocaleString()})` });
     }
     if (funnelData.totalBookings > 0) {
       const arrRate  = (funnelData.arrived / funnelData.totalBookings * 100).toFixed(1);
