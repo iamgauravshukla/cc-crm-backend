@@ -62,6 +62,46 @@ const normDate = v => {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
 };
 
+// Appends the "Booked On" (booking_date) and Appointment-date filters shared by
+// the Master Bookings table (getOldBookings) and its CSV export (exportBookings),
+// so the two never drift. Mutates conds/params; returns the next param index.
+const pushBookingDateFilters = (conds, params, idx, q) => {
+  const TODAY = "(NOW() AT TIME ZONE 'Asia/Manila')::date";
+
+  // Booked On — filters by booking_date (the date agents enter, shown in the table)
+  if (q.createdStartDate && q.createdEndDate) {
+    conds.push(`booking_date >= $${idx++}::date AND booking_date <= $${idx++}::date`);
+    params.push(q.createdStartDate, q.createdEndDate);
+  } else if (q.createdDateRange && q.createdDateRange !== 'all') {
+    if (q.createdDateRange === 'today') {
+      conds.push(`booking_date = ${TODAY}`);
+    } else {
+      const d = { last7: 7, last30: 30, last90: 90 }[q.createdDateRange];
+      if (d) conds.push(`booking_date >= ${TODAY} - INTERVAL '${d} days'`);
+    }
+  }
+
+  // Appointment date
+  if (q.appointmentStartDate && q.appointmentEndDate) {
+    conds.push(`appointment_date >= $${idx++}::date AND appointment_date <= $${idx++}::date`);
+    params.push(q.appointmentStartDate, q.appointmentEndDate);
+  } else if (q.appointmentDateRange && q.appointmentDateRange !== 'all') {
+    const r = q.appointmentDateRange;
+    if      (r === 'today')     conds.push(`appointment_date = ${TODAY}`);
+    else if (r === 'tomorrow')  conds.push(`appointment_date = ${TODAY} + 1`);
+    else if (r === 'thisWeek')  conds.push(`appointment_date >= ${TODAY} AND appointment_date <= ${TODAY} + (6 - EXTRACT(DOW FROM ${TODAY})::int)`);
+    else if (r === 'next7')     conds.push(`appointment_date >= ${TODAY} AND appointment_date <= ${TODAY} + 7`);
+    else if (r === 'next30')    conds.push(`appointment_date >= ${TODAY} AND appointment_date <= ${TODAY} + 30`);
+    else if (r === 'last7')     conds.push(`appointment_date >= ${TODAY} - 7 AND appointment_date < ${TODAY}`);
+    else if (r === 'last30')    conds.push(`appointment_date >= ${TODAY} - 30 AND appointment_date < ${TODAY}`);
+    else if (r === 'last90')    conds.push(`appointment_date >= ${TODAY} - 90 AND appointment_date < ${TODAY}`);
+    else if (r === 'thisMonth') conds.push(`DATE_TRUNC('month', appointment_date) = DATE_TRUNC('month', ${TODAY})`);
+    else if (r === 'lastMonth') conds.push(`DATE_TRUNC('month', appointment_date) = DATE_TRUNC('month', ${TODAY} - INTERVAL '1 month')`);
+  }
+
+  return idx;
+};
+
 const normalizeGender = v => {
   const l = (v || '').toLowerCase();
   if (l === 'female') return 'Female';
@@ -193,6 +233,7 @@ class BookingController {
       const agent     = (req.query.agent     || '').trim();
       const gender    = (req.query.gender    || '').trim();
       const sortOrder = req.query.sortOrder  || 'newest';
+      const sortField = req.query.sortField  || 'appointment_date';
 
       const createdDateRange    = req.query.createdDateRange;
       const createdStartDate    = req.query.createdStartDate;
@@ -242,29 +283,11 @@ class BookingController {
         params.push(gender.toLowerCase());
       }
 
-      // Created date filter
-      if (createdStartDate && createdEndDate) {
-        conds.push(`DATE(created_at) >= $${idx++}::date AND DATE(created_at) <= $${idx++}::date`);
-        params.push(createdStartDate, createdEndDate);
-      } else if (createdDateRange && createdDateRange !== 'all') {
-        if (createdDateRange === 'today') {
-          conds.push("(created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date");
-        } else {
-          const daysMap = { last7: 7, last30: 30, last90: 90 };
-          const d = daysMap[createdDateRange];
-          if (d) conds.push(`(created_at AT TIME ZONE 'Asia/Manila')::date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${d} days'`);
-        }
-      }
-
-      // Appointment date filter
-      if (appointmentStartDate && appointmentEndDate) {
-        conds.push(`appointment_date >= $${idx++}::date AND appointment_date <= $${idx++}::date`);
-        params.push(appointmentStartDate, appointmentEndDate);
-      } else if (appointmentDateRange && appointmentDateRange !== 'all') {
-        if (appointmentDateRange === 'today')    conds.push("appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date");
-        else if (appointmentDateRange === 'tomorrow')  conds.push("appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1");
-        else if (appointmentDateRange === 'thisWeek')  conds.push("appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + (6 - EXTRACT(DOW FROM (NOW() AT TIME ZONE 'Asia/Manila'))::int)");
-      }
+      // Booked On (booking_date) + Appointment-date filters — shared with exportBookings
+      idx = pushBookingDateFilters(conds, params, idx, {
+        createdStartDate, createdEndDate, createdDateRange,
+        appointmentStartDate, appointmentEndDate, appointmentDateRange,
+      });
 
       // Search filter
       if (search) {
@@ -277,6 +300,8 @@ class BookingController {
       const WHERE  = `WHERE ${conds.join(' AND ')}`;
       const ORDER  = sortOrder === 'oldest' ? 'ASC' : 'DESC';
       const OFFSET = (page - 1) * limit;
+      const ALLOWED_SORT = { appointment_date: 'appointment_date', booking_date: 'booking_date', age: 'age' };
+      const SORT_COL = ALLOWED_SORT[sortField] || 'appointment_date';
 
       const [{ rows: countRows }, { rows }] = await Promise.all([
         pool.query(`SELECT COUNT(*) AS total FROM bookings ${WHERE}`, params),
@@ -298,7 +323,7 @@ class BookingController {
             do_not_call, is_rescheduled,
             follow_up_date, booking_date, booking_time
           FROM bookings ${WHERE}
-          ORDER BY appointment_date ${ORDER} NULLS LAST, created_at ${ORDER}
+          ORDER BY ${SORT_COL} ${ORDER} NULLS LAST, created_at ${ORDER}
           LIMIT ${limit} OFFSET ${OFFSET}
         `, params)
       ]);
@@ -676,12 +701,13 @@ class BookingController {
     try {
       // Fetch all rows needed for the 7 report sections in one query
       const { rows } = await pool.query(`
-        SELECT branch, booking_status, appointment_date, created_at, total_price,
+        SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
                cancellation_time, underage_cancellation, follow_up_date
         FROM bookings
         WHERE record_status != 'DELETED'
           AND (
-            (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+            booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+            OR (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
             OR appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
             OR (appointment_date > (NOW() AT TIME ZONE 'Asia/Manila')::date + 1 AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7)
             OR (LOWER(booking_status) LIKE '%cancel%')
@@ -694,10 +720,10 @@ class BookingController {
 
       const phFmt      = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
       const now        = Date.now();
-      const todayStr   = phFmt.format(now);
-      const tomorrowStr = phFmt.format(now + 86400000);
-      const d7EndStr   = phFmt.format(now + 7 * 86400000);
-      const d7AfterStr = phFmt.format(now + 2 * 86400000);
+      const todayStr      = phFmt.format(now);
+      const tomorrowStr   = phFmt.format(now + 86400000);
+      const next7EndStr   = phFmt.format(now + 7 * 86400000); // day+7 — end of "next 7 days" (e.g. next Mon when today is Mon)
+      const next7StartStr = phFmt.format(now + 2 * 86400000); // day+2 — first day after tomorrow
       const rpts = {
         otsBookings:             { total: 0, revenue: 0, count: 0, byBranch: {} },
         overallBookings:         { total: 0, revenue: 0, count: 0, byBranch: {} },
@@ -722,34 +748,36 @@ class BookingController {
         const branch  = r.branch || 'Unknown';
         const status  = (r.booking_status || '').toLowerCase();
         const apptStr    = r.appointment_date ? new Date(r.appointment_date).toISOString().split('T')[0] : null;
+        const bookingStr = r.booking_date    ? new Date(r.booking_date).toISOString().split('T')[0]     : null;
         const price      = parseFloat(r.total_price) || 0;
         const created    = r.created_at ? new Date(r.created_at) : null;
 
-        const createdToday = created && phFmt.format(created) === todayStr;
+        const createdToday = created && phFmt.format(created) === todayStr; // used only for cancellation fallback
+        const bookedToday  = bookingStr === todayStr;                       // "OTS" = booked today (booking_date)
         const isToday    = apptStr === todayStr;
         const isTomorrow = apptStr === tomorrowStr;
-        const isNext7    = apptStr != null && apptStr > todayStr && apptStr <= d7EndStr;
-        const isD7After  = apptStr != null && apptStr >= d7AfterStr && apptStr <= d7EndStr;
+        const isNext7    = apptStr != null && apptStr > todayStr    && apptStr <= next7EndStr; // day+1 .. day+7
+        const isD7After  = apptStr != null && apptStr >= next7StartStr && apptStr <= next7EndStr; // day+2 .. day+7
 
         // Section 1: OTS
-        if (createdToday && isToday) {
+        if (bookedToday && isToday) {
           rpts.otsBookings.count++; rpts.otsBookings.revenue += price; rpts.otsBookings.total++;
           inc(rpts.otsBookings.byBranch, branch, price);
         }
 
         // Section 2: Overall
-        if (createdToday && (isToday || isNext7)) {
+        if (bookedToday && (isToday || isNext7)) {
           rpts.overallBookings.count++; rpts.overallBookings.revenue += price; rpts.overallBookings.total++;
           inc(rpts.overallBookings.byBranch, branch, price);
         }
 
         // Section 3: Booked Tomorrow
-        if (createdToday && isTomorrow && status === 'scheduled') {
+        if (bookedToday && isTomorrow && status === 'scheduled') {
           inc(rpts.bookedTomorrow.byBranch, branch, price);
         }
 
         // Section 4: Booked Next 7 Days
-        if (createdToday && isD7After && status === 'scheduled') {
+        if (bookedToday && isD7After && status === 'scheduled') {
           inc(rpts.bookedNext7Days.byBranch, branch, price);
         }
 
@@ -820,7 +848,7 @@ class BookingController {
                treatment, total_price, booking_status, phone, email, agent
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
       `);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
@@ -837,7 +865,7 @@ class BookingController {
                treatment, total_price, booking_status, phone, email, agent
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
       `);
@@ -855,7 +883,7 @@ class BookingController {
                treatment, total_price, booking_status, phone, email, agent
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
           AND LOWER(booking_status) = 'scheduled'
       `);
@@ -873,7 +901,7 @@ class BookingController {
                treatment, total_price, booking_status, phone, email, agent
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date > (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
           AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
           AND LOWER(booking_status) = 'scheduled'
@@ -945,7 +973,7 @@ class BookingController {
   async getCCReport(req, res) {
     try {
       const { rows } = await pool.query(`
-        SELECT branch, booking_status, appointment_date, created_at, total_price,
+        SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
                payment_mode, underage_cancellation, cancel_validation
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -956,9 +984,11 @@ class BookingController {
 
       const phFmt      = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
       const now        = Date.now();
-      const todayStr   = phFmt.format(now);
+      const todayStr    = phFmt.format(now);
       const tomorrowStr = phFmt.format(now + 86400000);
-      const d7EndStr   = phFmt.format(now + 7 * 86400000);
+      // "Next 7 days" = day+2 .. day+7 (excludes today & tomorrow). E.g. if today is
+      // Monday, this counts Wednesday through next Monday.
+      const next7EndStr = phFmt.format(now + 7 * 86400000);
 
       const schedToday = {}, arrToday = {}, schedTomorrow = {}, next7 = {}, otsMap = {};
       const payModesTomorrow = { Cash: 0, Debit: 0, Credit: 0 };
@@ -980,24 +1010,25 @@ class BookingController {
         const branch  = r.branch || 'Unknown';
         const status  = (r.booking_status || '').toLowerCase().replace(/\s+/g, ' ').trim();
         const apptStr    = r.appointment_date ? new Date(r.appointment_date).toISOString().split('T')[0] : null;
-        const created    = r.created_at      ? new Date(r.created_at)       : null;
+        const bookingStr = r.booking_date    ? new Date(r.booking_date).toISOString().split('T')[0]     : null;
         const price      = parseFloat(r.total_price) || 0;
         const pm         = (r.payment_mode || '').trim();
 
-        const createdToday = created && phFmt.format(created) === todayStr;
-        const cancelled    = status.includes('cancel');
-        const isArrived    = status === 'arrived & bought' || status === 'arrived not potential';
+        // "OTS" = booked today (booking_date column), regardless of the DB insertion time.
+        const bookedToday = bookingStr === todayStr;
+        const cancelled   = status.includes('cancel');
+        const isArrived   = status === 'arrived & bought' || status === 'arrived not potential';
 
         if (!apptStr) continue;
         const isToday    = apptStr === todayStr;
         const isTomorrow = apptStr === tomorrowStr;
-        const inNext7    = apptStr > todayStr && apptStr <= d7EndStr;
+        const inNext7    = apptStr > tomorrowStr && apptStr <= next7EndStr; // day+2 .. day+7
 
         // Schedules today
         if (!cancelled && isToday) {
           inc(schedToday, branch, price);
-          if (createdToday) { otsT++; otsRev += price; inc(otsMap, branch); }
-          else              { otsAddit++; additRev += price; }
+          if (bookedToday) { otsT++; otsRev += price; inc(otsMap, branch); }
+          else             { otsAddit++; additRev += price; }
         }
 
         // Arrivals today
@@ -1005,7 +1036,7 @@ class BookingController {
           inc(arrToday, branch);
           const label = r.booking_status || '';
           arrStatusMap[label] = (arrStatusMap[label] || 0) + 1;
-          if (createdToday) arrOTS++; else arrAddit++;
+          if (bookedToday) arrOTS++; else arrAddit++;
         }
 
         // Bought today (arrived & bought + comeback & bought)
@@ -1025,15 +1056,15 @@ class BookingController {
                    : pm.toLowerCase().includes('debit') ? 'Debit'
                    : pm.toLowerCase().includes('credit') ? 'Credit' : null;
           if (mk) { payModesTomorrow[mk]++; payModeRevTomorrow[mk] += price; }
-          if (createdToday) { schedTomOTS++; inc(otsMap, branch); }
-          else               schedTomAddit++;
+          if (bookedToday) { schedTomOTS++; inc(otsMap, branch); }
+          else              schedTomAddit++;
         }
 
-        // Next 7 days (excludes tomorrow to avoid double-counting with schedTomorrow/otsMap)
-        if (!cancelled && inNext7 && !isTomorrow) {
+        // Next 7 days (day+2 .. day+7 — already excludes today & tomorrow via inNext7)
+        if (!cancelled && inNext7) {
           inc(next7, branch, price);
-          if (createdToday) { otsNext7++; inc(otsMap, branch); }
-          else               additNext7++;
+          if (bookedToday) { otsNext7++; inc(otsMap, branch); }
+          else              additNext7++;
         }
       }
 
@@ -1095,9 +1126,11 @@ class BookingController {
       } else if (section === 'schedules-tomorrow' || section === 'payment-tomorrow') {
         SQL += ` AND appointment_date = ${phToday} + 1 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
       } else if (section === 'next7days') {
-        SQL += ` AND appointment_date > ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
+        // day+2 .. day+7 (excludes today & tomorrow), matching totalSchedulesNext7
+        SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
       } else if (section === 'ots') {
-        SQL += ` AND (created_at AT TIME ZONE 'Asia/Manila')::date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
+        // OTS = booked today (booking_date), appt within today .. day+7
+        SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
       }
 
       const { rows } = await pool.query(SQL);
@@ -1146,21 +1179,11 @@ class BookingController {
       if (gender && gender !== 'All') {
         conds.push(`LOWER(COALESCE(gender,'')) = $${idx++}`); params.push(gender.toLowerCase());
       }
-      if (createdStartDate && createdEndDate) {
-        conds.push(`DATE(created_at) >= $${idx++}::date AND DATE(created_at) <= $${idx++}::date`);
-        params.push(createdStartDate, createdEndDate);
-      } else if (createdDateRange && createdDateRange !== 'all') {
-        if (createdDateRange === 'today') conds.push("(created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date");
-        else { const d = { last7: 7, last30: 30, last90: 90 }[createdDateRange]; if (d) conds.push(`(created_at AT TIME ZONE 'Asia/Manila')::date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${d} days'`); }
-      }
-      if (appointmentStartDate && appointmentEndDate) {
-        conds.push(`appointment_date >= $${idx++}::date AND appointment_date <= $${idx++}::date`);
-        params.push(appointmentStartDate, appointmentEndDate);
-      } else if (appointmentDateRange && appointmentDateRange !== 'all') {
-        if (appointmentDateRange === 'today')    conds.push("appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date");
-        else if (appointmentDateRange === 'tomorrow') conds.push("appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1");
-        else if (appointmentDateRange === 'thisWeek') conds.push("appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + (6 - EXTRACT(DOW FROM (NOW() AT TIME ZONE 'Asia/Manila'))::int)");
-      }
+      // Booked On (booking_date) + Appointment-date filters — shared with getOldBookings
+      idx = pushBookingDateFilters(conds, params, idx, {
+        createdStartDate, createdEndDate, createdDateRange,
+        appointmentStartDate, appointmentEndDate, appointmentDateRange,
+      });
       if (search) {
         const q = `%${search.toLowerCase()}%`;
         conds.push(`(LOWER(COALESCE(first_name,'')) LIKE $${idx} OR LOWER(COALESCE(last_name,'')) LIKE $${idx} OR LOWER(COALESCE(email,'')) LIKE $${idx} OR phone LIKE $${idx} OR LOWER(COALESCE(social_media,'')) LIKE $${idx} OR LOWER(COALESCE(agent,'')) LIKE $${idx} OR LOWER(COALESCE(treatment,'')) LIKE $${idx} OR LOWER(COALESCE(branch,'')) LIKE $${idx})`);

@@ -2,7 +2,8 @@
 const pool = require('../db/pool');
 
 const COMPLETED_IN = `LOWER(booking_status) IN ('arrived not potential','arrived & bought','comeback & bought')`;
-const ARRIVAL_IN   = `LOWER(booking_status) IN ('arrived not potential','arrived & bought')`;
+// An "arrival" = arrived status AND not invalidated by an underage- or cancel-validation flag.
+const ARRIVAL_IN   = `(LOWER(booking_status) IN ('arrived not potential','arrived & bought') AND COALESCE(underage_cancellation, FALSE) = FALSE AND COALESCE(cancel_validation, FALSE) = FALSE)`;
 const SALE_STATUSES = new Set(['arrived & bought','comeback & bought','arrived not potential']);
 const ARRIVAL_STATUSES = new Set(['arrived not potential','arrived & bought']);
 
@@ -594,7 +595,8 @@ async function getSalesReport(req, res) {
       : [prevStart.toISOString().split('T')[0], endDate.toISOString().split('T')[0]];
 
     const { rows } = await pool.query(`
-      SELECT branch, booking_status, appointment_date, total_price
+      SELECT branch, booking_status, appointment_date, total_price,
+             underage_cancellation, cancel_validation
       FROM bookings
       WHERE record_status != 'DELETED'
         AND appointment_date >= $1::date
@@ -625,7 +627,7 @@ async function getSalesReport(req, res) {
       const branch = r.branch || 'Unknown';
       const status = (r.booking_status || '').toLowerCase().replace(/\s+/g, ' ').trim();
       const price  = parseFloat(r.total_price) || 0;
-      const isArr  = ARRIVAL_STATUSES.has(status);
+      const isArr  = ARRIVAL_STATUSES.has(status) && !r.underage_cancellation && !r.cancel_validation;
       const isSale = SALE_STATUSES.has(status);
 
       if (bDate >= startDate && bDate <= endDate) {
