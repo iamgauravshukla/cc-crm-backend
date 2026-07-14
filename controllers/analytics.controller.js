@@ -2,8 +2,8 @@
 const pool = require('../db/pool');
 
 const COMPLETED_IN = `LOWER(booking_status) IN ('arrived not potential','arrived & bought','comeback & bought')`;
-// An "arrival" = arrived status AND not invalidated by an underage- or cancel-validation flag.
-const ARRIVAL_IN   = `(LOWER(booking_status) IN ('arrived not potential','arrived & bought') AND COALESCE(underage_cancellation, FALSE) = FALSE AND COALESCE(cancel_validation, FALSE) = FALSE)`;
+// An "arrival" = arrived status AND both validations Approved (Pending/Rejected excluded).
+const ARRIVAL_IN   = `(LOWER(booking_status) IN ('arrived not potential','arrived & bought') AND COALESCE(underage_status,'Approved') = 'Approved' AND COALESCE(db_status,'Approved') = 'Approved')`;
 const SALE_STATUSES = new Set(['arrived & bought','comeback & bought','arrived not potential']);
 const ARRIVAL_STATUSES = new Set(['arrived not potential','arrived & bought']);
 
@@ -419,7 +419,7 @@ async function getAgentPerformance(req, res) {
     const endDate   = req.query.endDate;
 
     const SKIP_AGENTS = `agent IS NOT NULL AND TRIM(LOWER(agent)) NOT IN ('unknown','no data','n/a','-','','none','unassigned')`;
-    const VAL_FILTER  = `cancel_validation = FALSE AND underage_cancellation = FALSE`;
+    const VAL_FILTER  = `COALESCE(underage_status,'Approved') = 'Approved' AND COALESCE(db_status,'Approved') = 'Approved'`;
 
     let WHERE, params;
     if (startDate && endDate) {
@@ -596,7 +596,7 @@ async function getSalesReport(req, res) {
 
     const { rows } = await pool.query(`
       SELECT branch, booking_status, appointment_date, total_price,
-             underage_cancellation, cancel_validation
+             underage_status, db_status
       FROM bookings
       WHERE record_status != 'DELETED'
         AND appointment_date >= $1::date
@@ -627,7 +627,7 @@ async function getSalesReport(req, res) {
       const branch = r.branch || 'Unknown';
       const status = (r.booking_status || '').toLowerCase().replace(/\s+/g, ' ').trim();
       const price  = parseFloat(r.total_price) || 0;
-      const isArr  = ARRIVAL_STATUSES.has(status) && !r.underage_cancellation && !r.cancel_validation;
+      const isArr  = ARRIVAL_STATUSES.has(status) && (r.underage_status || 'Approved') === 'Approved' && (r.db_status || 'Approved') === 'Approved';
       const isSale = SALE_STATUSES.has(status);
 
       if (bDate >= startDate && bDate <= endDate) {

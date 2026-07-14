@@ -32,7 +32,9 @@ const bookingSchema = Joi.object({
   adInteracted:        Joi.string().allow('', null).optional(),
   remarks:             Joi.string().allow('', null).optional(),
   followUpDate:        Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).allow('', null).optional(),
-  agent:               Joi.string().required()
+  agent:               Joi.string().required(),
+  isOts:               Joi.boolean().default(false),
+  isCompanion:         Joi.boolean().default(false)
 });
 
 // ── Activity log helper ───────────────────────────────────────────────────────
@@ -88,6 +90,7 @@ const pushBookingDateFilters = (conds, params, idx, q) => {
   } else if (q.appointmentDateRange && q.appointmentDateRange !== 'all') {
     const r = q.appointmentDateRange;
     if      (r === 'today')     conds.push(`appointment_date = ${TODAY}`);
+    else if (r === 'yesterday') conds.push(`appointment_date = ${TODAY} - 1`);
     else if (r === 'tomorrow')  conds.push(`appointment_date = ${TODAY} + 1`);
     else if (r === 'thisWeek')  conds.push(`appointment_date >= ${TODAY} AND appointment_date <= ${TODAY} + (6 - EXTRACT(DOW FROM ${TODAY})::int)`);
     else if (r === 'next7')     conds.push(`appointment_date >= ${TODAY} AND appointment_date <= ${TODAY} + 7`);
@@ -100,6 +103,17 @@ const pushBookingDateFilters = (conds, params, idx, q) => {
   }
 
   return idx;
+};
+
+// Placeholder emails entered when a client has no real address (e.g. n/a@gmail.com,
+// na@gmail.com). Many unrelated clients share these, so they must NOT drive Promo
+// Hunter matching — normalize them to '' ("no email") for both storage and matching.
+const PLACEHOLDER_EMAIL_LOCALS = new Set(['n/a', 'na', 'none', 'noemail', 'nil', 'n.a', 'n-a']);
+const normalizeEmail = (email) => {
+  const e = (email || '').toLowerCase().trim();
+  if (!e) return '';
+  const local = e.split('@')[0];
+  return PLACEHOLDER_EMAIL_LOCALS.has(local) ? '' : e;
 };
 
 const normalizeGender = v => {
@@ -148,7 +162,7 @@ class BookingController {
       const finalStatus = promoResult.status === 'Promo hunter' ? 'Promo hunter' : (d.status || 'Scheduled');
 
       // Normalized fields
-      const emailNorm   = (d.email        || '').toLowerCase().trim();
+      const emailNorm   = normalizeEmail(d.email);
       const phoneNorm   = (d.phone        || '').replace(/\D/g, '');
       const socialNorm  = (d.socialMedia  || '').toLowerCase().trim();
       const fullName    = `${d.firstName} ${d.lastName}`.toLowerCase().trim();
@@ -183,7 +197,7 @@ class BookingController {
           $28,$29,$30,$31,
           $32,$33,$34,$35,$36,
           $37,$38,$39,$40,$2,
-          false,false,false,false,false,
+          $42,false,$43,false,false,
           $41
         )`,
         [
@@ -198,7 +212,9 @@ class BookingController {
           d.agent, d.bookingDetails || null, d.remarks || null, d.adInteracted || null,
           emailNorm, phoneNorm, socialNorm, fullName, companionFN,
           promoResult.status, promoResult.matchReason || null, promoResult.matchedSource || null, promoResult.matchedRow || null,
-          d.followUpDate || null
+          d.followUpDate || null,
+          d.isOts === true,        // $42 is_ots
+          d.isCompanion === true   // $43 is_companion
         ]
       );
 
@@ -292,7 +308,7 @@ class BookingController {
       // Search filter
       if (search) {
         const q = `%${search.toLowerCase()}%`;
-        conds.push(`(LOWER(COALESCE(first_name,'')) LIKE $${idx} OR LOWER(COALESCE(last_name,'')) LIKE $${idx} OR LOWER(COALESCE(email,'')) LIKE $${idx} OR phone LIKE $${idx} OR LOWER(COALESCE(social_media,'')) LIKE $${idx} OR LOWER(COALESCE(agent,'')) LIKE $${idx} OR LOWER(COALESCE(treatment,'')) LIKE $${idx} OR LOWER(COALESCE(branch,'')) LIKE $${idx})`);
+        conds.push(`(LOWER(COALESCE(first_name,'')) LIKE $${idx} OR LOWER(COALESCE(last_name,'')) LIKE $${idx} OR (LOWER(COALESCE(first_name,'')) || ' ' || LOWER(COALESCE(last_name,''))) LIKE $${idx} OR LOWER(COALESCE(full_name_norm,'')) LIKE $${idx} OR LOWER(COALESCE(email,'')) LIKE $${idx} OR phone LIKE $${idx} OR LOWER(COALESCE(social_media,'')) LIKE $${idx} OR LOWER(COALESCE(agent,'')) LIKE $${idx} OR LOWER(COALESCE(treatment,'')) LIKE $${idx} OR LOWER(COALESCE(branch,'')) LIKE $${idx})`);
         params.push(q);
         idx++;
       }
@@ -302,6 +318,12 @@ class BookingController {
       const OFFSET = (page - 1) * limit;
       const ALLOWED_SORT = { appointment_date: 'appointment_date', booking_date: 'booking_date', age: 'age' };
       const SORT_COL = ALLOWED_SORT[sortField] || 'appointment_date';
+      // Secondary sort by the matching time column, parsed from "10:00 AM" text into a
+      // real time so it orders chronologically (not lexically). Malformed times sort last.
+      const TIME_COL = { appointment_date: 'appointment_time', booking_date: 'booking_time' }[SORT_COL];
+      const TIME_SORT = TIME_COL
+        ? `, CASE WHEN ${TIME_COL} ~* '^[0-9]{1,2}:[0-9]{2} *(AM|PM)$' THEN to_timestamp(${TIME_COL}, 'HH12:MI AM')::time END ${ORDER} NULLS LAST`
+        : '';
 
       const [{ rows: countRows }, { rows }] = await Promise.all([
         pool.query(`SELECT COUNT(*) AS total FROM bookings ${WHERE}`, params),
@@ -317,13 +339,13 @@ class BookingController {
             companion_first_name, companion_last_name, companion_age, companion_gender,
             companion_freebie, companion_area,
             promo_hunter_status,
-            cancel_validation, underage_cancellation,
+            cancel_validation, underage_cancellation, underage_status, db_status,
             remarks, purchase_details,
             is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion,
             do_not_call, is_rescheduled,
             follow_up_date, booking_date, booking_time
           FROM bookings ${WHERE}
-          ORDER BY ${SORT_COL} ${ORDER} NULLS LAST, created_at ${ORDER}
+          ORDER BY ${SORT_COL} ${ORDER} NULLS LAST${TIME_SORT}, created_at ${ORDER}
           LIMIT ${limit} OFFSET ${OFFSET}
         `, params)
       ]);
@@ -364,6 +386,8 @@ class BookingController {
         promoHunterStatus:  r.promo_hunter_status   || '',
         cancelValidation:   r.cancel_validation     || false,
         underageValidation: r.underage_cancellation || false,
+        underageStatus:     r.underage_status      || 'Approved',
+        dbStatus:           r.db_status            || 'Approved',
         remarks:            r.remarks              || '',
         purchaseDetails:    r.purchase_details      || '',
         isOts:             r.is_ots              || false,
@@ -437,6 +461,8 @@ class BookingController {
           promoHunterStatus:  r.promo_hunter_status   || '',
           cancelValidation:   r.cancel_validation     || false,
           underageValidation: r.underage_cancellation || false,
+          underageStatus:     r.underage_status      || 'Approved',
+          dbStatus:           r.db_status            || 'Approved',
           isOts:             r.is_ots             || false,
           isAdId:            r.is_ad_id           || false,
           isCompanion:       r.is_companion       || false,
@@ -492,7 +518,7 @@ class BookingController {
       }
 
       // Normalized fields
-      const emailNorm   = (d.email       || cur.email        || '').toLowerCase().trim();
+      const emailNorm   = normalizeEmail(d.email || cur.email);
       const phoneNorm   = (d.phone       || cur.phone        || '').replace(/\D/g, '');
       const socialNorm  = (d.socialMedia || cur.social_media || '').toLowerCase().trim();
       const fullName    = `${d.firstName || cur.first_name || ''} ${d.lastName || cur.last_name || ''}`.toLowerCase().trim();
@@ -649,26 +675,41 @@ class BookingController {
 
   // ── updateValidation ───────────────────────────────────────────────────────
   // PATCH /bookings/:rowNumber/validation  (rowNumber is record_id)
+  // Sets the tri-state Underage Status / Double Booking Status columns.
   async updateValidation(req, res) {
     try {
       if (req.user?.role !== 'Admin') {
-        return res.status(403).json({ error: 'Only admins can set validation flags' });
+        return res.status(403).json({ error: 'Only admins can set validation status' });
       }
 
-      const recordId         = req.params.rowNumber;
-      const { cancelValidation, underageValidation } = req.body;
+      const recordId = req.params.rowNumber;
+      const { underageStatus, dbStatus } = req.body;
+      const ALLOWED = ['Approved', 'Pending', 'Rejected'];
 
+      // Build a partial update from whichever field(s) were supplied
+      const sets = [], vals = [];
+      if (underageStatus !== undefined) {
+        if (!ALLOWED.includes(underageStatus)) return res.status(400).json({ error: `underageStatus must be one of ${ALLOWED.join(', ')}` });
+        vals.push(underageStatus); sets.push(`underage_status = $${vals.length}`);
+      }
+      if (dbStatus !== undefined) {
+        if (!ALLOWED.includes(dbStatus)) return res.status(400).json({ error: `dbStatus must be one of ${ALLOWED.join(', ')}` });
+        vals.push(dbStatus); sets.push(`db_status = $${vals.length}`);
+      }
+      if (!sets.length) return res.status(400).json({ error: 'Nothing to update: provide underageStatus and/or dbStatus' });
+
+      vals.push(recordId);
       const { rowCount } = await pool.query(
-        `UPDATE bookings SET cancel_validation = $1, underage_cancellation = $2 WHERE record_id = $3`,
-        [cancelValidation ? true : false, underageValidation ? true : false, recordId]
+        `UPDATE bookings SET ${sets.join(', ')} WHERE record_id = $${vals.length}`,
+        vals
       );
 
       if (!rowCount) return res.status(404).json({ error: 'Booking not found' });
 
-      res.json({ success: true, recordId, cancelValidation, underageValidation });
+      res.json({ success: true, recordId, underageStatus, dbStatus });
     } catch (err) {
       console.error('updateValidation error:', err);
-      res.status(500).json({ error: 'Failed to update validation flags' });
+      res.status(500).json({ error: 'Failed to update validation status' });
     }
   }
 
@@ -702,7 +743,7 @@ class BookingController {
       // Fetch all rows needed for the 7 report sections in one query
       const { rows } = await pool.query(`
         SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
-               cancellation_time, underage_cancellation, follow_up_date
+               cancellation_time, underage_cancellation, underage_status, db_status, follow_up_date
         FROM bookings
         WHERE record_status != 'DELETED'
           AND (
@@ -730,7 +771,7 @@ class BookingController {
         bookedTomorrow:          { byBranch: {} },
         bookedNext7Days:         { byBranch: {} },
         cancellations:           { total: 0, revenue: 0, count: 0, byBranch: {} },
-        overallBookingsTomorrow: { total: 0, revenue: 0, count: 0 },
+        overallBookingsTomorrow: { total: 0, revenue: 0, count: 0, byBranch: {} },
         arrivalsToday:           { count: 0, byBranch: {}, byStatus: { 'Arrived & bought': 0, 'Arrived not potential': 0 } },
         boughtToday:             { count: 0, revenue: 0, comebackCount: 0 },
         noShowsToday:            0,
@@ -754,6 +795,8 @@ class BookingController {
 
         const createdToday = created && phFmt.format(created) === todayStr; // used only for cancellation fallback
         const bookedToday  = bookingStr === todayStr;                       // "OTS" = booked today (booking_date)
+        // "Valid" = both tri-state validations Approved (Pending/Rejected are excluded from reports)
+        const valid = (r.underage_status || 'Approved') === 'Approved' && (r.db_status || 'Approved') === 'Approved';
         const isToday    = apptStr === todayStr;
         const isTomorrow = apptStr === tomorrowStr;
         const isNext7    = apptStr != null && apptStr > todayStr    && apptStr <= next7EndStr; // day+1 .. day+7
@@ -791,15 +834,18 @@ class BookingController {
           }
         }
 
-        // Section 6: Tomorrow Summary (any creation date)
-        if (isTomorrow && status === 'scheduled') {
+        // Section 6: Tomorrow Summary (any creation date) — drives both the
+        // "Overall Bookings Tomorrow" big number AND its per-branch chart, so they match.
+        // Per formula #1: appt=Tomorrow, Scheduled, and both validations Approved.
+        if (isTomorrow && status === 'scheduled' && valid) {
           rpts.overallBookingsTomorrow.count++;
           rpts.overallBookingsTomorrow.revenue += price;
           rpts.overallBookingsTomorrow.total++;
+          inc(rpts.overallBookingsTomorrow.byBranch, branch, price);
         }
 
-        // Section 7: Arrivals Today
-        if (isToday && !r.underage_cancellation &&
+        // Section 7: Arrivals Today (exclude non-Approved underage status)
+        if (isToday && r.underage_status === 'Approved' &&
             (status === 'arrived & bought' || status === 'arrived not potential')) {
           rpts.arrivalsToday.count++;
           inc(rpts.arrivalsToday.byBranch, branch);
@@ -808,7 +854,7 @@ class BookingController {
         }
 
         // Section 8: Bought Today (actual revenue-generating visits)
-        if (isToday && !r.underage_cancellation &&
+        if (isToday && r.underage_status === 'Approved' &&
             (status === 'arrived & bought' || status === 'comeback & bought')) {
           rpts.boughtToday.count++;
           rpts.boughtToday.revenue += price;
@@ -943,7 +989,7 @@ class BookingController {
         WHERE record_status != 'DELETED'
           AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND LOWER(booking_status) IN ('arrived & bought','arrived not potential')
-          AND underage_cancellation = FALSE
+          AND underage_status = 'Approved'
       `);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
     } catch (err) {
@@ -961,6 +1007,7 @@ class BookingController {
         WHERE record_status != 'DELETED'
           AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
           AND LOWER(booking_status) = 'scheduled'
+          AND underage_status = 'Approved' AND db_status = 'Approved'
       `);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
     } catch (err) {
@@ -974,10 +1021,10 @@ class BookingController {
     try {
       const { rows } = await pool.query(`
         SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
-               payment_mode, underage_cancellation, cancel_validation
+               payment_mode, underage_status, db_status
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND cancel_validation = FALSE
+          AND underage_status = 'Approved' AND db_status = 'Approved'
           AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
       `);
@@ -1031,8 +1078,8 @@ class BookingController {
           else             { otsAddit++; additRev += price; }
         }
 
-        // Arrivals today
-        if (!r.underage_cancellation && isArrived && isToday) {
+        // Arrivals today (base query already excludes non-Approved underage/DB status)
+        if (isArrived && isToday) {
           inc(arrToday, branch);
           const label = r.booking_status || '';
           arrStatusMap[label] = (arrStatusMap[label] || 0) + 1;
@@ -1040,7 +1087,7 @@ class BookingController {
         }
 
         // Bought today (arrived & bought + comeback & bought)
-        if (!r.underage_cancellation && isToday &&
+        if (isToday &&
             (status === 'arrived & bought' || status === 'comeback & bought')) {
           boughtTodayCount++;
           boughtTodayRevenue += price;
@@ -1049,8 +1096,8 @@ class BookingController {
         // Promo hunters today
         if (isToday && status === 'promo hunter') promoHuntersToday++;
 
-        // Schedules tomorrow
-        if (!cancelled && isTomorrow) {
+        // Schedules tomorrow (Status = Scheduled only, per report formula)
+        if (isTomorrow && status === 'scheduled') {
           inc(schedTomorrow, branch, price);
           const mk = pm.toLowerCase().includes('cash') ? 'Cash'
                    : pm.toLowerCase().includes('debit') ? 'Debit'
@@ -1060,8 +1107,8 @@ class BookingController {
           else              schedTomAddit++;
         }
 
-        // Next 7 days (day+2 .. day+7 — already excludes today & tomorrow via inNext7)
-        if (!cancelled && inNext7) {
+        // Next 7 days (day+2 .. day+7, Status = Scheduled only — already excludes today & tomorrow via inNext7)
+        if (inNext7 && status === 'scheduled') {
           inc(next7, branch, price);
           if (bookedToday) { otsNext7++; inc(otsMap, branch); }
           else              additNext7++;
@@ -1115,22 +1162,26 @@ class BookingController {
                treatment, total_price, booking_status, phone, email, agent, payment_mode,
                created_at
         FROM bookings
-        WHERE record_status != 'DELETED' AND cancel_validation = FALSE
+        WHERE record_status != 'DELETED' AND underage_status = 'Approved' AND db_status = 'Approved'
       `;
 
       const phToday = `(NOW() AT TIME ZONE 'Asia/Manila')::date`;
       if (section === 'schedules-today') {
         SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) NOT LIKE '%cancel%'`;
       } else if (section === 'arrivals') {
-        SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) IN ('arrived & bought','arrived not potential') AND underage_cancellation = FALSE`;
+        SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) IN ('arrived & bought','arrived not potential')`;
       } else if (section === 'schedules-tomorrow' || section === 'payment-tomorrow') {
-        SQL += ` AND appointment_date = ${phToday} + 1 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
+        SQL += ` AND appointment_date = ${phToday} + 1 AND LOWER(booking_status) = 'scheduled'`;
       } else if (section === 'next7days') {
-        // day+2 .. day+7 (excludes today & tomorrow), matching totalSchedulesNext7
-        SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
+        // day+2 .. day+7 (excludes today & tomorrow), Scheduled only — matches totalSchedulesNext7
+        SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) = 'scheduled'`;
       } else if (section === 'ots') {
-        // OTS = booked today (booking_date), appt within today .. day+7
-        SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) NOT LIKE '%cancel%'`;
+        // OTS = booked today (booking_date), matching the report buckets it aggregates:
+        // today = not-cancelled; tomorrow & next-7 (day+2..day+7) = Scheduled only.
+        SQL += ` AND booking_date = ${phToday} AND (
+                   (appointment_date = ${phToday} AND LOWER(booking_status) NOT LIKE '%cancel%')
+                   OR (appointment_date > ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) = 'scheduled')
+                 )`;
       }
 
       const { rows } = await pool.query(SQL);
@@ -1186,7 +1237,7 @@ class BookingController {
       });
       if (search) {
         const q = `%${search.toLowerCase()}%`;
-        conds.push(`(LOWER(COALESCE(first_name,'')) LIKE $${idx} OR LOWER(COALESCE(last_name,'')) LIKE $${idx} OR LOWER(COALESCE(email,'')) LIKE $${idx} OR phone LIKE $${idx} OR LOWER(COALESCE(social_media,'')) LIKE $${idx} OR LOWER(COALESCE(agent,'')) LIKE $${idx} OR LOWER(COALESCE(treatment,'')) LIKE $${idx} OR LOWER(COALESCE(branch,'')) LIKE $${idx})`);
+        conds.push(`(LOWER(COALESCE(first_name,'')) LIKE $${idx} OR LOWER(COALESCE(last_name,'')) LIKE $${idx} OR (LOWER(COALESCE(first_name,'')) || ' ' || LOWER(COALESCE(last_name,''))) LIKE $${idx} OR LOWER(COALESCE(full_name_norm,'')) LIKE $${idx} OR LOWER(COALESCE(email,'')) LIKE $${idx} OR phone LIKE $${idx} OR LOWER(COALESCE(social_media,'')) LIKE $${idx} OR LOWER(COALESCE(agent,'')) LIKE $${idx} OR LOWER(COALESCE(treatment,'')) LIKE $${idx} OR LOWER(COALESCE(branch,'')) LIKE $${idx})`);
         params.push(q); idx++;
       }
 
@@ -1488,7 +1539,7 @@ async function checkPromoHunter(firstName, lastName, email, phone, socialMedia, 
     const fullName        = `${firstName} ${lastName}`.toLowerCase().trim();
     const companionFull   = companionFirstName && companionLastName
       ? `${companionFirstName} ${companionLastName}`.toLowerCase().trim() : '';
-    const emailNorm       = (email       || '').toLowerCase().trim();
+    const emailNorm       = normalizeEmail(email);
     const phoneNorm       = (phone       || '').replace(/\D/g, '');
     const socialNorm      = (socialMedia || '').toLowerCase().trim();
 
