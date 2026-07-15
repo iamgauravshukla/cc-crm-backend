@@ -1046,6 +1046,7 @@ class BookingController {
       let schedTomOTS = 0, schedTomAddit = 0;
       let otsNext7 = 0, additNext7 = 0;
       let boughtTodayCount = 0, boughtTodayRevenue = 0, promoHuntersToday = 0;
+      let schedTodayRoster = 0; // everyone expected today (excl. cancelled) — arrival-rate denominator
 
       const inc = (map, branch, rev = 0) => {
         if (!map[branch]) map[branch] = { count: 0, revenue: 0 };
@@ -1071,8 +1072,11 @@ class BookingController {
         const isTomorrow = apptStr === tomorrowStr;
         const inNext7    = apptStr > tomorrowStr && apptStr <= next7EndStr; // day+2 .. day+7
 
-        // Schedules today
-        if (!cancelled && isToday) {
+        // Roster for the arrival-rate denominator (everyone still expected today, excl. cancelled)
+        if (!cancelled && isToday) schedTodayRoster++;
+
+        // Schedules today (Status = Scheduled only, per report formula)
+        if (isToday && status === 'scheduled') {
           inc(schedToday, branch, price);
           if (bookedToday) { otsT++; otsRev += price; inc(otsMap, branch); }
           else             { otsAddit++; additRev += price; }
@@ -1120,7 +1124,8 @@ class BookingController {
 
       const schedTodayTotal   = sumCount(schedToday);
       const arrTodayTotal     = sumCount(arrToday);
-      const arrivalRateToday   = schedTodayTotal   > 0 ? +(arrTodayTotal     / schedTodayTotal   * 100).toFixed(1) : 0;
+      // Arrival rate = arrived / everyone expected today (roster), not / still-scheduled
+      const arrivalRateToday   = schedTodayRoster  > 0 ? +(arrTodayTotal     / schedTodayRoster  * 100).toFixed(1) : 0;
       const conversionRateToday = arrTodayTotal    > 0 ? +(boughtTodayCount  / arrTodayTotal     * 100).toFixed(1) : 0;
 
       return res.json({
@@ -1167,7 +1172,7 @@ class BookingController {
 
       const phToday = `(NOW() AT TIME ZONE 'Asia/Manila')::date`;
       if (section === 'schedules-today') {
-        SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) NOT LIKE '%cancel%'`;
+        SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) = 'scheduled'`;
       } else if (section === 'arrivals') {
         SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) IN ('arrived & bought','arrived not potential')`;
       } else if (section === 'schedules-tomorrow' || section === 'payment-tomorrow') {
@@ -1176,12 +1181,9 @@ class BookingController {
         // day+2 .. day+7 (excludes today & tomorrow), Scheduled only — matches totalSchedulesNext7
         SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) = 'scheduled'`;
       } else if (section === 'ots') {
-        // OTS = booked today (booking_date), matching the report buckets it aggregates:
-        // today = not-cancelled; tomorrow & next-7 (day+2..day+7) = Scheduled only.
-        SQL += ` AND booking_date = ${phToday} AND (
-                   (appointment_date = ${phToday} AND LOWER(booking_status) NOT LIKE '%cancel%')
-                   OR (appointment_date > ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) = 'scheduled')
-                 )`;
+        // OTS = booked today (booking_date), Scheduled, appt within today .. day+7
+        // (matches the three Scheduled-only buckets it aggregates).
+        SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) = 'scheduled'`;
       }
 
       const { rows } = await pool.query(SQL);
