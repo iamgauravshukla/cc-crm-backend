@@ -1019,15 +1019,30 @@ class BookingController {
   // ── getCCReport ────────────────────────────────────────────────────────────
   async getCCReport(req, res) {
     try {
-      const { rows } = await pool.query(`
-        SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
-               payment_mode, underage_status, db_status
-        FROM bookings
-        WHERE record_status != 'DELETED'
-          AND underage_status = 'Approved' AND db_status = 'Approved'
-          AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
-          AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
-      `);
+      const [{ rows }, { rows: cancelRows }] = await Promise.all([
+        pool.query(`
+          SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
+                 payment_mode, underage_status, db_status
+          FROM bookings
+          WHERE record_status != 'DELETED'
+            AND underage_status = 'Approved' AND db_status = 'Approved'
+            AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
+            AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
+        `),
+        // Cancellation per Branch — Status = Cancelled, Booked on = Today.
+        // Independent of the appointment window and of validation status (per formula).
+        pool.query(`
+          SELECT branch, COUNT(*)::int AS cnt, COALESCE(SUM(total_price),0) AS revenue
+          FROM bookings
+          WHERE record_status != 'DELETED'
+            AND LOWER(booking_status) = 'cancelled'
+            AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          GROUP BY branch
+        `),
+      ]);
+
+      const cancellations = {};
+      for (const c of cancelRows) cancellations[c.branch || 'Unknown'] = { count: c.cnt, revenue: parseFloat(c.revenue) || 0 };
 
       const phFmt      = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
       const now        = Date.now();
@@ -1139,6 +1154,7 @@ class BookingController {
           paymentModeRevenueTomorrow: payModeRevTomorrow,
           totalSchedulesNext7:    { otsNext7, additionalNext7: additNext7, byBranch: next7, total: sumCount(next7) },
           totalOTS:               { byBranch: otsMap, total: sumCount(otsMap) },
+          cancellationsToday:     { byBranch: cancellations, total: sumCount(cancellations) },
           performance: {
             boughtToday:          { count: boughtTodayCount, revenue: +boughtTodayRevenue.toFixed(2) },
             arrivalRateToday,
@@ -1157,20 +1173,28 @@ class BookingController {
   async getCCReportDrilldown(req, res) {
     try {
       const { section } = req.query;
-      const validSections = ['schedules-today','arrivals','schedules-tomorrow','payment-tomorrow','next7days','ots'];
+      const validSections = ['schedules-today','arrivals','schedules-tomorrow','payment-tomorrow','next7days','ots','cancellations'];
       if (!validSections.includes(section)) {
         return res.status(400).json({ error: 'Invalid section. Must be one of: ' + validSections.join(', ') });
       }
 
-      let SQL = `
+      const SELECT = `
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, payment_mode,
                created_at
-        FROM bookings
-        WHERE record_status != 'DELETED' AND underage_status = 'Approved' AND db_status = 'Approved'
-      `;
-
+        FROM bookings`;
       const phToday = `(NOW() AT TIME ZONE 'Asia/Manila')::date`;
+
+      // Cancellations are independent of the appointment window and of validation status.
+      if (section === 'cancellations') {
+        const { rows } = await pool.query(
+          `${SELECT} WHERE record_status != 'DELETED' AND LOWER(booking_status) = 'cancelled' AND booking_date = ${phToday}`
+        );
+        return res.json({ success: true, bookings: rows.map(r => ({ ...mapDrilldown(r), paymentMode: normalizePaymentMode(r.payment_mode) })) });
+      }
+
+      let SQL = `${SELECT} WHERE record_status != 'DELETED' AND underage_status = 'Approved' AND db_status = 'Approved'`;
+
       if (section === 'schedules-today') {
         SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) = 'scheduled'`;
       } else if (section === 'arrivals') {
