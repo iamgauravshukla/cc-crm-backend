@@ -140,6 +140,8 @@ class BookingController {
       if (error) return res.status(400).json({ error: error.details[0].message });
 
       const d = value;
+      // Guard against any client-side float drift on the price (e.g. 599.98 for 600) — store clean 2-decimal pesos.
+      if (typeof d.totalPrice === 'number') d.totalPrice = Math.round(d.totalPrice * 100) / 100;
       const recordId = `BK-${new Date().toISOString().slice(0,10).replace(/-/g,'')}-${uuidv4().slice(0,8).toUpperCase()}`;
       const now      = new Date();
 
@@ -489,6 +491,11 @@ class BookingController {
       const d        = req.body;
       const user     = req.user;
 
+      // Guard against client-side float drift on the price — store clean 2-decimal pesos.
+      if (d.totalPrice !== undefined && d.totalPrice !== null && d.totalPrice !== '') {
+        d.totalPrice = Math.round(Number(d.totalPrice) * 100) / 100;
+      }
+
       const { rows: existing } = await pool.query(
         `SELECT * FROM bookings WHERE record_id = $1 AND record_status != 'DELETED'`,
         [recordId]
@@ -713,6 +720,30 @@ class BookingController {
     }
   }
 
+  // ── updateFlags ────────────────────────────────────────────────────────────
+  // PATCH /bookings/:id/flags — toggle the OTS / With-Companion identifier columns
+  async updateFlags(req, res) {
+    try {
+      const recordId = req.params.id;
+      const { isOts, isCompanion } = req.body;
+      const sets = [], vals = [];
+      if (isOts !== undefined)      { vals.push(isOts === true);      sets.push(`is_ots = $${vals.length}`); }
+      if (isCompanion !== undefined) { vals.push(isCompanion === true); sets.push(`is_companion = $${vals.length}`); }
+      if (!sets.length) return res.status(400).json({ error: 'Nothing to update: provide isOts and/or isCompanion' });
+
+      vals.push(recordId);
+      const { rowCount } = await pool.query(
+        `UPDATE bookings SET ${sets.join(', ')} WHERE record_id = $${vals.length}`, vals
+      );
+      if (!rowCount) return res.status(404).json({ error: 'Booking not found' });
+
+      res.json({ success: true, recordId, isOts, isCompanion });
+    } catch (err) {
+      console.error('updateFlags error:', err);
+      res.status(500).json({ error: 'Failed to update flags' });
+    }
+  }
+
   // ── deleteBooking ──────────────────────────────────────────────────────────
   // DELETE /bookings/:rowNumber  (rowNumber is record_id)
   async deleteBooking(req, res) {
@@ -853,12 +884,10 @@ class BookingController {
           rpts.arrivalsToday.byStatus[label] = (rpts.arrivalsToday.byStatus[label] || 0) + 1;
         }
 
-        // Section 8: Bought Today (actual revenue-generating visits)
-        if (isToday && r.underage_status === 'Approved' &&
-            (status === 'arrived & bought' || status === 'comeback & bought')) {
+        // Section 8: Bought Today — "Comeback & Bought" is excluded from the Daily Report (#20)
+        if (isToday && r.underage_status === 'Approved' && status === 'arrived & bought') {
           rpts.boughtToday.count++;
           rpts.boughtToday.revenue += price;
-          if (status === 'comeback & bought') rpts.boughtToday.comebackCount++;
         }
 
         // Section 9: No-shows today

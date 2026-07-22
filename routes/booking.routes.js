@@ -38,6 +38,7 @@ router.get('/:id/activity', bookingController.getActivityLog);
 router.get('/:id', bookingController.getBookingById);
 router.put('/:id', bookingController.updateBooking);
 router.patch('/:rowNumber/validation', bookingController.updateValidation);
+router.patch('/:id/flags', bookingController.updateFlags);
 router.delete('/:rowNumber', bookingController.deleteBooking);
 
 module.exports = router;
