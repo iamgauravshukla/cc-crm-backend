@@ -19,6 +19,7 @@ router.use(authMiddleware);
 // Booking routes — static paths must come before /:id
 router.post('/', bookingController.createBooking);
 router.post('/bulk-status', bookingController.bulkUpdateStatus);
+router.post('/bulk-delete', bookingController.bulkDelete);
 router.get('/export',  bookingController.exportBookings);
 router.get('/customer', bookingController.getCustomerHistory);
 router.get('/daily-reports', bookingController.getDailyReports);

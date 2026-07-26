@@ -818,7 +818,9 @@ class BookingController {
 
       for (const r of rows) {
         const branch  = r.branch || 'Unknown';
-        const status  = (r.booking_status || '').toLowerCase();
+        const status  = (r.booking_status || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        // "Comeback & Bought" is excluded from the entire Daily Report folder (#20)
+        if (status === 'comeback & bought') continue;
         const apptStr    = r.appointment_date ? new Date(r.appointment_date).toISOString().split('T')[0] : null;
         const bookingStr = r.booking_date    ? new Date(r.booking_date).toISOString().split('T')[0]     : null;
         const price      = parseFloat(r.total_price) || 0;
@@ -1058,13 +1060,14 @@ class BookingController {
             AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
             AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
         `),
-        // Cancellation per Branch — Status = Cancelled, Booked on = Today.
-        // Independent of the appointment window and of validation status (per formula).
+        // Cancellation per Branch — Status = Cancelled or Promo Hunter, Booked on = Today.
+        // Counts bookings CREATED/booked today (booking_date), regardless of appointment date
+        // or validation status (per the updated formula + follow-up).
         pool.query(`
           SELECT branch, COUNT(*)::int AS cnt, COALESCE(SUM(total_price),0) AS revenue
           FROM bookings
           WHERE record_status != 'DELETED'
-            AND LOWER(booking_status) = 'cancelled'
+            AND LOWER(booking_status) IN ('cancelled', 'promo hunter')
             AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           GROUP BY branch
         `),
@@ -1217,7 +1220,7 @@ class BookingController {
       // Cancellations are independent of the appointment window and of validation status.
       if (section === 'cancellations') {
         const { rows } = await pool.query(
-          `${SELECT} WHERE record_status != 'DELETED' AND LOWER(booking_status) = 'cancelled' AND booking_date = ${phToday}`
+          `${SELECT} WHERE record_status != 'DELETED' AND LOWER(booking_status) IN ('cancelled', 'promo hunter') AND booking_date = ${phToday}`
         );
         return res.json({ success: true, bookings: rows.map(r => ({ ...mapDrilldown(r), paymentMode: normalizePaymentMode(r.payment_mode) })) });
       }
@@ -1425,6 +1428,31 @@ class BookingController {
     } catch (err) {
       console.error('Bulk update error:', err);
       res.status(500).json({ error: 'Failed to bulk update bookings' });
+    }
+  }
+
+  // ── bulkDelete ─────────────────────────────────────────────────────────────
+  // POST /api/bookings/bulk-delete   Body: { recordIds: ['BK-...'] }  (Admin only, soft-delete)
+  async bulkDelete(req, res) {
+    try {
+      if (req.user?.role !== 'Admin') {
+        return res.status(403).json({ error: 'Only admins can delete bookings' });
+      }
+      const { recordIds } = req.body;
+      if (!Array.isArray(recordIds) || recordIds.length === 0) {
+        return res.status(400).json({ error: 'recordIds must be a non-empty array' });
+      }
+      if (recordIds.length > 200) {
+        return res.status(400).json({ error: 'Cannot delete more than 200 bookings at once' });
+      }
+      const { rowCount } = await pool.query(
+        `UPDATE bookings SET record_status = 'DELETED' WHERE record_id = ANY($1::text[]) AND record_status != 'DELETED'`,
+        [recordIds]
+      );
+      res.json({ success: true, deleted: rowCount, message: `${rowCount} booking(s) deleted` });
+    } catch (err) {
+      console.error('Bulk delete error:', err);
+      res.status(500).json({ error: 'Failed to delete bookings' });
     }
   }
 
