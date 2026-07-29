@@ -105,6 +105,26 @@ const pushBookingDateFilters = (conds, params, idx, q) => {
   return idx;
 };
 
+// Report scope filter — narrows the Daily/CC report dataset by Branch and/or Agent
+// (like a Monday dashboard filter). Within a field, multiple values are OR; between
+// fields, they combine with AND or OR per `fLogic`. Returns a parameterized SQL
+// fragment plus its params (placeholders start at $1, since report queries have none).
+const _csvLower = v => (Array.isArray(v) ? v : String(v || '').split(','))
+  .map(s => s.trim().toLowerCase()).filter(Boolean);
+const reportScopeFilter = (query) => {
+  const conds = [];
+  const params = [];
+  let idx = 1;
+  const branches = _csvLower(query.fBranch);
+  const agents   = _csvLower(query.fAgent);
+  if (branches.length) { conds.push(`LOWER(COALESCE(branch,'')) = ANY($${idx++}::text[])`); params.push(branches); }
+  if (agents.length)   { conds.push(`LOWER(COALESCE(agent,''))  = ANY($${idx++}::text[])`); params.push(agents); }
+  if (!conds.length) return { clause: '', params: [] };
+  const joiner  = String(query.fLogic || 'and').toLowerCase() === 'or' ? ' OR ' : ' AND ';
+  const combined = conds.length > 1 ? `(${conds.join(joiner)})` : conds[0];
+  return { clause: ` AND ${combined}`, params };
+};
+
 // Placeholder emails entered when a client has no real address (e.g. n/a@gmail.com,
 // na@gmail.com). Many unrelated clients share these, so they must NOT drive Promo
 // Hunter matching — normalize them to '' ("no email") for both storage and matching.
@@ -323,9 +343,20 @@ class BookingController {
       // Secondary sort by the matching time column, parsed from "10:00 AM" text into a
       // real time so it orders chronologically (not lexically). Malformed times sort last.
       const TIME_COL = { appointment_date: 'appointment_time', booking_date: 'booking_time' }[SORT_COL];
-      const TIME_SORT = TIME_COL
-        ? `, CASE WHEN ${TIME_COL} ~* '^[0-9]{1,2}:[0-9]{2} *(AM|PM)$' THEN to_timestamp(${TIME_COL}, 'HH12:MI AM')::time END ${ORDER} NULLS LAST`
-        : '';
+      // Times are stored either 12-hour ("9:19 AM") or 24-hour ("09:19") — parse both.
+      let TIME_SORT = '';
+      if (TIME_COL) {
+        const parsed = `CASE
+              WHEN ${TIME_COL} ~* '(AM|PM)'            THEN to_timestamp(${TIME_COL}, 'HH12:MI AM')::time
+              WHEN ${TIME_COL} ~ '^[0-9]{1,2}:[0-9]{2}$' THEN to_timestamp(${TIME_COL}, 'HH24:MI')::time
+              ELSE NULL END`;
+        // "Booked On" (booking_date): when booking_time is blank, fall back to the
+        // creation time so those rows still order chronologically instead of dropping to the bottom.
+        const expr = SORT_COL === 'booking_date'
+          ? `COALESCE(${parsed}, (created_at AT TIME ZONE 'Asia/Manila')::time)`
+          : parsed;
+        TIME_SORT = `, ${expr} ${ORDER} NULLS LAST`;
+      }
 
       const [{ rows: countRows }, { rows }] = await Promise.all([
         pool.query(`SELECT COUNT(*) AS total FROM bookings ${WHERE}`, params),
@@ -345,7 +376,8 @@ class BookingController {
             remarks, purchase_details,
             is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion,
             do_not_call, is_rescheduled,
-            follow_up_date, booking_date, booking_time
+            follow_up_date, booking_date, booking_time,
+            to_char(created_at AT TIME ZONE 'Asia/Manila', 'FMHH12:MI AM') AS created_time_ph
           FROM bookings ${WHERE}
           ORDER BY ${SORT_COL} ${ORDER} NULLS LAST${TIME_SORT}, created_at ${ORDER}
           LIMIT ${limit} OFFSET ${OFFSET}
@@ -401,7 +433,8 @@ class BookingController {
         isRescheduled:     r.is_rescheduled      || false,
         followUpDate:       normDate(r.follow_up_date) || null,
         bookingDate:        normDate(r.booking_date)   || null,
-        bookingTime:        r.booking_time             || '',
+        // Fall back to the creation time when no booking_time was captured (#6)
+        bookingTime:        r.booking_time || r.created_time_ph || '',
       }));
 
       res.json({
@@ -772,6 +805,7 @@ class BookingController {
   async getDailyReports(req, res) {
     try {
       // Fetch all rows needed for the 7 report sections in one query
+      const sf = reportScopeFilter(req.query);   // Branch/Agent scope filter
       const { rows } = await pool.query(`
         SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
                cancellation_time, underage_cancellation, underage_status, db_status, follow_up_date
@@ -788,7 +822,8 @@ class BookingController {
             ))
             OR (follow_up_date = (NOW() AT TIME ZONE 'Asia/Manila')::date)
           )
-      `);
+          ${sf.clause}
+      `, sf.params);
 
       const phFmt      = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
       const now        = Date.now();
@@ -920,6 +955,7 @@ class BookingController {
 
   async getOTSBookings(req, res) {
     try {
+      const sf = reportScopeFilter(req.query);
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent
@@ -927,7 +963,8 @@ class BookingController {
         WHERE record_status != 'DELETED'
           AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
-      `);
+          ${sf.clause}
+      `, sf.params);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
     } catch (err) {
       console.error('getOTSBookings error:', err);
@@ -937,6 +974,7 @@ class BookingController {
 
   async getOverallBookings(req, res) {
     try {
+      const sf = reportScopeFilter(req.query);
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent
@@ -945,7 +983,8 @@ class BookingController {
           AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
-      `);
+          ${sf.clause}
+      `, sf.params);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
     } catch (err) {
       console.error('getOverallBookings error:', err);
@@ -955,6 +994,7 @@ class BookingController {
 
   async getTomorrowBookings(req, res) {
     try {
+      const sf = reportScopeFilter(req.query);
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent
@@ -963,7 +1003,8 @@ class BookingController {
           AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
           AND LOWER(booking_status) = 'scheduled'
-      `);
+          ${sf.clause}
+      `, sf.params);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
     } catch (err) {
       console.error('getTomorrowBookings error:', err);
@@ -973,6 +1014,7 @@ class BookingController {
 
   async getNext7DaysBookings(req, res) {
     try {
+      const sf = reportScopeFilter(req.query);
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent
@@ -982,7 +1024,8 @@ class BookingController {
           AND appointment_date > (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
           AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
           AND LOWER(booking_status) = 'scheduled'
-      `);
+          ${sf.clause}
+      `, sf.params);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
     } catch (err) {
       console.error('getNext7DaysBookings error:', err);
@@ -992,6 +1035,7 @@ class BookingController {
 
   async getCancellations(req, res) {
     try {
+      const sf = reportScopeFilter(req.query);
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent,
@@ -1003,7 +1047,8 @@ class BookingController {
             (cancellation_time AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
             OR (cancellation_time IS NULL AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date)
           )
-      `);
+          ${sf.clause}
+      `, sf.params);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
     } catch (err) {
       console.error('getCancellations error:', err);
@@ -1013,6 +1058,7 @@ class BookingController {
 
   async getArrivalsToday(req, res) {
     try {
+      const sf = reportScopeFilter(req.query);
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent
@@ -1021,7 +1067,8 @@ class BookingController {
           AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND LOWER(booking_status) IN ('arrived & bought','arrived not potential')
           AND underage_status = 'Approved'
-      `);
+          ${sf.clause}
+      `, sf.params);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
     } catch (err) {
       console.error('getArrivalsToday error:', err);
@@ -1031,6 +1078,7 @@ class BookingController {
 
   async getTomorrowSummary(req, res) {
     try {
+      const sf = reportScopeFilter(req.query);
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent
@@ -1039,7 +1087,8 @@ class BookingController {
           AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
           AND LOWER(booking_status) = 'scheduled'
           AND underage_status = 'Approved' AND db_status = 'Approved'
-      `);
+          ${sf.clause}
+      `, sf.params);
       res.json({ success: true, bookings: rows.map(mapDrilldown) });
     } catch (err) {
       console.error('getTomorrowSummary error:', err);
@@ -1050,16 +1099,17 @@ class BookingController {
   // ── getCCReport ────────────────────────────────────────────────────────────
   async getCCReport(req, res) {
     try {
+      const sf = reportScopeFilter(req.query);   // Branch/Agent scope filter
       const [{ rows }, { rows: cancelRows }] = await Promise.all([
         pool.query(`
           SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
-                 payment_mode, underage_status, db_status
+                 payment_mode
           FROM bookings
           WHERE record_status != 'DELETED'
-            AND underage_status = 'Approved' AND db_status = 'Approved'
             AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
             AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
-        `),
+            ${sf.clause}
+        `, sf.params),
         // Cancellation per Branch — Status = Cancelled or Promo Hunter, Booked on = Today.
         // Counts bookings CREATED/booked today (booking_date), regardless of appointment date
         // or validation status (per the updated formula + follow-up).
@@ -1069,8 +1119,9 @@ class BookingController {
           WHERE record_status != 'DELETED'
             AND LOWER(booking_status) IN ('cancelled', 'promo hunter')
             AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+            ${sf.clause}
           GROUP BY branch
-        `),
+        `, sf.params),
       ]);
 
       const cancellations = {};
@@ -1122,10 +1173,16 @@ class BookingController {
         // Roster for the arrival-rate denominator (everyone still expected today, excl. cancelled)
         if (!cancelled && isToday) schedTodayRoster++;
 
+        // Total OTS — Booked on = Today AND appointment in the next 7 days (today .. day+7),
+        // ANY status (per formula #18: only two conditions, no status filter).
+        if (bookedToday && apptStr >= todayStr && apptStr <= next7EndStr) {
+          inc(otsMap, branch, price);
+        }
+
         // Schedules today (Status = Scheduled only, per report formula)
         if (isToday && status === 'scheduled') {
           inc(schedToday, branch, price);
-          if (bookedToday) { otsT++; otsRev += price; inc(otsMap, branch); }
+          if (bookedToday) { otsT++; otsRev += price; }
           else             { otsAddit++; additRev += price; }
         }
 
@@ -1154,14 +1211,14 @@ class BookingController {
                    : pm.toLowerCase().includes('debit') ? 'Debit'
                    : pm.toLowerCase().includes('credit') ? 'Credit' : null;
           if (mk) { payModesTomorrow[mk]++; payModeRevTomorrow[mk] += price; }
-          if (bookedToday) { schedTomOTS++; inc(otsMap, branch); }
+          if (bookedToday) { schedTomOTS++; }
           else              schedTomAddit++;
         }
 
         // Next 7 days (day+2 .. day+7, Status = Scheduled only — already excludes today & tomorrow via inNext7)
         if (inNext7 && status === 'scheduled') {
           inc(next7, branch, price);
-          if (bookedToday) { otsNext7++; inc(otsMap, branch); }
+          if (bookedToday) { otsNext7++; }
           else              additNext7++;
         }
       }
@@ -1216,16 +1273,18 @@ class BookingController {
                created_at
         FROM bookings`;
       const phToday = `(NOW() AT TIME ZONE 'Asia/Manila')::date`;
+      const sf = reportScopeFilter(req.query);   // Branch/Agent scope filter
 
       // Cancellations are independent of the appointment window and of validation status.
       if (section === 'cancellations') {
         const { rows } = await pool.query(
-          `${SELECT} WHERE record_status != 'DELETED' AND LOWER(booking_status) IN ('cancelled', 'promo hunter') AND booking_date = ${phToday}`
+          `${SELECT} WHERE record_status != 'DELETED' AND LOWER(booking_status) IN ('cancelled', 'promo hunter') AND booking_date = ${phToday}${sf.clause}`,
+          sf.params
         );
         return res.json({ success: true, bookings: rows.map(r => ({ ...mapDrilldown(r), paymentMode: normalizePaymentMode(r.payment_mode) })) });
       }
 
-      let SQL = `${SELECT} WHERE record_status != 'DELETED' AND underage_status = 'Approved' AND db_status = 'Approved'`;
+      let SQL = `${SELECT} WHERE record_status != 'DELETED'`;
 
       if (section === 'schedules-today') {
         SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) = 'scheduled'`;
@@ -1237,12 +1296,12 @@ class BookingController {
         // day+2 .. day+7 (excludes today & tomorrow), Scheduled only — matches totalSchedulesNext7
         SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) = 'scheduled'`;
       } else if (section === 'ots') {
-        // OTS = booked today (booking_date), Scheduled, appt within today .. day+7
-        // (matches the three Scheduled-only buckets it aggregates).
-        SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) = 'scheduled'`;
+        // Total OTS = booked today (booking_date), appt within today .. day+7, ANY status (formula #18).
+        SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7`;
       }
+      SQL += sf.clause;
 
-      const { rows } = await pool.query(SQL);
+      const { rows } = await pool.query(SQL, sf.params);
       res.json({ success: true, bookings: rows.map(r => ({ ...mapDrilldown(r), paymentMode: normalizePaymentMode(r.payment_mode) })) });
     } catch (err) {
       console.error('getCCReportDrilldown error:', err);
