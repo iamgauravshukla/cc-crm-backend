@@ -105,25 +105,81 @@ const pushBookingDateFilters = (conds, params, idx, q) => {
   return idx;
 };
 
-// Report scope filter — narrows the Daily/CC report dataset by Branch and/or Agent
-// (like a Monday dashboard filter). Within a field, multiple values are OR; between
-// fields, they combine with AND or OR per `fLogic`. Returns a parameterized SQL
-// fragment plus its params (placeholders start at $1, since report queries have none).
-const _csvLower = v => (Array.isArray(v) ? v : String(v || '').split(','))
-  .map(s => s.trim().toLowerCase()).filter(Boolean);
-const reportScopeFilter = (query) => {
-  const conds = [];
-  const params = [];
-  let idx = 1;
-  const branches = _csvLower(query.fBranch);
-  const agents   = _csvLower(query.fAgent);
-  if (branches.length) { conds.push(`LOWER(COALESCE(branch,'')) = ANY($${idx++}::text[])`); params.push(branches); }
-  if (agents.length)   { conds.push(`LOWER(COALESCE(agent,''))  = ANY($${idx++}::text[])`); params.push(agents); }
-  if (!conds.length) return { clause: '', params: [] };
-  const joiner  = String(query.fLogic || 'and').toLowerCase() === 'or' ? ' OR ' : ' AND ';
-  const combined = conds.length > 1 ? `(${conds.join(joiner)})` : conds[0];
-  return { clause: ` AND ${combined}`, params };
+// ── Per-widget "refine" filters ──────────────────────────────────────────────
+// Each report widget can carry conditions on branch / status / agent / date-range,
+// with is / isNot / isLike operators, combined by AND or OR. They REFINE (narrow)
+// the widget's built-in formula — evaluated per row in JS during aggregation.
+const _apptStr = row => row.appointment_date ? new Date(row.appointment_date).toISOString().slice(0, 10) : null;
+const _bookedStr = row => row.booking_date ? new Date(row.booking_date).toISOString().slice(0, 10) : null;
+// Manila "today" as YYYY-MM-DD, and a day-shift helper for date presets.
+const _phToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date());
+const _shiftStr = (baseStr, days) => {
+  const d = new Date(baseStr + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
 };
+// Does date string `d` fall in the named preset window, relative to `today`?
+// Presets mirror Monday's date filter values (is Today / is not Tomorrow / …).
+const matchDatePreset = (d, preset, today) => {
+  if (!d) return false;
+  switch (preset) {
+    case 'today':     return d === today;
+    case 'yesterday': return d === _shiftStr(today, -1);
+    case 'tomorrow':  return d === _shiftStr(today, 1);
+    case 'next7':     return d >= today && d <= _shiftStr(today, 7);
+    case 'thisWeek': {
+      // Mon–Sun week containing today.
+      const dow = new Date(today + 'T00:00:00Z').getUTCDay(); // 0=Sun..6=Sat
+      const start = _shiftStr(today, -((dow + 6) % 7));
+      return d >= start && d <= _shiftStr(start, 6);
+    }
+    case 'past':   return d < today;
+    case 'future': return d > today;
+    default:       return true; // unknown preset → don't constrain
+  }
+};
+// Values may be a single value or an array (multi-select). Normalize to an array.
+const _asArr = v => Array.isArray(v) ? v : (v == null || v === '' ? [] : [v]);
+const evalWidgetCondition = (row, c, ctx) => {
+  const op  = c.op || 'is';
+  const today = (ctx && ctx.today) || _phToday();
+  const txt = (field) => {
+    const cell = String(row[field] || '').toLowerCase();
+    const vals = _asArr(c.value).map(v => String(v).toLowerCase().trim()).filter(Boolean);
+    if (!vals.length) return true;
+    // Multi-select: "is" = equals any, "is not" = equals none, "is like" = contains any.
+    if (op === 'isNot')  return vals.every(v => cell !== v);
+    if (op === 'isLike') return vals.some(v => cell.includes(v));
+    return vals.some(v => cell === v);
+  };
+  if (c.field === 'branch') return txt('branch');
+  if (c.field === 'status') return txt('booking_status');
+  if (c.field === 'agent')  return txt('agent');
+  // Date fields: bookingSchedule → appointment_date, bookedOn → booking_date.
+  // (dateRange kept as an alias of bookingSchedule for backward compatibility.)
+  if (c.field === 'bookingSchedule' || c.field === 'dateRange' || c.field === 'bookedOn') {
+    const d = c.field === 'bookedOn' ? _bookedStr(row) : _apptStr(row);
+    // Custom {from,to} range (single object value).
+    if (c.value && !Array.isArray(c.value) && typeof c.value === 'object') {
+      const from = c.value.from, to = c.value.to;
+      const inRange = !!d && (!from || d >= from) && (!to || d <= to);
+      return op === 'isNot' ? !inRange : inRange;
+    }
+    const presets = _asArr(c.value).filter(v => typeof v === 'string');
+    if (!presets.length) return true;
+    const inAny = presets.some(p => matchDatePreset(d, p, today)); // is any selected preset
+    return op === 'isNot' ? !inAny : inAny;
+  }
+  return true;
+};
+const matchesWidgetFilter = (row, filter, ctx) => {
+  if (!filter || !Array.isArray(filter.conditions) || filter.conditions.length === 0) return true;
+  const rs = filter.conditions.map(c => evalWidgetCondition(row, c, ctx));
+  return String(filter.logic).toLowerCase() === 'or' ? rs.some(Boolean) : rs.every(Boolean);
+};
+const parseWidgetFilters = (q) => { try { return JSON.parse(q.filters || '{}') || {}; } catch { return {}; } };
+const parseSingleFilter  = (q) => { try { return q.filter ? JSON.parse(q.filter) : null; } catch { return null; } };
+const widgetCtx = () => ({ today: _phToday() });
 
 // Placeholder emails entered when a client has no real address (e.g. n/a@gmail.com,
 // na@gmail.com). Many unrelated clients share these, so they must NOT drive Promo
@@ -433,8 +489,10 @@ class BookingController {
         isRescheduled:     r.is_rescheduled      || false,
         followUpDate:       normDate(r.follow_up_date) || null,
         bookingDate:        normDate(r.booking_date)   || null,
-        // Fall back to the creation time when no booking_time was captured (#6)
-        bookingTime:        r.booking_time || r.created_time_ph || '',
+        bookingTime:        r.booking_time             || '',   // actual value (used by the edit form)
+        // Display-only: show the creation time when no booking_time was captured (#6).
+        // Kept separate so editing an unrelated field never persists this fallback as real data.
+        bookingTimeDisplay: r.booking_time || r.created_time_ph || '',
       }));
 
       res.json({
@@ -804,11 +862,12 @@ class BookingController {
   // ── getDailyReports ────────────────────────────────────────────────────────
   async getDailyReports(req, res) {
     try {
-      // Fetch all rows needed for the 7 report sections in one query
-      const sf = reportScopeFilter(req.query);   // Branch/Agent scope filter
+      // Fetch all rows needed for the 7 report sections in one query.
+      // Per-widget "refine" filters are applied per row in JS (see F.<key> below).
+      const F = parseWidgetFilters(req.query);
       const { rows } = await pool.query(`
         SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
-               cancellation_time, underage_cancellation, underage_status, db_status, follow_up_date
+               agent, cancellation_time, underage_cancellation, underage_status, db_status, follow_up_date
         FROM bookings
         WHERE record_status != 'DELETED'
           AND (
@@ -822,8 +881,7 @@ class BookingController {
             ))
             OR (follow_up_date = (NOW() AT TIME ZONE 'Asia/Manila')::date)
           )
-          ${sf.clause}
-      `, sf.params);
+      `);
 
       const phFmt      = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
       const now        = Date.now();
@@ -831,6 +889,7 @@ class BookingController {
       const tomorrowStr   = phFmt.format(now + 86400000);
       const next7EndStr   = phFmt.format(now + 7 * 86400000); // day+7 — end of "next 7 days" (e.g. next Mon when today is Mon)
       const next7StartStr = phFmt.format(now + 2 * 86400000); // day+2 — first day after tomorrow
+      const ctx = { today: todayStr }; // shared by all per-widget date-preset checks
       const rpts = {
         otsBookings:             { total: 0, revenue: 0, count: 0, byBranch: {} },
         overallBookings:         { total: 0, revenue: 0, count: 0, byBranch: {} },
@@ -871,29 +930,29 @@ class BookingController {
         const isD7After  = apptStr != null && apptStr >= next7StartStr && apptStr <= next7EndStr; // day+2 .. day+7
 
         // Section 1: OTS
-        if (bookedToday && isToday) {
+        if (bookedToday && isToday && matchesWidgetFilter(r, F.ots, ctx)) {
           rpts.otsBookings.count++; rpts.otsBookings.revenue += price; rpts.otsBookings.total++;
           inc(rpts.otsBookings.byBranch, branch, price);
         }
 
         // Section 2: Overall
-        if (bookedToday && (isToday || isNext7)) {
+        if (bookedToday && (isToday || isNext7) && matchesWidgetFilter(r, F.overall, ctx)) {
           rpts.overallBookings.count++; rpts.overallBookings.revenue += price; rpts.overallBookings.total++;
           inc(rpts.overallBookings.byBranch, branch, price);
         }
 
         // Section 3: Booked Tomorrow
-        if (bookedToday && isTomorrow && status === 'scheduled') {
+        if (bookedToday && isTomorrow && status === 'scheduled' && matchesWidgetFilter(r, F['tomorrow'], ctx)) {
           inc(rpts.bookedTomorrow.byBranch, branch, price);
         }
 
         // Section 4: Booked Next 7 Days
-        if (bookedToday && isD7After && status === 'scheduled') {
+        if (bookedToday && isD7After && status === 'scheduled' && matchesWidgetFilter(r, F['next7days'], ctx)) {
           inc(rpts.bookedNext7Days.byBranch, branch, price);
         }
 
         // Section 5: Cancellations
-        if (status.includes('cancel')) {
+        if (status.includes('cancel') && matchesWidgetFilter(r, F.cancellations, ctx)) {
           const cancelDay = r.cancellation_time ? new Date(r.cancellation_time) : null;
           const cancelledToday = cancelDay && phFmt.format(cancelDay) === todayStr;
           if (cancelledToday || (!r.cancellation_time && createdToday)) {
@@ -905,7 +964,7 @@ class BookingController {
         // Section 6: Tomorrow Summary (any creation date) — drives both the
         // "Overall Bookings Tomorrow" big number AND its per-branch chart, so they match.
         // Per formula #1: appt=Tomorrow, Scheduled, and both validations Approved.
-        if (isTomorrow && status === 'scheduled' && valid) {
+        if (isTomorrow && status === 'scheduled' && valid && matchesWidgetFilter(r, F['overall-tomorrow'], ctx)) {
           rpts.overallBookingsTomorrow.count++;
           rpts.overallBookingsTomorrow.revenue += price;
           rpts.overallBookingsTomorrow.total++;
@@ -914,7 +973,8 @@ class BookingController {
 
         // Section 7: Arrivals Today (exclude non-Approved underage status)
         if (isToday && r.underage_status === 'Approved' &&
-            (status === 'arrived & bought' || status === 'arrived not potential')) {
+            (status === 'arrived & bought' || status === 'arrived not potential') &&
+            matchesWidgetFilter(r, F['arrivals-today'], ctx)) {
           rpts.arrivalsToday.count++;
           inc(rpts.arrivalsToday.byBranch, branch);
           const label = r.booking_status || '';
@@ -955,17 +1015,17 @@ class BookingController {
 
   async getOTSBookings(req, res) {
     try {
-      const sf = reportScopeFilter(req.query);
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
-               treatment, total_price, booking_status, phone, email, agent
+               treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
           AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
-          ${sf.clause}
-      `, sf.params);
-      res.json({ success: true, bookings: rows.map(mapDrilldown) });
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
     } catch (err) {
       console.error('getOTSBookings error:', err);
       res.status(500).json({ error: 'Failed to fetch OTS bookings' });
@@ -974,18 +1034,18 @@ class BookingController {
 
   async getOverallBookings(req, res) {
     try {
-      const sf = reportScopeFilter(req.query);
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
-               treatment, total_price, booking_status, phone, email, agent
+               treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
           AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
-          ${sf.clause}
-      `, sf.params);
-      res.json({ success: true, bookings: rows.map(mapDrilldown) });
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
     } catch (err) {
       console.error('getOverallBookings error:', err);
       res.status(500).json({ error: 'Failed to fetch overall bookings' });
@@ -994,18 +1054,18 @@ class BookingController {
 
   async getTomorrowBookings(req, res) {
     try {
-      const sf = reportScopeFilter(req.query);
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
-               treatment, total_price, booking_status, phone, email, agent
+               treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
           AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
           AND LOWER(booking_status) = 'scheduled'
-          ${sf.clause}
-      `, sf.params);
-      res.json({ success: true, bookings: rows.map(mapDrilldown) });
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
     } catch (err) {
       console.error('getTomorrowBookings error:', err);
       res.status(500).json({ error: 'Failed to fetch tomorrow bookings' });
@@ -1014,19 +1074,19 @@ class BookingController {
 
   async getNext7DaysBookings(req, res) {
     try {
-      const sf = reportScopeFilter(req.query);
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
-               treatment, total_price, booking_status, phone, email, agent
+               treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
           AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND appointment_date > (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
           AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
           AND LOWER(booking_status) = 'scheduled'
-          ${sf.clause}
-      `, sf.params);
-      res.json({ success: true, bookings: rows.map(mapDrilldown) });
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
     } catch (err) {
       console.error('getNext7DaysBookings error:', err);
       res.status(500).json({ error: 'Failed to fetch next 7 days bookings' });
@@ -1035,11 +1095,12 @@ class BookingController {
 
   async getCancellations(req, res) {
     try {
-      const sf = reportScopeFilter(req.query);
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent,
-               cancellation_time, created_at
+               booking_date, cancellation_time, created_at
         FROM bookings
         WHERE record_status != 'DELETED'
           AND LOWER(booking_status) LIKE '%cancel%'
@@ -1047,9 +1108,8 @@ class BookingController {
             (cancellation_time AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
             OR (cancellation_time IS NULL AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date)
           )
-          ${sf.clause}
-      `, sf.params);
-      res.json({ success: true, bookings: rows.map(mapDrilldown) });
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
     } catch (err) {
       console.error('getCancellations error:', err);
       res.status(500).json({ error: 'Failed to fetch cancellations' });
@@ -1058,18 +1118,18 @@ class BookingController {
 
   async getArrivalsToday(req, res) {
     try {
-      const sf = reportScopeFilter(req.query);
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
-               treatment, total_price, booking_status, phone, email, agent
+               treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
           AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
           AND LOWER(booking_status) IN ('arrived & bought','arrived not potential')
           AND underage_status = 'Approved'
-          ${sf.clause}
-      `, sf.params);
-      res.json({ success: true, bookings: rows.map(mapDrilldown) });
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
     } catch (err) {
       console.error('getArrivalsToday error:', err);
       res.status(500).json({ error: 'Failed to fetch arrivals today' });
@@ -1078,18 +1138,18 @@ class BookingController {
 
   async getTomorrowSummary(req, res) {
     try {
-      const sf = reportScopeFilter(req.query);
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
       const { rows } = await pool.query(`
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
-               treatment, total_price, booking_status, phone, email, agent
+               treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
           AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
           AND LOWER(booking_status) = 'scheduled'
           AND underage_status = 'Approved' AND db_status = 'Approved'
-          ${sf.clause}
-      `, sf.params);
-      res.json({ success: true, bookings: rows.map(mapDrilldown) });
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
     } catch (err) {
       console.error('getTomorrowSummary error:', err);
       res.status(500).json({ error: 'Failed to fetch tomorrow summary' });
@@ -1099,37 +1159,41 @@ class BookingController {
   // ── getCCReport ────────────────────────────────────────────────────────────
   async getCCReport(req, res) {
     try {
-      const sf = reportScopeFilter(req.query);   // Branch/Agent scope filter
+      const F = parseWidgetFilters(req.query);   // Per-widget refine filters
       const [{ rows }, { rows: cancelRows }] = await Promise.all([
         pool.query(`
           SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
-                 payment_mode
+                 payment_mode, agent
           FROM bookings
           WHERE record_status != 'DELETED'
             AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
             AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
-            ${sf.clause}
-        `, sf.params),
+        `),
         // Cancellation per Branch — Status = Cancelled or Promo Hunter, Booked on = Today.
-        // Counts bookings CREATED/booked today (booking_date), regardless of appointment date
-        // or validation status (per the updated formula + follow-up).
+        // Fetch rows (not grouped) so the widget's own refine filter can apply per row.
         pool.query(`
-          SELECT branch, COUNT(*)::int AS cnt, COALESCE(SUM(total_price),0) AS revenue
+          SELECT branch, booking_status, appointment_date, booking_date, agent, total_price
           FROM bookings
           WHERE record_status != 'DELETED'
             AND LOWER(booking_status) IN ('cancelled', 'promo hunter')
             AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
-            ${sf.clause}
-          GROUP BY branch
-        `, sf.params),
+        `),
       ]);
-
-      const cancellations = {};
-      for (const c of cancelRows) cancellations[c.branch || 'Unknown'] = { count: c.cnt, revenue: parseFloat(c.revenue) || 0 };
 
       const phFmt      = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
       const now        = Date.now();
       const todayStr    = phFmt.format(now);
+      const ctx        = { today: todayStr }; // shared by all per-widget date-preset checks
+
+      const cancellations = {};
+      for (const c of cancelRows) {
+        if (!matchesWidgetFilter(c, F.cancellations, ctx)) continue;
+        const br = c.branch || 'Unknown';
+        if (!cancellations[br]) cancellations[br] = { count: 0, revenue: 0 };
+        cancellations[br].count++;
+        cancellations[br].revenue += parseFloat(c.total_price) || 0;
+      }
+
       const tomorrowStr = phFmt.format(now + 86400000);
       // "Next 7 days" = day+2 .. day+7 (excludes today & tomorrow). E.g. if today is
       // Monday, this counts Wednesday through next Monday.
@@ -1175,19 +1239,19 @@ class BookingController {
 
         // Total OTS — Booked on = Today AND appointment in the next 7 days (today .. day+7),
         // ANY status (per formula #18: only two conditions, no status filter).
-        if (bookedToday && apptStr >= todayStr && apptStr <= next7EndStr) {
+        if (bookedToday && apptStr >= todayStr && apptStr <= next7EndStr && matchesWidgetFilter(r, F.ots, ctx)) {
           inc(otsMap, branch, price);
         }
 
         // Schedules today (Status = Scheduled only, per report formula)
-        if (isToday && status === 'scheduled') {
+        if (isToday && status === 'scheduled' && matchesWidgetFilter(r, F.today, ctx)) {
           inc(schedToday, branch, price);
           if (bookedToday) { otsT++; otsRev += price; }
           else             { otsAddit++; additRev += price; }
         }
 
         // Arrivals today (base query already excludes non-Approved underage/DB status)
-        if (isArrived && isToday) {
+        if (isArrived && isToday && matchesWidgetFilter(r, F.arrivals, ctx)) {
           inc(arrToday, branch);
           const label = r.booking_status || '';
           arrStatusMap[label] = (arrStatusMap[label] || 0) + 1;
@@ -1205,18 +1269,22 @@ class BookingController {
         if (isToday && status === 'promo hunter') promoHuntersToday++;
 
         // Schedules tomorrow (Status = Scheduled only, per report formula)
-        if (isTomorrow && status === 'scheduled') {
+        if (isTomorrow && status === 'scheduled' && matchesWidgetFilter(r, F.tomorrow, ctx)) {
           inc(schedTomorrow, branch, price);
-          const mk = pm.toLowerCase().includes('cash') ? 'Cash'
-                   : pm.toLowerCase().includes('debit') ? 'Debit'
-                   : pm.toLowerCase().includes('credit') ? 'Credit' : null;
-          if (mk) { payModesTomorrow[mk]++; payModeRevTomorrow[mk] += price; }
           if (bookedToday) { schedTomOTS++; }
           else              schedTomAddit++;
         }
 
+        // Modes of Payment for Tomorrow (own widget filter — decoupled from the Tomorrow schedule widget)
+        if (isTomorrow && status === 'scheduled' && matchesWidgetFilter(r, F.payment, ctx)) {
+          const mk = pm.toLowerCase().includes('cash') ? 'Cash'
+                   : pm.toLowerCase().includes('debit') ? 'Debit'
+                   : pm.toLowerCase().includes('credit') ? 'Credit' : null;
+          if (mk) { payModesTomorrow[mk]++; payModeRevTomorrow[mk] += price; }
+        }
+
         // Next 7 days (day+2 .. day+7, Status = Scheduled only — already excludes today & tomorrow via inNext7)
-        if (inNext7 && status === 'scheduled') {
+        if (inNext7 && status === 'scheduled' && matchesWidgetFilter(r, F.next7, ctx)) {
           inc(next7, branch, price);
           if (bookedToday) { otsNext7++; }
           else              additNext7++;
@@ -1270,18 +1338,21 @@ class BookingController {
       const SELECT = `
         SELECT first_name, last_name, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, payment_mode,
-               created_at
+               booking_date, created_at
         FROM bookings`;
       const phToday = `(NOW() AT TIME ZONE 'Asia/Manila')::date`;
-      const sf = reportScopeFilter(req.query);   // Branch/Agent scope filter
+      // The clicked widget's own refine filter (JSON), applied to the rows in JS.
+      let widgetFilter = null;
+      try { widgetFilter = req.query.filter ? JSON.parse(req.query.filter) : null; } catch { widgetFilter = null; }
+      const ctx = { today: new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(Date.now()) };
+      const apply = (rows) => rows.filter(r => matchesWidgetFilter(r, widgetFilter, ctx));
 
       // Cancellations are independent of the appointment window and of validation status.
       if (section === 'cancellations') {
         const { rows } = await pool.query(
-          `${SELECT} WHERE record_status != 'DELETED' AND LOWER(booking_status) IN ('cancelled', 'promo hunter') AND booking_date = ${phToday}${sf.clause}`,
-          sf.params
+          `${SELECT} WHERE record_status != 'DELETED' AND LOWER(booking_status) IN ('cancelled', 'promo hunter') AND booking_date = ${phToday}`
         );
-        return res.json({ success: true, bookings: rows.map(r => ({ ...mapDrilldown(r), paymentMode: normalizePaymentMode(r.payment_mode) })) });
+        return res.json({ success: true, bookings: apply(rows).map(r => ({ ...mapDrilldown(r), paymentMode: normalizePaymentMode(r.payment_mode) })) });
       }
 
       let SQL = `${SELECT} WHERE record_status != 'DELETED'`;
@@ -1299,10 +1370,9 @@ class BookingController {
         // Total OTS = booked today (booking_date), appt within today .. day+7, ANY status (formula #18).
         SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7`;
       }
-      SQL += sf.clause;
 
-      const { rows } = await pool.query(SQL, sf.params);
-      res.json({ success: true, bookings: rows.map(r => ({ ...mapDrilldown(r), paymentMode: normalizePaymentMode(r.payment_mode) })) });
+      const { rows } = await pool.query(SQL);
+      res.json({ success: true, bookings: apply(rows).map(r => ({ ...mapDrilldown(r), paymentMode: normalizePaymentMode(r.payment_mode) })) });
     } catch (err) {
       console.error('getCCReportDrilldown error:', err);
       res.status(500).json({ error: 'Failed to fetch drill-down bookings' });
