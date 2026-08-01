@@ -1238,13 +1238,15 @@ class BookingController {
         if (!cancelled && isToday) schedTodayRoster++;
 
         // Total OTS — Booked on = Today AND appointment in the next 7 days (today .. day+7),
-        // ANY status (per formula #18: only two conditions, no status filter).
-        if (bookedToday && apptStr >= todayStr && apptStr <= next7EndStr && matchesWidgetFilter(r, F.ots, ctx)) {
+        // ANY status EXCEPT "Comeback & Bought" (team follow-up: those are not real OTS bookings).
+        if (bookedToday && apptStr >= todayStr && apptStr <= next7EndStr &&
+            status !== 'comeback & bought' && matchesWidgetFilter(r, F.ots, ctx)) {
           inc(otsMap, branch, price);
         }
 
-        // Schedules today (Status = Scheduled only, per report formula)
-        if (isToday && status === 'scheduled' && matchesWidgetFilter(r, F.today, ctx)) {
+        // Schedules today — Scheduled, plus already-arrived bookings (Arrived & bought,
+        // Arrived not potential) since they were still scheduled for today (team follow-up #2).
+        if (isToday && (status === 'scheduled' || isArrived) && matchesWidgetFilter(r, F.today, ctx)) {
           inc(schedToday, branch, price);
           if (bookedToday) { otsT++; otsRev += price; }
           else             { otsAddit++; additRev += price; }
@@ -1358,7 +1360,8 @@ class BookingController {
       let SQL = `${SELECT} WHERE record_status != 'DELETED'`;
 
       if (section === 'schedules-today') {
-        SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) = 'scheduled'`;
+        // Scheduled + already-arrived (team follow-up #2) — mirrors the widget total.
+        SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) IN ('scheduled','arrived & bought','arrived not potential')`;
       } else if (section === 'arrivals') {
         SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) IN ('arrived & bought','arrived not potential')`;
       } else if (section === 'schedules-tomorrow' || section === 'payment-tomorrow') {
@@ -1367,8 +1370,9 @@ class BookingController {
         // day+2 .. day+7 (excludes today & tomorrow), Scheduled only — matches totalSchedulesNext7
         SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) = 'scheduled'`;
       } else if (section === 'ots') {
-        // Total OTS = booked today (booking_date), appt within today .. day+7, ANY status (formula #18).
-        SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7`;
+        // Total OTS = booked today (booking_date), appt within today .. day+7, ANY status
+        // EXCEPT "Comeback & Bought" (team follow-up #1/#6).
+        SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) <> 'comeback & bought'`;
       }
 
       const { rows } = await pool.query(SQL);

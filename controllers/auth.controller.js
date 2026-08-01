@@ -9,7 +9,9 @@ const signupSchema = Joi.object({
   email: Joi.string().email().required(),
   password: Joi.string().min(8).required(),
   name: Joi.string().min(2).required(),
-  role: Joi.string().valid('Admin', 'Agent').required()
+  role: Joi.string().valid('Admin', 'Agent').required(),
+  // Authorizes creating an Admin via self-signup (internal tool). Optional for Agents.
+  masterPassword: Joi.string().allow('').optional()
 });
 
 const loginSchema = Joi.object({
@@ -23,24 +25,30 @@ class AuthController {
       const { error, value } = signupSchema.validate(req.body);
       if (error) return res.status(400).json({ error: error.details[0].message });
 
-      const { email, password, name, role } = value;
+      const { email, password, name, role, masterPassword } = value;
 
-      // Admin accounts can only be created by an authenticated Admin
+      // Admin accounts are authorized either by the shared master password (internal
+      // self-signup) OR by an already-authenticated Admin (e.g. Users Management).
       if (role === 'Admin') {
-        const authHeader = req.headers.authorization;
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-          return res.status(403).json({ error: 'Admin accounts can only be created by an existing Admin' });
-        }
-        try {
-          const decoded = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET, { algorithms: ['HS256'] });
-          const { rows: callerRows } = await pool.query(
-            'SELECT role FROM users WHERE user_id = $1', [decoded.userId]
-          );
-          if (!callerRows.length || callerRows[0].role !== 'Admin') {
-            return res.status(403).json({ error: 'Only Admins can create Admin accounts' });
+        const master   = process.env.ADMIN_MASTER_PASSWORD || '';
+        const masterOk = master !== '' && (masterPassword || '') === master;
+
+        if (!masterOk) {
+          const authHeader = req.headers.authorization;
+          if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(403).json({ error: 'Incorrect master password for creating an Admin account' });
           }
-        } catch {
-          return res.status(403).json({ error: 'Valid Admin authentication required to create Admin accounts' });
+          try {
+            const decoded = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET, { algorithms: ['HS256'] });
+            const { rows: callerRows } = await pool.query(
+              'SELECT role FROM users WHERE user_id = $1', [decoded.userId]
+            );
+            if (!callerRows.length || callerRows[0].role !== 'Admin') {
+              return res.status(403).json({ error: 'Admin accounts require the master password or an existing Admin login' });
+            }
+          } catch {
+            return res.status(403).json({ error: 'Incorrect master password for creating an Admin account' });
+          }
         }
       }
 
