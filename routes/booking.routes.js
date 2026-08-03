@@ -30,6 +30,7 @@ router.get('/daily-reports/next7days', bookingController.getNext7DaysBookings);
 router.get('/daily-reports/cancellations', bookingController.getCancellations);
 router.get('/daily-reports/arrivals-today', bookingController.getArrivalsToday);
 router.get('/daily-reports/tomorrow-summary', bookingController.getTomorrowSummary);
+router.get('/filter-options', bookingController.getFilterOptions);
 router.get('/cc-report', bookingController.getCCReport);
 router.get('/cc-report/drilldown', bookingController.getCCReportDrilldown);
 router.get('/kanban', bookingController.getKanbanBookings);

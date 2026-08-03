@@ -444,6 +444,19 @@ async function getAgentPerformance(req, res) {
       GROUP BY 1 ORDER BY revenue DESC
     `, params);
 
+    // Per-agent status breakdown — drives the per-agent modal chart (booking counts by
+    // status: Arrived & Bought / Arrived Not Potential / Cancelled / Scheduled / …).
+    const { rows: sbRows } = await pool.query(`
+      SELECT ${SQL_AGENT} AS agent, LOWER(TRIM(booking_status)) AS status, COUNT(*)::int AS n
+      FROM bookings ${WHERE} AND NULLIF(TRIM(booking_status), '') IS NOT NULL
+      GROUP BY 1, 2
+    `, params);
+    const titleCase = (s) => String(s).replace(/\b\w/g, (c) => c.toUpperCase());
+    const statusByAgent = {};
+    for (const r of sbRows) {
+      (statusByAgent[r.agent] = statusByAgent[r.agent] || {})[titleCase(r.status)] = r.n;
+    }
+
     const rd = startDate && endDate
       ? Math.max(1, Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1) : days;
     const rW = Math.max(1, rd / 7), rM = Math.max(1, rd / 30);
@@ -458,7 +471,8 @@ async function getAgentPerformance(req, res) {
         arrivalRate:    tot > 0 ? Math.round(arr / tot * 10000) / 100 : 0,
         arrivals: arr, avgWeeklyArrivals: +(arr / rW).toFixed(2), avgMonthlyArrivals: +(arr / rM).toFixed(2),
         converted: comp, scheduled: parseInt(r.scheduled), cancelled: parseInt(r.cancelled),
-        promoHunters: parseInt(r.promo_hunters)
+        promoHunters: parseInt(r.promo_hunters),
+        statusBreakdown: statusByAgent[r.agent] || {}
       };
     });
 

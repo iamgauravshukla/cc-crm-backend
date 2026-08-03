@@ -951,14 +951,11 @@ class BookingController {
           inc(rpts.bookedNext7Days.byBranch, branch, price);
         }
 
-        // Section 5: Cancellations
-        if (status.includes('cancel') && matchesWidgetFilter(r, F.cancellations, ctx)) {
-          const cancelDay = r.cancellation_time ? new Date(r.cancellation_time) : null;
-          const cancelledToday = cancelDay && phFmt.format(cancelDay) === todayStr;
-          if (cancelledToday || (!r.cancellation_time && createdToday)) {
-            rpts.cancellations.count++; rpts.cancellations.revenue += price; rpts.cancellations.total++;
-            inc(rpts.cancellations.byBranch, branch, price);
-          }
+        // Section 5: Cancellations — per Monday: Creation date is Today AND status colour = Cancelled,
+        // where the Cancelled colour group also includes Promo Hunter.
+        if ((status.includes('cancel') || status === 'promo hunter') && createdToday && matchesWidgetFilter(r, F.cancellations, ctx)) {
+          rpts.cancellations.count++; rpts.cancellations.revenue += price; rpts.cancellations.total++;
+          inc(rpts.cancellations.byBranch, branch, price);
         }
 
         // Section 6: Tomorrow Summary (any creation date) — drives both the
@@ -1103,11 +1100,8 @@ class BookingController {
                booking_date, cancellation_time, created_at
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND LOWER(booking_status) LIKE '%cancel%'
-          AND (
-            (cancellation_time AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
-            OR (cancellation_time IS NULL AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date)
-          )
+          AND (LOWER(booking_status) LIKE '%cancel%' OR LOWER(booking_status) = 'promo hunter')
+          AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
       `);
       res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
     } catch (err) {
@@ -1195,9 +1189,9 @@ class BookingController {
       }
 
       const tomorrowStr = phFmt.format(now + 86400000);
-      // "Next 7 days" = day+2 .. day+7 (excludes today & tomorrow). E.g. if today is
-      // Monday, this counts Wednesday through next Monday.
-      const next7EndStr = phFmt.format(now + 7 * 86400000);
+      // Monday defines "in the next 7 days" as today .. today+6 (7 calendar days incl. today).
+      // So the "Next 7 days" widget (which also excludes today & tomorrow) = day+2 .. day+6.
+      const next7EndStr = phFmt.format(now + 6 * 86400000);
 
       const schedToday = {}, arrToday = {}, schedTomorrow = {}, next7 = {}, otsMap = {};
       const payModesTomorrow = { Cash: 0, Debit: 0, Credit: 0 };
@@ -1228,25 +1222,29 @@ class BookingController {
         const bookedToday = bookingStr === todayStr;
         const cancelled   = status.includes('cancel');
         const isArrived   = status === 'arrived & bought' || status === 'arrived not potential';
+        // Monday filters these widgets by "Status COLOR is Scheduled" — Promo Hunter shares
+        // the Scheduled colour on their board, so it counts as Scheduled here too.
+        const isScheduled = status === 'scheduled' || status === 'promo hunter';
 
         if (!apptStr) continue;
         const isToday    = apptStr === todayStr;
         const isTomorrow = apptStr === tomorrowStr;
-        const inNext7    = apptStr > tomorrowStr && apptStr <= next7EndStr; // day+2 .. day+7
+        const inNext7    = apptStr > tomorrowStr && apptStr <= next7EndStr; // day+2 .. day+6
 
         // Roster for the arrival-rate denominator (everyone still expected today, excl. cancelled)
         if (!cancelled && isToday) schedTodayRoster++;
 
-        // Total OTS — Booked on = Today AND appointment in the next 7 days (today .. day+7),
+        // Total OTS — Booked on = Today AND appointment in the next 7 days (today .. day+6),
         // ANY status EXCEPT "Comeback & Bought" (team follow-up: those are not real OTS bookings).
         if (bookedToday && apptStr >= todayStr && apptStr <= next7EndStr &&
             status !== 'comeback & bought' && matchesWidgetFilter(r, F.ots, ctx)) {
           inc(otsMap, branch, price);
         }
 
-        // Schedules today — Scheduled, plus already-arrived bookings (Arrived & bought,
-        // Arrived not potential) since they were still scheduled for today (team follow-up #2).
-        if (isToday && (status === 'scheduled' || isArrived) && matchesWidgetFilter(r, F.today, ctx)) {
+        // Schedules today — EVERY booking scheduled for today, regardless of status
+        // (Monday's widget has a single condition: Booking Schedule = Today; it counts
+        // Cancelled / Promo Hunter / Arrived / etc. alike). Booked-on splits OTS vs Additional.
+        if (isToday && matchesWidgetFilter(r, F.today, ctx)) {
           inc(schedToday, branch, price);
           if (bookedToday) { otsT++; otsRev += price; }
           else             { otsAddit++; additRev += price; }
@@ -1270,23 +1268,23 @@ class BookingController {
         // Promo hunters today
         if (isToday && status === 'promo hunter') promoHuntersToday++;
 
-        // Schedules tomorrow (Status = Scheduled only, per report formula)
-        if (isTomorrow && status === 'scheduled' && matchesWidgetFilter(r, F.tomorrow, ctx)) {
+        // Schedules tomorrow (Status color = Scheduled → Scheduled + Promo Hunter)
+        if (isTomorrow && isScheduled && matchesWidgetFilter(r, F.tomorrow, ctx)) {
           inc(schedTomorrow, branch, price);
           if (bookedToday) { schedTomOTS++; }
           else              schedTomAddit++;
         }
 
         // Modes of Payment for Tomorrow (own widget filter — decoupled from the Tomorrow schedule widget)
-        if (isTomorrow && status === 'scheduled' && matchesWidgetFilter(r, F.payment, ctx)) {
+        if (isTomorrow && isScheduled && matchesWidgetFilter(r, F.payment, ctx)) {
           const mk = pm.toLowerCase().includes('cash') ? 'Cash'
                    : pm.toLowerCase().includes('debit') ? 'Debit'
                    : pm.toLowerCase().includes('credit') ? 'Credit' : null;
           if (mk) { payModesTomorrow[mk]++; payModeRevTomorrow[mk] += price; }
         }
 
-        // Next 7 days (day+2 .. day+7, Status = Scheduled only — already excludes today & tomorrow via inNext7)
-        if (inNext7 && status === 'scheduled' && matchesWidgetFilter(r, F.next7, ctx)) {
+        // Next 7 days (day+2 .. day+6, Status color = Scheduled → Scheduled + Promo Hunter)
+        if (inNext7 && isScheduled && matchesWidgetFilter(r, F.next7, ctx)) {
           inc(next7, branch, price);
           if (bookedToday) { otsNext7++; }
           else              additNext7++;
@@ -1360,19 +1358,20 @@ class BookingController {
       let SQL = `${SELECT} WHERE record_status != 'DELETED'`;
 
       if (section === 'schedules-today') {
-        // Scheduled + already-arrived (team follow-up #2) — mirrors the widget total.
-        SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) IN ('scheduled','arrived & bought','arrived not potential')`;
+        // Every booking scheduled for today, any status — mirrors the widget total.
+        SQL += ` AND appointment_date = ${phToday}`;
       } else if (section === 'arrivals') {
         SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) IN ('arrived & bought','arrived not potential')`;
       } else if (section === 'schedules-tomorrow' || section === 'payment-tomorrow') {
-        SQL += ` AND appointment_date = ${phToday} + 1 AND LOWER(booking_status) = 'scheduled'`;
+        // Status colour = Scheduled → Scheduled + Promo Hunter (matches the widget).
+        SQL += ` AND appointment_date = ${phToday} + 1 AND LOWER(booking_status) IN ('scheduled','promo hunter')`;
       } else if (section === 'next7days') {
-        // day+2 .. day+7 (excludes today & tomorrow), Scheduled only — matches totalSchedulesNext7
-        SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) = 'scheduled'`;
+        // day+2 .. day+6 (excludes today & tomorrow); Status colour = Scheduled → Scheduled + Promo Hunter.
+        SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 6 AND LOWER(booking_status) IN ('scheduled','promo hunter')`;
       } else if (section === 'ots') {
-        // Total OTS = booked today (booking_date), appt within today .. day+7, ANY status
+        // Total OTS = booked today (booking_date), appt within today .. day+6, ANY status
         // EXCEPT "Comeback & Bought" (team follow-up #1/#6).
-        SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) <> 'comeback & bought'`;
+        SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 6 AND LOWER(booking_status) <> 'comeback & bought'`;
       }
 
       const { rows } = await pool.query(SQL);
@@ -1380,6 +1379,40 @@ class BookingController {
     } catch (err) {
       console.error('getCCReportDrilldown error:', err);
       res.status(500).json({ error: 'Failed to fetch drill-down bookings' });
+    }
+  }
+
+  // ── getFilterOptions ───────────────────────────────────────────────────────
+  // GET /api/bookings/filter-options — distinct branch / status / agent values that
+  // actually exist in the data, so the per-widget filters reflect real data (config
+  // lists can drift, e.g. agents). Case-insensitively de-duplicated, first spelling wins.
+  async getFilterOptions(req, res) {
+    try {
+      const { rows } = await pool.query(`
+        SELECT
+          COALESCE((SELECT array_agg(DISTINCT branch)         FROM bookings WHERE record_status <> 'DELETED' AND NULLIF(TRIM(branch), '')         IS NOT NULL), '{}') AS branches,
+          COALESCE((SELECT array_agg(DISTINCT booking_status) FROM bookings WHERE record_status <> 'DELETED' AND NULLIF(TRIM(booking_status), '') IS NOT NULL), '{}') AS statuses,
+          COALESCE((SELECT array_agg(DISTINCT agent)          FROM bookings WHERE record_status <> 'DELETED' AND NULLIF(TRIM(agent), '')          IS NOT NULL), '{}') AS agents
+      `);
+      const dedupe = (arr) => {
+        const seen = new Set(), out = [];
+        for (const v of (arr || [])) {
+          const k = String(v).trim().toLowerCase();
+          if (k && !seen.has(k)) { seen.add(k); out.push(String(v).trim()); }
+        }
+        return out.sort((a, b) => a.localeCompare(b));
+      };
+      res.json({
+        success: true,
+        options: {
+          branches: dedupe(rows[0].branches),
+          statuses: dedupe(rows[0].statuses),
+          agents:   dedupe(rows[0].agents),
+        },
+      });
+    } catch (err) {
+      console.error('getFilterOptions error:', err);
+      res.status(500).json({ error: 'Failed to fetch filter options' });
     }
   }
 
