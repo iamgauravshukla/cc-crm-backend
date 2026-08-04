@@ -34,7 +34,8 @@ const bookingSchema = Joi.object({
   followUpDate:        Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).allow('', null).optional(),
   agent:               Joi.string().required(),
   isOts:               Joi.boolean().default(false),
-  isCompanion:         Joi.boolean().default(false)
+  isCompanion:         Joi.boolean().default(false),
+  isPromoHunter:       Joi.boolean().default(false)
 });
 
 // ── Activity log helper ───────────────────────────────────────────────────────
@@ -237,7 +238,10 @@ class BookingController {
         d.companionFirstName, d.companionLastName
       );
 
-      const finalStatus = promoResult.status === 'Promo hunter' ? 'Promo hunter' : (d.status || 'Scheduled');
+      // Keep the real appointment status; "promo hunter" is a separate flag (customer trait),
+      // set by auto-detection OR a manual toggle from the form — never overwrites the status.
+      const finalStatus   = d.status || 'Scheduled';
+      const isPromoHunter = d.isPromoHunter === true || promoResult.status === 'Promo hunter';
 
       // Normalized fields
       const emailNorm   = normalizeEmail(d.email);
@@ -261,7 +265,7 @@ class BookingController {
           agent, booking_details, remarks, ad_interacted,
           email_norm, phone_norm, social_norm, full_name_norm, companion_full_name_norm,
           promo_hunter_status, match_reason, matched_source, matched_row, last_checked_at,
-          is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion,
+          is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion, is_promo_hunter,
           follow_up_date
         ) VALUES (
           $1,'ACTIVE',$2,
@@ -275,7 +279,7 @@ class BookingController {
           $28,$29,$30,$31,
           $32,$33,$34,$35,$36,
           $37,$38,$39,$40,$2,
-          $42,false,$43,false,false,
+          $42,false,$43,false,false,$44,
           $41
         )`,
         [
@@ -292,7 +296,8 @@ class BookingController {
           promoResult.status, promoResult.matchReason || null, promoResult.matchedSource || null, promoResult.matchedRow || null,
           d.followUpDate || null,
           d.isOts === true,        // $42 is_ots
-          d.isCompanion === true   // $43 is_companion
+          d.isCompanion === true,  // $43 is_companion
+          isPromoHunter            // $44 is_promo_hunter
         ]
       );
 
@@ -307,6 +312,7 @@ class BookingController {
           recordId,
           ...d,
           promoHunterStatus: promoResult.status,
+          isPromoHunter,
           finalStatus
         }
       });
@@ -430,7 +436,7 @@ class BookingController {
             promo_hunter_status,
             cancel_validation, underage_cancellation, underage_status, db_status,
             remarks, purchase_details,
-            is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion,
+            is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion, is_promo_hunter,
             do_not_call, is_rescheduled,
             follow_up_date, booking_date, booking_time,
             to_char(created_at AT TIME ZONE 'Asia/Manila', 'FMHH12:MI AM') AS created_time_ph
@@ -485,6 +491,7 @@ class BookingController {
         isCompanion:       r.is_companion        || false,
         isHighPriority:    r.is_high_priority    || false,
         isMetaConversion:  r.is_meta_conversion  || false,
+        isPromoHunter:     r.is_promo_hunter     || false,
         doNotCall:         r.do_not_call         || false,
         isRescheduled:     r.is_rescheduled      || false,
         followUpDate:       normDate(r.follow_up_date) || null,
@@ -561,6 +568,7 @@ class BookingController {
           isCompanion:       r.is_companion       || false,
           isHighPriority:    r.is_high_priority   || false,
           isMetaConversion:  r.is_meta_conversion || false,
+          isPromoHunter:     r.is_promo_hunter    || false,
           doNotCall:         r.do_not_call        || false,
           isRescheduled:     r.is_rescheduled     || false,
           followUpDate:      normDate(r.follow_up_date) || null,
@@ -670,7 +678,8 @@ class BookingController {
           booking_date     = $41,
           booking_time     = $42,
           do_not_call      = $43,
-          is_rescheduled   = $44
+          is_rescheduled   = $44,
+          is_promo_hunter  = $46
         WHERE record_id = $45
       `, [
         d.branch           || cur.branch,
@@ -713,7 +722,8 @@ class BookingController {
         d.bookingTime  !== undefined ? (d.bookingTime  || null) : cur.booking_time,
         d.doNotCall      !== undefined ? d.doNotCall      : cur.do_not_call,
         d.isRescheduled  !== undefined ? d.isRescheduled  : cur.is_rescheduled,
-        recordId
+        recordId,
+        d.isPromoHunter  !== undefined ? d.isPromoHunter  : cur.is_promo_hunter
       ]);
 
       // Compute diff and log activity
@@ -867,7 +877,8 @@ class BookingController {
       const F = parseWidgetFilters(req.query);
       const { rows } = await pool.query(`
         SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
-               agent, cancellation_time, underage_cancellation, underage_status, db_status, follow_up_date
+               agent, cancellation_time, underage_cancellation, underage_status, db_status, follow_up_date,
+               is_promo_hunter
         FROM bookings
         WHERE record_status != 'DELETED'
           AND (
@@ -953,7 +964,7 @@ class BookingController {
 
         // Section 5: Cancellations — per Monday: Creation date is Today AND status colour = Cancelled,
         // where the Cancelled colour group also includes Promo Hunter.
-        if ((status.includes('cancel') || status === 'promo hunter') && createdToday && matchesWidgetFilter(r, F.cancellations, ctx)) {
+        if ((status.includes('cancel') || r.is_promo_hunter) && createdToday && matchesWidgetFilter(r, F.cancellations, ctx)) {
           rpts.cancellations.count++; rpts.cancellations.revenue += price; rpts.cancellations.total++;
           inc(rpts.cancellations.byBranch, branch, price);
         }
@@ -988,7 +999,7 @@ class BookingController {
         if (isToday && status === 'no show') rpts.noShowsToday++;
 
         // Section 10: Promo hunters today
-        if (isToday && status === 'promo hunter') rpts.promoHuntersToday++;
+        if (isToday && r.is_promo_hunter) rpts.promoHuntersToday++;
 
         // Section 11: Follow-ups due today
         const fuDate = r.follow_up_date ? String(r.follow_up_date).split('T')[0] : null;
@@ -1100,7 +1111,7 @@ class BookingController {
                booking_date, cancellation_time, created_at
         FROM bookings
         WHERE record_status != 'DELETED'
-          AND (LOWER(booking_status) LIKE '%cancel%' OR LOWER(booking_status) = 'promo hunter')
+          AND (LOWER(booking_status) LIKE '%cancel%' OR is_promo_hunter)
           AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
       `);
       res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
@@ -1157,7 +1168,7 @@ class BookingController {
       const [{ rows }, { rows: cancelRows }] = await Promise.all([
         pool.query(`
           SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
-                 payment_mode, agent
+                 payment_mode, agent, is_promo_hunter
           FROM bookings
           WHERE record_status != 'DELETED'
             AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
@@ -1169,7 +1180,7 @@ class BookingController {
           SELECT branch, booking_status, appointment_date, booking_date, agent, total_price
           FROM bookings
           WHERE record_status != 'DELETED'
-            AND LOWER(booking_status) IN ('cancelled', 'promo hunter')
+            AND (LOWER(booking_status) LIKE '%cancel%' OR is_promo_hunter)
             AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
         `),
       ]);
@@ -1266,7 +1277,7 @@ class BookingController {
         }
 
         // Promo hunters today
-        if (isToday && status === 'promo hunter') promoHuntersToday++;
+        if (isToday && r.is_promo_hunter) promoHuntersToday++;
 
         // Schedules tomorrow (Status color = Scheduled → Scheduled + Promo Hunter)
         if (isTomorrow && isScheduled && matchesWidgetFilter(r, F.tomorrow, ctx)) {
@@ -1350,7 +1361,7 @@ class BookingController {
       // Cancellations are independent of the appointment window and of validation status.
       if (section === 'cancellations') {
         const { rows } = await pool.query(
-          `${SELECT} WHERE record_status != 'DELETED' AND LOWER(booking_status) IN ('cancelled', 'promo hunter') AND booking_date = ${phToday}`
+          `${SELECT} WHERE record_status != 'DELETED' AND (LOWER(booking_status) LIKE '%cancel%' OR is_promo_hunter) AND booking_date = ${phToday}`
         );
         return res.json({ success: true, bookings: apply(rows).map(r => ({ ...mapDrilldown(r), paymentMode: normalizePaymentMode(r.payment_mode) })) });
       }
@@ -1638,7 +1649,7 @@ class BookingController {
                first_name, last_name, age, gender, phone, email, social_media, treatment, area, freebie,
                total_price, payment_mode, agent, booking_details, remarks, purchase_details,
                companion_first_name, companion_last_name,
-               promo_hunter_status, match_reason, is_ots, is_high_priority, is_meta_conversion,
+               promo_hunter_status, match_reason, is_ots, is_high_priority, is_meta_conversion, is_promo_hunter,
                do_not_call, is_rescheduled, follow_up_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1695,6 +1706,7 @@ class BookingController {
         isOts:             r.is_ots             || false,
         isHighPriority:    r.is_high_priority   || false,
         isMetaConversion:  r.is_meta_conversion || false,
+        isPromoHunter:     r.is_promo_hunter    || false,
         doNotCall:         r.do_not_call        || false,
         isRescheduled:     r.is_rescheduled     || false,
         promoHunterStatus: r.promo_hunter_status || '',
@@ -1744,7 +1756,7 @@ class BookingController {
         SELECT
           record_id, booking_status, branch, appointment_time,
           first_name, last_name, treatment, total_price, payment_mode,
-          agent, phone, is_ots, is_high_priority, is_meta_conversion,
+          agent, phone, is_ots, is_high_priority, is_meta_conversion, is_promo_hunter,
           do_not_call, is_rescheduled, follow_up_date, remarks
         FROM bookings
         WHERE ${conds.join(' AND ')}
@@ -1766,6 +1778,7 @@ class BookingController {
         isOts:            r.is_ots             || false,
         isHighPriority:   r.is_high_priority   || false,
         isMetaConversion: r.is_meta_conversion || false,
+        isPromoHunter:    r.is_promo_hunter    || false,
         doNotCall:        r.do_not_call        || false,
         isRescheduled:    r.is_rescheduled     || false,
         followUpDate:     normDate(r.follow_up_date) || null,

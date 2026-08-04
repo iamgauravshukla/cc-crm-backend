@@ -218,7 +218,7 @@ async function getAnalytics(req, res) {
                COUNT(*) FILTER (WHERE ${ARRIVAL_IN}) AS arrived,
                COUNT(*) FILTER (WHERE LOWER(booking_status) IN ('arrived & bought','comeback & bought')) AS bought,
                COUNT(*) FILTER (WHERE LOWER(booking_status) LIKE '%cancel%') AS cancelled,
-               COUNT(*) FILTER (WHERE LOWER(booking_status) = 'promo hunter') AS promo_hunters
+               COUNT(*) FILTER (WHERE is_promo_hunter) AS promo_hunters
         FROM bookings ${WHERE}`, P),
 
       // 13. Bookings by day of week
@@ -438,7 +438,7 @@ async function getAgentPerformance(req, res) {
         COUNT(*) FILTER (WHERE ${ARRIVAL_IN})      AS arrivals,
         COUNT(*) FILTER (WHERE LOWER(booking_status) = 'scheduled')   AS scheduled,
         COUNT(*) FILTER (WHERE LOWER(booking_status) LIKE '%cancel%')  AS cancelled,
-        COUNT(*) FILTER (WHERE LOWER(booking_status) = 'promo hunter' OR (promo_hunter_status IS NOT NULL AND promo_hunter_status != '')) AS promo_hunters,
+        COUNT(*) FILTER (WHERE is_promo_hunter) AS promo_hunters,
         SUM(CASE WHEN ${COMPLETED_IN} THEN total_price ELSE 0 END) AS revenue
       FROM bookings ${WHERE}
       GROUP BY 1 ORDER BY revenue DESC
