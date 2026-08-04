@@ -1222,9 +1222,9 @@ class BookingController {
         const bookedToday = bookingStr === todayStr;
         const cancelled   = status.includes('cancel');
         const isArrived   = status === 'arrived & bought' || status === 'arrived not potential';
-        // Monday filters these widgets by "Status COLOR is Scheduled" — Promo Hunter shares
-        // the Scheduled colour on their board, so it counts as Scheduled here too.
-        const isScheduled = status === 'scheduled' || status === 'promo hunter';
+        // Monday filters these widgets by "Status colour is Scheduled" = the literal Scheduled
+        // status only (Promo Hunter has its own colour — verified against Monday's counts).
+        const isScheduled = status === 'scheduled';
 
         if (!apptStr) continue;
         const isToday    = apptStr === todayStr;
@@ -1363,11 +1363,10 @@ class BookingController {
       } else if (section === 'arrivals') {
         SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) IN ('arrived & bought','arrived not potential')`;
       } else if (section === 'schedules-tomorrow' || section === 'payment-tomorrow') {
-        // Status colour = Scheduled → Scheduled + Promo Hunter (matches the widget).
-        SQL += ` AND appointment_date = ${phToday} + 1 AND LOWER(booking_status) IN ('scheduled','promo hunter')`;
+        SQL += ` AND appointment_date = ${phToday} + 1 AND LOWER(booking_status) = 'scheduled'`;
       } else if (section === 'next7days') {
-        // day+2 .. day+7 (excludes today & tomorrow); Status colour = Scheduled → Scheduled + Promo Hunter.
-        SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) IN ('scheduled','promo hunter')`;
+        // day+2 .. day+7 (excludes today & tomorrow), Scheduled only — matches the widget.
+        SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) = 'scheduled'`;
       } else if (section === 'ots') {
         // Total OTS = booked today (booking_date), appt within today .. day+7, ANY status
         // EXCEPT "Comeback & Bought" (team follow-up #1/#6).
