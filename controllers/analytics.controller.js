@@ -457,6 +457,20 @@ async function getAgentPerformance(req, res) {
       (statusByAgent[r.agent] = statusByAgent[r.agent] || {})[titleCase(r.status)] = r.n;
     }
 
+    // Per-agent treatment distribution — drives the "Treatment Distribution by Agent" section.
+    const { rows: trRows } = await pool.query(`
+      SELECT ${SQL_AGENT} AS agent, UPPER(TRIM(treatment)) AS treatment, COUNT(*)::int AS n
+      FROM bookings ${WHERE} AND NULLIF(TRIM(treatment), '') IS NOT NULL
+      GROUP BY 1, 2
+    `, params);
+    const treatmentsByAgent = {};
+    for (const r of trRows) {
+      (treatmentsByAgent[r.agent] = treatmentsByAgent[r.agent] || []).push({ name: r.treatment, count: r.n });
+    }
+    for (const a of Object.keys(treatmentsByAgent)) {
+      treatmentsByAgent[a].sort((x, y) => y.count - x.count);
+    }
+
     const rd = startDate && endDate
       ? Math.max(1, Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1) : days;
     const rW = Math.max(1, rd / 7), rM = Math.max(1, rd / 30);
@@ -472,7 +486,8 @@ async function getAgentPerformance(req, res) {
         arrivals: arr, avgWeeklyArrivals: +(arr / rW).toFixed(2), avgMonthlyArrivals: +(arr / rM).toFixed(2),
         converted: comp, scheduled: parseInt(r.scheduled), cancelled: parseInt(r.cancelled),
         promoHunters: parseInt(r.promo_hunters),
-        statusBreakdown: statusByAgent[r.agent] || {}
+        statusBreakdown: statusByAgent[r.agent] || {},
+        treatments: treatmentsByAgent[r.agent] || []
       };
     });
 

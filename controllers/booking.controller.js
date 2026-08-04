@@ -1189,9 +1189,9 @@ class BookingController {
       }
 
       const tomorrowStr = phFmt.format(now + 86400000);
-      // Monday defines "in the next 7 days" as today .. today+6 (7 calendar days incl. today).
-      // So the "Next 7 days" widget (which also excludes today & tomorrow) = day+2 .. day+6.
-      const next7EndStr = phFmt.format(now + 6 * 86400000);
+      // "In the next 7 days" = tomorrow .. today+7 (7 days). The "Next 7 days" widget also
+      // excludes today & tomorrow, so it spans day+2 .. day+7.
+      const next7EndStr = phFmt.format(now + 7 * 86400000);
 
       const schedToday = {}, arrToday = {}, schedTomorrow = {}, next7 = {}, otsMap = {};
       const payModesTomorrow = { Cash: 0, Debit: 0, Credit: 0 };
@@ -1229,12 +1229,12 @@ class BookingController {
         if (!apptStr) continue;
         const isToday    = apptStr === todayStr;
         const isTomorrow = apptStr === tomorrowStr;
-        const inNext7    = apptStr > tomorrowStr && apptStr <= next7EndStr; // day+2 .. day+6
+        const inNext7    = apptStr > tomorrowStr && apptStr <= next7EndStr; // day+2 .. day+7
 
         // Roster for the arrival-rate denominator (everyone still expected today, excl. cancelled)
         if (!cancelled && isToday) schedTodayRoster++;
 
-        // Total OTS — Booked on = Today AND appointment in the next 7 days (today .. day+6),
+        // Total OTS — Booked on = Today AND appointment in the next 7 days (today .. day+7),
         // ANY status EXCEPT "Comeback & Bought" (team follow-up: those are not real OTS bookings).
         if (bookedToday && apptStr >= todayStr && apptStr <= next7EndStr &&
             status !== 'comeback & bought' && matchesWidgetFilter(r, F.ots, ctx)) {
@@ -1283,7 +1283,7 @@ class BookingController {
           if (mk) { payModesTomorrow[mk]++; payModeRevTomorrow[mk] += price; }
         }
 
-        // Next 7 days (day+2 .. day+6, Status color = Scheduled → Scheduled + Promo Hunter)
+        // Next 7 days (day+2 .. day+7, Status color = Scheduled → Scheduled + Promo Hunter)
         if (inNext7 && isScheduled && matchesWidgetFilter(r, F.next7, ctx)) {
           inc(next7, branch, price);
           if (bookedToday) { otsNext7++; }
@@ -1366,12 +1366,12 @@ class BookingController {
         // Status colour = Scheduled → Scheduled + Promo Hunter (matches the widget).
         SQL += ` AND appointment_date = ${phToday} + 1 AND LOWER(booking_status) IN ('scheduled','promo hunter')`;
       } else if (section === 'next7days') {
-        // day+2 .. day+6 (excludes today & tomorrow); Status colour = Scheduled → Scheduled + Promo Hunter.
-        SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 6 AND LOWER(booking_status) IN ('scheduled','promo hunter')`;
+        // day+2 .. day+7 (excludes today & tomorrow); Status colour = Scheduled → Scheduled + Promo Hunter.
+        SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) IN ('scheduled','promo hunter')`;
       } else if (section === 'ots') {
-        // Total OTS = booked today (booking_date), appt within today .. day+6, ANY status
+        // Total OTS = booked today (booking_date), appt within today .. day+7, ANY status
         // EXCEPT "Comeback & Bought" (team follow-up #1/#6).
-        SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 6 AND LOWER(booking_status) <> 'comeback & bought'`;
+        SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) <> 'comeback & bought'`;
       }
 
       const { rows } = await pool.query(SQL);
