@@ -2,8 +2,9 @@
 const pool = require('../db/pool');
 
 const COMPLETED_IN = `LOWER(booking_status) IN ('arrived not potential','arrived & bought','comeback & bought')`;
-// An "arrival" = arrived status AND both validations Approved (Pending/Rejected excluded).
-const ARRIVAL_IN   = `(LOWER(booking_status) IN ('arrived not potential','arrived & bought') AND COALESCE(underage_status,'Approved') = 'Approved' AND COALESCE(db_status,'Approved') = 'Approved')`;
+// An "arrival" = arrived status AND both validations Approved (Pending/Rejected excluded)
+// AND not flagged under Cancel Validation (those never count toward arrivals/arrival rate).
+const ARRIVAL_IN   = `(LOWER(booking_status) IN ('arrived not potential','arrived & bought') AND COALESCE(underage_status,'Approved') = 'Approved' AND COALESCE(db_status,'Approved') = 'Approved' AND NOT COALESCE(cancel_validation, false))`;
 const SALE_STATUSES = new Set(['arrived & bought','comeback & bought','arrived not potential']);
 const ARRIVAL_STATUSES = new Set(['arrived not potential','arrived & bought']);
 
@@ -625,7 +626,7 @@ async function getSalesReport(req, res) {
 
     const { rows } = await pool.query(`
       SELECT branch, booking_status, appointment_date, total_price,
-             underage_status, db_status
+             underage_status, db_status, cancel_validation
       FROM bookings
       WHERE record_status != 'DELETED'
         AND appointment_date >= $1::date
@@ -656,7 +657,7 @@ async function getSalesReport(req, res) {
       const branch = r.branch || 'Unknown';
       const status = (r.booking_status || '').toLowerCase().replace(/\s+/g, ' ').trim();
       const price  = parseFloat(r.total_price) || 0;
-      const isArr  = ARRIVAL_STATUSES.has(status) && (r.underage_status || 'Approved') === 'Approved' && (r.db_status || 'Approved') === 'Approved';
+      const isArr  = ARRIVAL_STATUSES.has(status) && (r.underage_status || 'Approved') === 'Approved' && (r.db_status || 'Approved') === 'Approved' && !r.cancel_validation;
       const isSale = SALE_STATUSES.has(status);
 
       if (bDate >= startDate && bDate <= endDate) {
@@ -763,4 +764,62 @@ async function getSalesReport(req, res) {
   }
 }
 
-module.exports = { getAnalytics, getAgentPerformance, getAdPerformance, getSalesReport };
+// ── getAgentBookings ─────────────────────────────────────────────────────────
+// GET /analytics/agent-bookings?agent=&status=&days=|startDate=&endDate=
+// Booking list behind one bar of the per-agent breakdown modal — same WHERE as
+// getAgentPerformance so counts always match the chart.
+async function getAgentBookings(req, res) {
+  try {
+    const agent  = (req.query.agent  || '').trim();
+    if (!agent) return res.status(400).json({ error: 'agent is required' });
+    const status = (req.query.status || '').trim();
+    const days      = Math.max(1, Math.min(365, Math.floor(parseInt(req.query.days) || 30)));
+    const startDate = req.query.startDate;
+    const endDate   = req.query.endDate;
+
+    const VAL_FILTER = `COALESCE(underage_status,'Approved') = 'Approved' AND COALESCE(db_status,'Approved') = 'Approved'`;
+    const conds  = [`record_status != 'DELETED'`, VAL_FILTER];
+    const params = [];
+    let   idx    = 1;
+    if (startDate && endDate) {
+      conds.push(`appointment_date >= $${idx++}::date`); params.push(startDate);
+      conds.push(`appointment_date <= $${idx++}::date`); params.push(endDate);
+    } else {
+      conds.push(`appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${days} days'`);
+    }
+    conds.push(`${SQL_AGENT} = UPPER(TRIM($${idx++}))`); params.push(agent);
+    if (status) { conds.push(`LOWER(TRIM(booking_status)) = $${idx++}`); params.push(status.toLowerCase()); }
+
+    const { rows } = await pool.query(`
+      SELECT record_id, appointment_date, appointment_time, first_name, last_name,
+             branch, treatment, booking_status, total_price, phone, email, is_promo_hunter
+      FROM bookings
+      WHERE ${conds.join(' AND ')}
+      ORDER BY appointment_date DESC, appointment_time DESC
+      LIMIT 500
+    `, params);
+
+    res.json({
+      success: true,
+      bookings: rows.map(r => ({
+        recordId:  r.record_id,
+        date:      r.appointment_date || '',
+        time:      r.appointment_time || '',
+        firstName: r.first_name || '',
+        lastName:  r.last_name  || '',
+        branch:    r.branch     || '',
+        treatment: r.treatment  || '',
+        status:    r.booking_status || '',
+        totalPrice: parseFloat(r.total_price) || 0,
+        phone:     r.phone || '',
+        email:     r.email || '',
+        isPromoHunter: r.is_promo_hunter || false,
+      })),
+    });
+  } catch (err) {
+    console.error('Agent bookings error:', err);
+    res.status(500).json({ error: 'Failed to fetch agent bookings' });
+  }
+}
+
+module.exports = { getAnalytics, getAgentPerformance, getAdPerformance, getSalesReport, getAgentBookings };

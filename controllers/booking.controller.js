@@ -106,6 +106,33 @@ const pushBookingDateFilters = (conds, params, idx, q) => {
   return idx;
 };
 
+// Appends the Branch / Status / Agent / Gender filters shared by getOldBookings and
+// exportBookings. Each text field supports an include list ("A,B"), the legacy
+// "NOT:A,B" prefix, and a separate <field>Not param so an "is" and an "is not"
+// filter on the SAME field can be active together (#6 team request).
+const pushTextFilters = (conds, params, idx, q) => {
+  const split = (v) => String(v || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  const apply = (raw, notRaw, colExpr) => {
+    let exc = split(notRaw);
+    let inc = [];
+    const val = (raw || '').trim();
+    if (val && val !== 'All') {
+      if (val.startsWith('NOT:')) exc = exc.concat(split(val.slice(4)));
+      else inc = split(val);
+    }
+    if (inc.length) { conds.push(`${colExpr} = ANY($${idx++}::text[])`); params.push(inc); }
+    if (exc.length) { conds.push(`NOT (${colExpr} = ANY($${idx++}::text[]))`); params.push(exc); }
+  };
+  apply(q.branch, q.branchNot, 'LOWER(branch)');
+  apply(q.status, q.statusNot, 'LOWER(booking_status)');
+  apply(q.agent,  q.agentNot,  `LOWER(COALESCE(agent,''))`);
+  if (q.gender && q.gender !== 'All') {
+    conds.push(`LOWER(COALESCE(gender,'')) = $${idx++}`);
+    params.push(q.gender.toLowerCase());
+  }
+  return idx;
+};
+
 // ── Per-widget "refine" filters ──────────────────────────────────────────────
 // Each report widget can carry conditions on branch / status / agent / date-range,
 // with is / isNot / isLike operators, combined by AND or OR. They REFINE (narrow)
@@ -266,7 +293,7 @@ class BookingController {
           email_norm, phone_norm, social_norm, full_name_norm, companion_full_name_norm,
           promo_hunter_status, match_reason, matched_source, matched_row, last_checked_at,
           is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion, is_promo_hunter,
-          follow_up_date
+          follow_up_date, underage_status, db_status
         ) VALUES (
           $1,'ACTIVE',$2,
           $3,$4,
@@ -280,7 +307,7 @@ class BookingController {
           $32,$33,$34,$35,$36,
           $37,$38,$39,$40,$2,
           $42,false,$43,false,false,$44,
-          $41
+          $41,'Pending','Pending'
         )`,
         [
           recordId, now,
@@ -346,42 +373,13 @@ class BookingController {
       const params = [];
       let   idx    = 1;
 
-      // Branch filter (supports NOT: prefix and comma-separated values)
-      if (branch && branch !== 'All') {
-        const isNot = branch.startsWith('NOT:');
-        const vals  = (isNot ? branch.slice(4) : branch).split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
-        if (vals.length) {
-          conds.push(isNot
-            ? `NOT (LOWER(branch) = ANY($${idx++}::text[]))`
-            : `LOWER(branch) = ANY($${idx++}::text[])`);
-          params.push(vals);
-        }
-      }
-
-      // Status filter
-      if (status && status !== 'All') {
-        const isNot = status.startsWith('NOT:');
-        const vals  = (isNot ? status.slice(4) : status).split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
-        if (vals.length) {
-          conds.push(isNot
-            ? `NOT (LOWER(booking_status) = ANY($${idx++}::text[]))`
-            : `LOWER(booking_status) = ANY($${idx++}::text[])`);
-          params.push(vals);
-        }
-      }
-
-      // Agent filter
-      if (agent && agent !== 'All') {
-        const vals = agent.split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
-        conds.push(`LOWER(COALESCE(agent,'')) = ANY($${idx++}::text[])`);
-        params.push(vals);
-      }
-
-      // Gender filter
-      if (gender && gender !== 'All') {
-        conds.push(`LOWER(COALESCE(gender,'')) = $${idx++}`);
-        params.push(gender.toLowerCase());
-      }
+      // Branch / Status / Agent / Gender filters (is + is-not combinable) — shared with exportBookings
+      idx = pushTextFilters(conds, params, idx, {
+        branch, branchNot: req.query.branchNot,
+        status, statusNot: req.query.statusNot,
+        agent,  agentNot:  req.query.agentNot,
+        gender,
+      });
 
       // Booked On (booking_date) + Appointment-date filters — shared with exportBookings
       idx = pushBookingDateFilters(conds, params, idx, {
@@ -392,7 +390,7 @@ class BookingController {
       // Search filter
       if (search) {
         const q = `%${search.toLowerCase()}%`;
-        conds.push(`(LOWER(COALESCE(first_name,'')) LIKE $${idx} OR LOWER(COALESCE(last_name,'')) LIKE $${idx} OR (LOWER(COALESCE(first_name,'')) || ' ' || LOWER(COALESCE(last_name,''))) LIKE $${idx} OR LOWER(COALESCE(full_name_norm,'')) LIKE $${idx} OR LOWER(COALESCE(email,'')) LIKE $${idx} OR phone LIKE $${idx} OR LOWER(COALESCE(social_media,'')) LIKE $${idx} OR LOWER(COALESCE(agent,'')) LIKE $${idx} OR LOWER(COALESCE(treatment,'')) LIKE $${idx} OR LOWER(COALESCE(branch,'')) LIKE $${idx})`);
+        conds.push(`(LOWER(COALESCE(first_name,'')) LIKE $${idx} OR LOWER(COALESCE(last_name,'')) LIKE $${idx} OR (LOWER(COALESCE(first_name,'')) || ' ' || LOWER(COALESCE(last_name,''))) LIKE $${idx} OR LOWER(COALESCE(full_name_norm,'')) LIKE $${idx} OR LOWER(COALESCE(email,'')) LIKE $${idx} OR phone LIKE $${idx} OR LOWER(COALESCE(social_media,'')) LIKE $${idx} OR LOWER(COALESCE(agent,'')) LIKE $${idx} OR LOWER(COALESCE(treatment,'')) LIKE $${idx} OR LOWER(COALESCE(branch,'')) LIKE $${idx} OR LOWER(COALESCE(companion_first_name,'')) LIKE $${idx} OR LOWER(COALESCE(companion_last_name,'')) LIKE $${idx} OR (LOWER(COALESCE(companion_first_name,'')) || ' ' || LOWER(COALESCE(companion_last_name,''))) LIKE $${idx} OR LOWER(COALESCE(companion_full_name_norm,'')) LIKE $${idx})`);
         params.push(q);
         idx++;
       }
@@ -754,12 +752,16 @@ class BookingController {
         ['companion_age',         String(d.companionAge !== undefined ? (d.companionAge ?? '') : (cur.companion_age ?? '')), String(cur.companion_age ?? '')],
         ['companion_gender',      nv(d.companionGender, cur.companion_gender),         cur.companion_gender ?? ''],
         ['companion_freebie',     nv(d.companionFreebie,cur.companion_freebie),        cur.companion_freebie ?? ''],
+        ['companion_area',        nv(d.companionArea,   cur.companion_area),           cur.companion_area  ?? ''],
         ['remarks',               nv(d.remarks,         cur.remarks),                  cur.remarks         ?? ''],
         ['purchase_details',      nv(d.purchaseDetails, cur.purchase_details),         cur.purchase_details ?? ''],
         ['follow_up_date',        normDate(d.followUpDate !== undefined ? d.followUpDate : cur.follow_up_date), normDate(cur.follow_up_date)],
         ['booking_date',          normDate(d.bookingDate !== undefined ? d.bookingDate : cur.booking_date),    normDate(cur.booking_date)],
         ['booking_time',          nv(d.bookingTime,     cur.booking_time),             cur.booking_time    ?? ''],
         ['is_ots',                String(d.isOts            !== undefined ? d.isOts            : cur.is_ots),            String(cur.is_ots)],
+        ['is_ad_id',              String(d.isAdId           !== undefined ? d.isAdId           : cur.is_ad_id),          String(cur.is_ad_id)],
+        ['is_companion',          String(d.isCompanion      !== undefined ? d.isCompanion      : cur.is_companion),      String(cur.is_companion)],
+        ['is_promo_hunter',       String(d.isPromoHunter    !== undefined ? d.isPromoHunter    : cur.is_promo_hunter),   String(cur.is_promo_hunter)],
         ['is_high_priority',      String(d.isHighPriority   !== undefined ? d.isHighPriority   : cur.is_high_priority),  String(cur.is_high_priority)],
         ['is_meta_conversion',    String(d.isMetaConversion !== undefined ? d.isMetaConversion : cur.is_meta_conversion), String(cur.is_meta_conversion)],
         ['do_not_call',           String(d.doNotCall     !== undefined ? d.doNotCall     : cur.do_not_call),     String(cur.do_not_call)],
@@ -783,7 +785,8 @@ class BookingController {
 
   // ── updateValidation ───────────────────────────────────────────────────────
   // PATCH /bookings/:rowNumber/validation  (rowNumber is record_id)
-  // Sets the tri-state Underage Status / Double Booking Status columns.
+  // Sets the tri-state Underage Status / Double Booking Status columns and the
+  // Cancel Validation checkbox (checked = excluded from agent arrivals/arrival rate).
   async updateValidation(req, res) {
     try {
       if (req.user?.role !== 'Admin') {
@@ -791,20 +794,34 @@ class BookingController {
       }
 
       const recordId = req.params.rowNumber;
-      const { underageStatus, dbStatus } = req.body;
+      const { underageStatus, dbStatus, cancelValidation } = req.body;
       const ALLOWED = ['Approved', 'Pending', 'Rejected'];
 
+      const { rows: curRows } = await pool.query(
+        `SELECT underage_status, db_status, cancel_validation FROM bookings WHERE record_id = $1 AND record_status != 'DELETED'`,
+        [recordId]
+      );
+      if (!curRows.length) return res.status(404).json({ error: 'Booking not found' });
+      const cur = curRows[0];
+
       // Build a partial update from whichever field(s) were supplied
-      const sets = [], vals = [];
+      const sets = [], vals = [], changes = {};
       if (underageStatus !== undefined) {
         if (!ALLOWED.includes(underageStatus)) return res.status(400).json({ error: `underageStatus must be one of ${ALLOWED.join(', ')}` });
         vals.push(underageStatus); sets.push(`underage_status = $${vals.length}`);
+        if (underageStatus !== cur.underage_status) changes.underage_status = { from: cur.underage_status, to: underageStatus };
       }
       if (dbStatus !== undefined) {
         if (!ALLOWED.includes(dbStatus)) return res.status(400).json({ error: `dbStatus must be one of ${ALLOWED.join(', ')}` });
         vals.push(dbStatus); sets.push(`db_status = $${vals.length}`);
+        if (dbStatus !== cur.db_status) changes.db_status = { from: cur.db_status, to: dbStatus };
       }
-      if (!sets.length) return res.status(400).json({ error: 'Nothing to update: provide underageStatus and/or dbStatus' });
+      if (cancelValidation !== undefined) {
+        const cv = cancelValidation === true;
+        vals.push(cv); sets.push(`cancel_validation = $${vals.length}`);
+        if (cv !== cur.cancel_validation) changes.cancel_validation = { from: cur.cancel_validation, to: cv };
+      }
+      if (!sets.length) return res.status(400).json({ error: 'Nothing to update: provide underageStatus, dbStatus and/or cancelValidation' });
 
       vals.push(recordId);
       const { rowCount } = await pool.query(
@@ -813,8 +830,9 @@ class BookingController {
       );
 
       if (!rowCount) return res.status(404).json({ error: 'Booking not found' });
+      if (Object.keys(changes).length) await logActivity(recordId, req.user, 'UPDATED', changes);
 
-      res.json({ success: true, recordId, underageStatus, dbStatus });
+      res.json({ success: true, recordId, underageStatus, dbStatus, cancelValidation });
     } catch (err) {
       console.error('updateValidation error:', err);
       res.status(500).json({ error: 'Failed to update validation status' });
@@ -827,9 +845,22 @@ class BookingController {
     try {
       const recordId = req.params.id;
       const { isOts, isCompanion } = req.body;
-      const sets = [], vals = [];
-      if (isOts !== undefined)      { vals.push(isOts === true);      sets.push(`is_ots = $${vals.length}`); }
-      if (isCompanion !== undefined) { vals.push(isCompanion === true); sets.push(`is_companion = $${vals.length}`); }
+      const { rows: curRows } = await pool.query(
+        `SELECT is_ots, is_companion FROM bookings WHERE record_id = $1 AND record_status != 'DELETED'`,
+        [recordId]
+      );
+      if (!curRows.length) return res.status(404).json({ error: 'Booking not found' });
+      const cur = curRows[0];
+
+      const sets = [], vals = [], changes = {};
+      if (isOts !== undefined) {
+        vals.push(isOts === true); sets.push(`is_ots = $${vals.length}`);
+        if ((isOts === true) !== cur.is_ots) changes.is_ots = { from: cur.is_ots, to: isOts === true };
+      }
+      if (isCompanion !== undefined) {
+        vals.push(isCompanion === true); sets.push(`is_companion = $${vals.length}`);
+        if ((isCompanion === true) !== cur.is_companion) changes.is_companion = { from: cur.is_companion, to: isCompanion === true };
+      }
       if (!sets.length) return res.status(400).json({ error: 'Nothing to update: provide isOts and/or isCompanion' });
 
       vals.push(recordId);
@@ -837,6 +868,7 @@ class BookingController {
         `UPDATE bookings SET ${sets.join(', ')} WHERE record_id = $${vals.length}`, vals
       );
       if (!rowCount) return res.status(404).json({ error: 'Booking not found' });
+      if (Object.keys(changes).length) await logActivity(recordId, req.user, 'UPDATED', changes);
 
       res.json({ success: true, recordId, isOts, isCompanion });
     } catch (err) {
@@ -1447,23 +1479,13 @@ class BookingController {
       const params = [];
       let   idx    = 1;
 
-      if (branch && branch !== 'All') {
-        const isNot = branch.startsWith('NOT:');
-        const vals  = (isNot ? branch.slice(4) : branch).split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
-        if (vals.length) { conds.push(isNot ? `NOT (LOWER(branch) = ANY($${idx++}::text[]))` : `LOWER(branch) = ANY($${idx++}::text[])`); params.push(vals); }
-      }
-      if (status && status !== 'All') {
-        const isNot = status.startsWith('NOT:');
-        const vals  = (isNot ? status.slice(4) : status).split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
-        if (vals.length) { conds.push(isNot ? `NOT (LOWER(booking_status) = ANY($${idx++}::text[]))` : `LOWER(booking_status) = ANY($${idx++}::text[])`); params.push(vals); }
-      }
-      if (agent && agent !== 'All') {
-        const vals = agent.split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
-        conds.push(`LOWER(COALESCE(agent,'')) = ANY($${idx++}::text[])`); params.push(vals);
-      }
-      if (gender && gender !== 'All') {
-        conds.push(`LOWER(COALESCE(gender,'')) = $${idx++}`); params.push(gender.toLowerCase());
-      }
+      // Branch / Status / Agent / Gender filters (is + is-not combinable) — shared with getOldBookings
+      idx = pushTextFilters(conds, params, idx, {
+        branch, branchNot: req.query.branchNot,
+        status, statusNot: req.query.statusNot,
+        agent,  agentNot:  req.query.agentNot,
+        gender,
+      });
       // Booked On (booking_date) + Appointment-date filters — shared with getOldBookings
       idx = pushBookingDateFilters(conds, params, idx, {
         createdStartDate, createdEndDate, createdDateRange,
@@ -1471,7 +1493,7 @@ class BookingController {
       });
       if (search) {
         const q = `%${search.toLowerCase()}%`;
-        conds.push(`(LOWER(COALESCE(first_name,'')) LIKE $${idx} OR LOWER(COALESCE(last_name,'')) LIKE $${idx} OR (LOWER(COALESCE(first_name,'')) || ' ' || LOWER(COALESCE(last_name,''))) LIKE $${idx} OR LOWER(COALESCE(full_name_norm,'')) LIKE $${idx} OR LOWER(COALESCE(email,'')) LIKE $${idx} OR phone LIKE $${idx} OR LOWER(COALESCE(social_media,'')) LIKE $${idx} OR LOWER(COALESCE(agent,'')) LIKE $${idx} OR LOWER(COALESCE(treatment,'')) LIKE $${idx} OR LOWER(COALESCE(branch,'')) LIKE $${idx})`);
+        conds.push(`(LOWER(COALESCE(first_name,'')) LIKE $${idx} OR LOWER(COALESCE(last_name,'')) LIKE $${idx} OR (LOWER(COALESCE(first_name,'')) || ' ' || LOWER(COALESCE(last_name,''))) LIKE $${idx} OR LOWER(COALESCE(full_name_norm,'')) LIKE $${idx} OR LOWER(COALESCE(email,'')) LIKE $${idx} OR phone LIKE $${idx} OR LOWER(COALESCE(social_media,'')) LIKE $${idx} OR LOWER(COALESCE(agent,'')) LIKE $${idx} OR LOWER(COALESCE(treatment,'')) LIKE $${idx} OR LOWER(COALESCE(branch,'')) LIKE $${idx} OR LOWER(COALESCE(companion_first_name,'')) LIKE $${idx} OR LOWER(COALESCE(companion_last_name,'')) LIKE $${idx} OR (LOWER(COALESCE(companion_first_name,'')) || ' ' || LOWER(COALESCE(companion_last_name,''))) LIKE $${idx} OR LOWER(COALESCE(companion_full_name_norm,'')) LIKE $${idx})`);
         params.push(q); idx++;
       }
 
@@ -1604,6 +1626,98 @@ class BookingController {
     } catch (err) {
       console.error('Bulk update error:', err);
       res.status(500).json({ error: 'Failed to bulk update bookings' });
+    }
+  }
+
+  // ── bulkEdit ───────────────────────────────────────────────────────────────
+  // POST /api/bookings/bulk-edit   Body: { recordIds: [...], fields: { <field>: value } }
+  // Applies the same change to every selected booking (Admin only). Supported
+  // fields mirror the Master Bookings bulk-edit bar (#5 team request).
+  async bulkEdit(req, res) {
+    try {
+      if (req.user?.role !== 'Admin') {
+        return res.status(403).json({ error: 'Only admins can bulk-edit bookings' });
+      }
+      const { recordIds, fields } = req.body;
+      if (!Array.isArray(recordIds) || recordIds.length === 0) {
+        return res.status(400).json({ error: 'recordIds must be a non-empty array' });
+      }
+      if (recordIds.length > 200) {
+        return res.status(400).json({ error: 'Cannot bulk-edit more than 200 bookings at once' });
+      }
+      if (!fields || typeof fields !== 'object') {
+        return res.status(400).json({ error: 'fields must be an object' });
+      }
+
+      const TEXT_COLS = {
+        status:      'booking_status',
+        branch:      'branch',
+        agent:       'agent',
+        treatment:   'treatment',
+        paymentMode: 'payment_mode',
+        freebie:     'freebie',
+      };
+      const BOOL_COLS = {
+        isPromoHunter:  'is_promo_hunter',
+        isOts:          'is_ots',
+        isHighPriority: 'is_high_priority',
+        doNotCall:      'do_not_call',
+      };
+
+      const sets = [], params = [], changes = {};
+      let idx = 1;
+      for (const [key, col] of Object.entries(TEXT_COLS)) {
+        if (fields[key] === undefined) continue;
+        const v = String(fields[key]).trim();
+        if (!v && (key === 'status' || key === 'branch')) {
+          return res.status(400).json({ error: `${key} cannot be set to empty` });
+        }
+        sets.push(`${col} = $${idx++}`); params.push(v || null);
+        changes[col] = { to: v || null };
+      }
+      for (const [key, col] of Object.entries(BOOL_COLS)) {
+        if (fields[key] === undefined) continue;
+        const v = fields[key] === true;
+        sets.push(`${col} = $${idx++}`); params.push(v);
+        changes[col] = { to: v };
+      }
+      if (fields.followUpDate !== undefined) {
+        sets.push(`follow_up_date = $${idx++}`); params.push(fields.followUpDate || null);
+        changes.follow_up_date = { to: fields.followUpDate || null };
+      }
+      if (!sets.length) return res.status(400).json({ error: 'No fields to update' });
+
+      // Mirror single-edit behavior: stamp cancellation_time when bulk-setting Cancelled
+      if (fields.status && String(fields.status).toLowerCase().includes('cancel')) {
+        sets.push(`cancellation_time = CASE WHEN cancellation_time IS NULL THEN NOW() ELSE cancellation_time END`);
+      }
+      sets.push(`updated_at = NOW()`);
+
+      params.push(recordIds);
+      const { rowCount } = await pool.query(
+        `UPDATE bookings SET ${sets.join(', ')}
+         WHERE record_id = ANY($${idx}::text[]) AND record_status != 'DELETED'`,
+        params
+      );
+
+      if (rowCount > 0) {
+        const logParams = recordIds.flatMap(rid => [
+          rid,
+          req.user?.userId || null,
+          req.user?.name   || req.user?.email || 'System',
+          'BULK_EDIT',
+          JSON.stringify(changes)
+        ]);
+        await pool.query(
+          `INSERT INTO booking_activity_log (booking_id, user_id, user_name, action, changes) VALUES ${recordIds.map((_, i) => `($${i*5+1},$${i*5+2},$${i*5+3},$${i*5+4},$${i*5+5})`).join(',')}`,
+          logParams
+        ).catch(e => console.error('Bulk-edit activity log failed:', e.message));
+      }
+
+      res.json({ success: true, updated: rowCount, message: `${rowCount} booking(s) updated` });
+    } catch (err) {
+      console.error('Bulk edit error:', err);
+      res.status(500).json({ error: 'Failed to bulk edit bookings' });
     }
   }
 

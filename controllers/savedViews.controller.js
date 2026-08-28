@@ -1,11 +1,18 @@
 'use strict';
 const pool = require('../db/pool');
 
+// Views are scoped per page: 'bookings' (Master Bookings, the default),
+// 'daily-reports', or 'cc-report'.
+const normPage = (p) => {
+  const v = String(p || 'bookings').trim().toLowerCase();
+  return ['bookings', 'daily-reports', 'cc-report'].includes(v) ? v : 'bookings';
+};
+
 async function getAll(req, res) {
   try {
     const { rows } = await pool.query(
-      `SELECT id, name, filters, created_at FROM saved_views WHERE user_id = $1 ORDER BY created_at DESC`,
-      [req.user.userId]
+      `SELECT id, name, filters, created_at FROM saved_views WHERE user_id = $1 AND page = $2 ORDER BY created_at DESC`,
+      [req.user.userId, normPage(req.query.page)]
     );
     res.json({ success: true, views: rows });
   } catch (err) {
@@ -16,16 +23,16 @@ async function getAll(req, res) {
 
 async function create(req, res) {
   try {
-    const { name, filters } = req.body;
+    const { name, filters, page } = req.body;
     if (!name || !name.trim()) return res.status(400).json({ error: 'View name is required' });
     if (!filters || typeof filters !== 'object') return res.status(400).json({ error: 'filters must be an object' });
 
     const { rows } = await pool.query(
-      `INSERT INTO saved_views (user_id, name, filters)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (user_id, name) DO UPDATE SET filters = EXCLUDED.filters
+      `INSERT INTO saved_views (user_id, page, name, filters)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, page, name) DO UPDATE SET filters = EXCLUDED.filters
        RETURNING id, name, filters, created_at`,
-      [req.user.userId, name.trim(), JSON.stringify(filters)]
+      [req.user.userId, normPage(page), name.trim(), JSON.stringify(filters)]
     );
     res.status(201).json({ success: true, view: rows[0] });
   } catch (err) {
