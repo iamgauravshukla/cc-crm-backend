@@ -1,1486 +1,825 @@
-const sheetsService = require('../services/sheets.service');
-const { parseDateString, parsePrice, mapRowToBooking } = require('../utils/dataParser');
+'use strict';
+const pool = require('../db/pool');
 
-// ── Shared status helpers (single source of truth) ──────────────────────────
-const normalizeStatus = (status) => (status || '').toLowerCase().replace(/\s+/g, ' ').trim();
-const COMPLETED_STATUSES = new Set(['arrived not potential', 'arrived & bought', 'comeback & bought']);
-const ARRIVAL_STATUSES   = new Set(['arrived not potential', 'arrived & bought']);
-// ────────────────────────────────────────────────────────────────────────────
+const COMPLETED_IN = `LOWER(booking_status) IN ('arrived not potential','arrived & bought','comeback & bought')`;
+// An "arrival" = arrived status AND both validations Approved (Pending/Rejected excluded)
+// AND not flagged under Cancel Validation (those never count toward arrivals/arrival rate).
+const ARRIVAL_IN   = `(LOWER(booking_status) IN ('arrived not potential','arrived & bought') AND COALESCE(underage_status,'Approved') = 'Approved' AND COALESCE(db_status,'Approved') = 'Approved' AND NOT COALESCE(cancel_validation, false))`;
+const SALE_STATUSES = new Set(['arrived & bought','comeback & bought','arrived not potential']);
+const ARRIVAL_STATUSES = new Set(['arrived not potential','arrived & bought']);
 
-/**
- * Get comprehensive analytics for a specific branch or all branches
- * Query params: 
- *  - branch (optional - defaults to "All")
- *  - range (optional - "today", "week", "month", "quarter", "year", defaults to "year")
- */
+// Normalize helper expressions for SQL GROUP BY — keeps data consistent regardless of import casing
+const SQL_GENDER = `
+  CASE WHEN LOWER(gender) = 'female' THEN 'Female'
+       WHEN LOWER(gender) = 'male'   THEN 'Male'
+       ELSE COALESCE(NULLIF(TRIM(gender),''), 'Unknown') END`;
+
+const SQL_PAYMENT_MODE = `
+  CASE WHEN LOWER(payment_mode) LIKE 'cash%'   THEN 'Cash'
+       WHEN LOWER(payment_mode) LIKE 'debit%'  THEN 'Debit'
+       WHEN LOWER(payment_mode) LIKE 'credit%' THEN 'Credit'
+       ELSE COALESCE(NULLIF(TRIM(payment_mode),''), 'Unknown') END`;
+
+const SQL_TREATMENT = `UPPER(TRIM(treatment))`;
+const SQL_AGENT     = `UPPER(TRIM(agent))`;
+
+// ── WHERE clause builder ─────────────────────────────────────────────────────
+// Returns { conditions: string[], params: any[] } with record_status guard included.
+function buildFilter(branch, range, startDate, endDate) {
+  const c = ["record_status != 'DELETED'"];
+  const p = [];
+  let i   = 1;
+
+  if (branch && branch !== 'All') {
+    c.push(`branch = $${i++}`);
+    p.push(branch);
+  }
+
+  if (startDate && endDate) {
+    c.push(`appointment_date >= $${i++}::date AND appointment_date <= $${i++}::date`);
+    p.push(startDate, endDate);
+  } else if (range && range !== 'year') {
+    const dMap = { today: 0, week: 7, month: 30, quarter: 90 };
+    if (range === 'today') {
+      c.push("appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date");
+    } else if (dMap[range]) {
+      c.push(`appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${dMap[range]} days'`);
+    }
+  }
+
+  return { conds: c, params: p };
+}
+
+function w(conds) { return `WHERE ${conds.join(' AND ')}`; }
+
+// Builds WHERE for the period immediately before the current filter window
+function buildPrevFilter(branch, range, startDate, endDate) {
+  const c = ["record_status != 'DELETED'"];
+  const p = [];
+  let i = 1;
+  if (branch && branch !== 'All') { c.push(`branch = $${i++}`); p.push(branch); }
+  if (startDate && endDate) {
+    const ms   = new Date(endDate) - new Date(startDate) + 86400000;
+    const pEnd = new Date(new Date(startDate) - 86400000);
+    const pSt  = new Date(pEnd - ms + 86400000);
+    c.push(`appointment_date >= $${i++}::date AND appointment_date <= $${i++}::date`);
+    p.push(pSt.toISOString().split('T')[0], pEnd.toISOString().split('T')[0]);
+  } else {
+    const d = { today: 1, week: 7, month: 30, quarter: 90 }[range] || 0;
+    if (!d) { c.push('1=0'); return { conds: c, params: p }; } // year: no meaningful prev
+    if (d === 1) c.push("appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date - 1");
+    else c.push(`appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${d * 2} days' AND appointment_date < (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${d} days'`);
+  }
+  return { conds: c, params: p };
+}
+
+function rangeDays(range, startDate, endDate) {
+  if (startDate && endDate) return Math.max(1, Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1);
+  return { today: 1, week: 7, month: 30, quarter: 90, year: 365 }[range] || 365;
+}
+
+// ── getAnalytics ─────────────────────────────────────────────────────────────
+
 async function getAnalytics(req, res) {
   try {
-    const branch = req.query.branch || 'All';
-    const range = req.query.range || 'year';
+    const branch    = req.query.branch    || 'All';
+    const range     = req.query.range     || 'year';
     const startDate = req.query.startDate;
-    const endDate = req.query.endDate;
+    const endDate   = req.query.endDate;
 
-    // Read only from DB sheet (old bookings)
-    const dbRows = await sheetsService.readSheet('DB');
+    const { conds, params: P } = buildFilter(branch, range, startDate, endDate);
+    const WHERE = w(conds);
 
-    if (dbRows.length < 2) {
-      return res.json({
-        success: true,
-        data: {
-          branch,
-          range,
-          overview: {
-            totalBookings: 0,
-            totalRevenue: '0',
-            avgBookingValue: '0',
-            uniqueCustomers: 0,
-            repeatCustomerRate: 0,
-            statusBreakdown: {}
-          },
-          branchPerformance: [],
-          treatmentAnalysis: [],
-          revenueAnalysis: { byPaymentMode: [], byPriceRange: [] },
-          agentPerformance: [],
-          demographicAnalysis: { byGender: [], byAgeGroup: [] },
-          timeSeriesData: { byMonth: [] },
-          marketingChannels: []
-        }
-      });
-    }
+    // Append extra condition to params, returns new params array
+    const pWith = (...extra) => [...P, ...extra];
 
-    // Skip header row
-    const allBookings = dbRows.slice(1);
+    // For branch perf we always query all branches
+    const { conds: bConds, params: bP } = buildFilter('All', range, startDate, endDate);
+    const bWHERE = w(bConds);
 
-    // Filter by branch if not "All"
-    let filteredBookings = allBookings;
-    if (branch !== 'All') {
-      filteredBookings = allBookings.filter(row => row[1] === branch);
-    }
+    // Previous period for delta comparison
+    const { conds: pvConds, params: pvP } = buildPrevFilter(branch, range, startDate, endDate);
+    const pvWHERE = w(pvConds);
 
-    // Parse bookings with proper structure - CORRECTED COLUMN MAPPING for 44-column DB sheet
-    let bookings = filteredBookings.map((row, idx) => {
-      // Parse price - remove peso sign and any non-numeric characters except decimal point
-      let price = row[12] || '0';
-      if (typeof price === 'string') {
-        price = price.replace(/[^0-9.]/g, '');
+    const [
+      { rows: ovRows },
+      { rows: brRows },
+      { rows: trRows },
+      { rows: pyRows },
+      { rows: prRows },
+      { rows: agRows },
+      { rows: gnRows },
+      { rows: agAgeRows },
+      { rows: soRows },
+      { rows: tmRows },
+      { rows: pvRows },
+      { rows: fnRows },
+      { rows: dwRows }
+    ] = await Promise.all([
+      // 1. Overview: status breakdown + revenue (completed) + unique customers
+      pool.query(`
+        SELECT LOWER(booking_status) AS status, COUNT(*) AS total,
+               SUM(CASE WHEN ${COMPLETED_IN} THEN total_price ELSE 0 END) AS rev
+        FROM bookings ${WHERE}
+        GROUP BY LOWER(booking_status)`, P),
+
+      // 2. Branch performance (all branches, same date/filter)
+      pool.query(`
+        SELECT branch,
+               COUNT(*) AS total_bookings,
+               COUNT(*) FILTER (WHERE ${COMPLETED_IN}) AS completed,
+               COUNT(*) FILTER (WHERE ${ARRIVAL_IN})   AS arrivals,
+               SUM(CASE WHEN ${COMPLETED_IN} THEN total_price ELSE 0 END) AS revenue
+        FROM bookings ${bWHERE}
+        GROUP BY branch`, bP),
+
+      // 3. Treatment analysis (completed bookings only) — normalized to UPPER so case variants merge
+      pool.query(`
+        SELECT ${SQL_TREATMENT} AS treatment, COUNT(*) AS cnt, SUM(total_price) AS revenue
+        FROM bookings ${WHERE} AND ${COMPLETED_IN}
+        GROUP BY 1 ORDER BY cnt DESC LIMIT 15`, P),
+
+      // 4. Revenue by payment mode (completed only) — normalized so "Cash Payment" → "Cash" etc.
+      pool.query(`
+        SELECT ${SQL_PAYMENT_MODE} AS payment_mode, SUM(total_price) AS revenue
+        FROM bookings ${WHERE} AND ${COMPLETED_IN}
+        GROUP BY 1 ORDER BY revenue DESC`, P),
+
+      // 5. Price range distribution (completed only)
+      pool.query(`
+        SELECT
+          SUM(CASE WHEN total_price <= 1000                          THEN 1 ELSE 0 END) AS r0_1000,
+          SUM(CASE WHEN total_price > 1000 AND total_price <= 2000   THEN 1 ELSE 0 END) AS r1001_2000,
+          SUM(CASE WHEN total_price > 2000 AND total_price <= 3000   THEN 1 ELSE 0 END) AS r2001_3000,
+          SUM(CASE WHEN total_price > 3000 AND total_price <= 5000   THEN 1 ELSE 0 END) AS r3001_5000,
+          SUM(CASE WHEN total_price > 5000                           THEN 1 ELSE 0 END) AS r5000plus
+        FROM bookings ${WHERE} AND ${COMPLETED_IN}`, P),
+
+      // 6. Agent performance — normalized to UPPER so "Raiza" and "RAIZA" merge
+      pool.query(`
+        SELECT ${SQL_AGENT} AS agent,
+               COUNT(*) AS total_bookings,
+               COUNT(*) FILTER (WHERE ${COMPLETED_IN}) AS completed,
+               COUNT(*) FILTER (WHERE ${ARRIVAL_IN})   AS arrivals,
+               SUM(CASE WHEN ${COMPLETED_IN} THEN total_price ELSE 0 END) AS revenue
+        FROM bookings ${WHERE}
+        GROUP BY 1 ORDER BY revenue DESC`, P),
+
+      // 7. Gender distribution — normalized so "FEMALE" and "Female" merge
+      pool.query(`
+        SELECT ${SQL_GENDER} AS gender, COUNT(*) AS cnt FROM bookings ${WHERE}
+        GROUP BY 1`, P),
+
+      // 8. Age groups
+      pool.query(`
+        SELECT
+          SUM(CASE WHEN age BETWEEN 18 AND 25 THEN 1 ELSE 0 END) AS g18_25,
+          SUM(CASE WHEN age BETWEEN 26 AND 35 THEN 1 ELSE 0 END) AS g26_35,
+          SUM(CASE WHEN age BETWEEN 36 AND 45 THEN 1 ELSE 0 END) AS g36_45,
+          SUM(CASE WHEN age BETWEEN 46 AND 55 THEN 1 ELSE 0 END) AS g46_55,
+          SUM(CASE WHEN age >= 56             THEN 1 ELSE 0 END) AS g56plus
+        FROM bookings ${WHERE}`, P),
+
+      // 9. Social media / marketing channels
+      pool.query(`
+        SELECT social_media AS channel,
+               COUNT(*) AS bookings,
+               COUNT(*) FILTER (WHERE ${COMPLETED_IN}) AS completed,
+               SUM(CASE WHEN ${COMPLETED_IN} THEN total_price ELSE 0 END) AS revenue
+        FROM bookings ${WHERE}
+        GROUP BY social_media ORDER BY bookings DESC`, P),
+
+      // 10. Time series (monthly for year/quarter; daily otherwise)
+      // appointment_date IS NOT NULL guard prevents null x-axis labels (ApexCharts crashes on null.toString())
+      (!startDate && (range === 'year' || range === 'quarter'))
+        ? pool.query(`
+            SELECT TO_CHAR(appointment_date,'YYYY-MM') AS period,
+                   TO_CHAR(MIN(appointment_date),'Mon YYYY') AS label,
+                   COUNT(*) AS cnt, SUM(total_price) AS revenue
+            FROM bookings ${WHERE} AND appointment_date IS NOT NULL
+            GROUP BY TO_CHAR(appointment_date,'YYYY-MM') ORDER BY period`, P)
+        : pool.query(`
+            SELECT appointment_date::text AS period,
+                   TO_CHAR(appointment_date,'DD Mon') AS label,
+                   COUNT(*) AS cnt, SUM(total_price) AS revenue
+            FROM bookings ${WHERE} AND appointment_date IS NOT NULL
+            GROUP BY appointment_date ORDER BY appointment_date`, P),
+
+      // 11. Previous period overview for delta comparison
+      pool.query(`
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE ${COMPLETED_IN}) AS completed,
+               SUM(CASE WHEN ${COMPLETED_IN} THEN total_price ELSE 0 END) AS revenue
+        FROM bookings ${pvWHERE}`, pvP),
+
+      // 12. Conversion funnel counts
+      pool.query(`
+        SELECT COUNT(*) AS total_bookings,
+               COUNT(*) FILTER (WHERE LOWER(booking_status) = 'scheduled') AS scheduled,
+               COUNT(*) FILTER (WHERE ${ARRIVAL_IN}) AS arrived,
+               COUNT(*) FILTER (WHERE LOWER(booking_status) IN ('arrived & bought','comeback & bought')) AS bought,
+               COUNT(*) FILTER (WHERE LOWER(booking_status) LIKE '%cancel%') AS cancelled,
+               COUNT(*) FILTER (WHERE is_promo_hunter) AS promo_hunters
+        FROM bookings ${WHERE}`, P),
+
+      // 13. Bookings by day of week
+      pool.query(`
+        SELECT EXTRACT(DOW FROM appointment_date) AS dow,
+               COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE ${ARRIVAL_IN}) AS arrived
+        FROM bookings ${WHERE}
+        GROUP BY EXTRACT(DOW FROM appointment_date)
+        ORDER BY dow`, P)
+    ]);
+
+    // ── assemble overview ──
+    let totalBookings = 0, completedBookings = 0, completedRevenue = 0;
+    const statusBreakdown = {};
+    for (const r of ovRows) {
+      const n = parseInt(r.total);
+      totalBookings += n;
+      statusBreakdown[r.status] = n;
+      if (SALE_STATUSES.has(r.status)) {
+        completedRevenue += parseFloat(r.rev || 0);
+        completedBookings += n;
       }
-      const parsedPrice = parseFloat(price) || 0;
-      
+    }
+    // Unique customers via separate lightweight query
+    const { rows: uniqRows } = await pool.query(
+      `SELECT COUNT(DISTINCT LOWER(email)) AS uniq FROM bookings ${WHERE} AND (email IS NOT NULL AND email != '')`, P
+    );
+    const uniqueCustomers = parseInt(uniqRows[0]?.uniq || 0);
+    const repeatRate = totalBookings > 0
+      ? parseFloat(((totalBookings - uniqueCustomers) / totalBookings * 100).toFixed(1)) : 0;
+
+    // ── branch performance ──
+    const rd = rangeDays(range, startDate, endDate);
+    const rW = Math.max(1, rd / 7), rM = Math.max(1, rd / 30);
+    const branchPerformance = brRows.map(r => {
+      const tot = parseInt(r.total_bookings), comp = parseInt(r.completed);
+      const arr = parseInt(r.arrivals),       rev  = parseFloat(r.revenue);
       return {
-        timestamp: row[0] || '',
-        branch: row[1] || '',
-        status: row[2] || '',
-        date: row[3] || '',
-        firstName: row[4] || '',
-        lastName: row[5] || '',
-        age: parseInt(row[6]) || 0,
-        gender: row[7] || '',
-        treatment: row[8] || '',
-        area: row[9] || '',
-        freebie: row[10] || '',
-        companionTreatment: row[11] || '',
-        totalPrice: parsedPrice,
-        paymentMode: row[13] || '',
-        phone: row[14] || '',
-        socialMedia: row[15] || '',
-        email: row[16] || '',
-        agent: row[17] || '',
-        bookingDetails: row[18] || '',
-        adInteracted: row[19] || '',
-        companionFirstName: row[20] || '',
-        companionLastName: row[21] || '',
-        companionAge: row[22] || '',
-        companionGender: row[23] || '',
-        companionFreebie: row[24] || ''
+        name: r.branch || 'Unknown', bookings: comp, totalBookings: tot,
+        revenue: +rev.toFixed(2), avgBookingValue: comp > 0 ? +(rev / comp).toFixed(2) : 0,
+        arrivals: arr, arrivalRate: tot > 0 ? +(arr / tot * 100).toFixed(2) : 0,
+        avgWeeklyArrivals: +(arr / rW).toFixed(2), avgMonthlyArrivals: +(arr / rM).toFixed(2)
+      };
+    }).sort((a, b) => b.revenue - a.revenue);
+
+    // ── treatment ──
+    const treatmentAnalysis = trRows.map(r => {
+      const cnt = parseInt(r.cnt), rev = parseFloat(r.revenue);
+      return { name: r.treatment || 'Unknown', count: cnt, revenue: +rev.toFixed(2), avgPrice: cnt > 0 ? +(rev / cnt).toFixed(2) : 0 };
+    });
+
+    // ── revenue analysis ──
+    const byPaymentMode = pyRows.map(r => ({ mode: r.payment_mode || 'Unknown', revenue: +parseFloat(r.revenue).toFixed(2) }));
+    const pr = prRows[0] || {};
+    const byPriceRange = [
+      { range: '0-1000',    count: parseInt(pr.r0_1000    || 0) },
+      { range: '1001-2000', count: parseInt(pr.r1001_2000 || 0) },
+      { range: '2001-3000', count: parseInt(pr.r2001_3000 || 0) },
+      { range: '3001-5000', count: parseInt(pr.r3001_5000 || 0) },
+      { range: '5000+',     count: parseInt(pr.r5000plus  || 0) }
+    ];
+
+    // ── agent performance ──
+    const agentPerformance = agRows.map(r => {
+      const tot = parseInt(r.total_bookings), comp = parseInt(r.completed);
+      const arr = parseInt(r.arrivals),       rev  = parseFloat(r.revenue);
+      return {
+        name: r.agent || 'Unknown', bookings: tot, completedBookings: comp,
+        revenue: +rev.toFixed(2), avgBookingValue: comp > 0 ? +(rev / comp).toFixed(2) : 0,
+        arrivals: arr, arrivalRate: tot > 0 ? Math.round(arr / tot * 10000) / 100 : 0,
+        avgWeeklyArrivals: +(arr / rW).toFixed(2), avgMonthlyArrivals: +(arr / rM).toFixed(2)
       };
     });
 
-    const totalBeforeFilter = bookings.length;
+    // ── demographics ──
+    const byGender = gnRows.map(r => ({ gender: r.gender || 'Unknown', count: parseInt(r.cnt) }));
+    const aRow = agAgeRows[0] || {};
+    const byAgeGroup = [
+      { ageGroup: '18-25', count: parseInt(aRow.g18_25  || 0) },
+      { ageGroup: '26-35', count: parseInt(aRow.g26_35  || 0) },
+      { ageGroup: '36-45', count: parseInt(aRow.g36_45  || 0) },
+      { ageGroup: '46-55', count: parseInt(aRow.g46_55  || 0) },
+      { ageGroup: '56+',   count: parseInt(aRow.g56plus || 0) }
+    ];
 
-    // Filter by date range
-    bookings = filterByDateRange(bookings, range, startDate, endDate);
-    
-    console.log(`Analytics - Range: ${range}, StartDate: ${startDate}, EndDate: ${endDate}`);
-    console.log(`Analytics - Bookings before filter: ${totalBeforeFilter}, after filter: ${bookings.length}`);
-
-    // Calculate analytics
-    // For branch performance, use all parsed bookings (not filtered by branch)
-    const allParsedBookings = filteredBookings.map((row) => {
-      let price = row[12] || '0';
-      if (typeof price === 'string') {
-        price = price.replace(/[^0-9.]/g, '');
-      }
-      const parsedPrice = parseFloat(price) || 0;
-      
+    // ── marketing channels ──
+    const marketingChannels = soRows.map(r => {
+      const b = parseInt(r.bookings), c = parseInt(r.completed), rev = parseFloat(r.revenue);
       return {
-        timestamp: row[0] || '',
-        branch: row[1] || '',
-        status: row[2] || '',
-        date: row[3] || '',
-        firstName: row[4] || '',
-        lastName: row[5] || '',
-        age: parseInt(row[6]) || 0,
-        gender: row[7] || '',
-        treatment: row[8] || '',
-        area: row[9] || '',
-        freebie: row[10] || '',
-        companionTreatment: row[11] || '',
-        totalPrice: parsedPrice,
-        paymentMode: row[13] || '',
-        phone: row[14] || '',
-        socialMedia: row[15] || '',
-        email: row[16] || '',
-        agent: row[17] || '',
-        bookingDetails: row[18] || '',
-        adInteracted: row[19] || '',
-        companionFirstName: row[20] || '',
-        companionLastName: row[21] || '',
-        companionAge: row[22] || '',
-        companionGender: row[23] || '',
-        companionFreebie: row[24] || ''
+        channel: r.channel || 'Unknown', bookings: b, completedBookings: c,
+        revenue: +rev.toFixed(2),
+        conversionRate: b > 0 ? +(c / b * 100).toFixed(1) : 0,
+        avgRevenuePerBooking: c > 0 ? +(rev / c).toFixed(2) : 0
       };
     });
-    
-    const analytics = {
-      branch,
-      range: startDate && endDate ? `${startDate} to ${endDate}` : range,
-      overview: calculateOverview(bookings),
-      branchPerformance: branch === 'All' ? calculateBranchPerformance(filterByDateRange(allParsedBookings, range, startDate, endDate), range, startDate, endDate) : [],
-      treatmentAnalysis: calculateTreatmentAnalysis(bookings),
-      revenueAnalysis: calculateRevenueAnalysis(bookings),
-      agentPerformance: calculateAgentPerformance(bookings, range, startDate, endDate),
-      demographicAnalysis: calculateDemographicAnalysis(bookings),
-      timeSeriesData: calculateTimeSeriesData(bookings, range, startDate, endDate),
-      marketingChannels: calculateMarketingChannels(bookings)
+
+    // ── time series ──
+    const byMonth = tmRows
+      .filter(r => r.label != null)
+      .map(r => ({
+        month: r.label, count: parseInt(r.cnt), revenue: +parseFloat(r.revenue || 0).toFixed(2)
+      }));
+
+    // ── previous period ──
+    const pvRow = pvRows[0] || {};
+    const previousOverview = {
+      totalBookings:     parseInt(pvRow.total    || 0),
+      completedBookings: parseInt(pvRow.completed|| 0),
+      totalRevenue:      +parseFloat(pvRow.revenue || 0).toFixed(2)
     };
+
+    // ── funnel ──
+    const fnRow = fnRows[0] || {};
+    const funnelData = {
+      totalBookings: parseInt(fnRow.total_bookings || 0),
+      scheduled:     parseInt(fnRow.scheduled      || 0),
+      arrived:       parseInt(fnRow.arrived        || 0),
+      bought:        parseInt(fnRow.bought         || 0),
+      cancelled:     parseInt(fnRow.cancelled      || 0),
+      promoHunters:  parseInt(fnRow.promo_hunters  || 0)
+    };
+
+    // ── day of week ──
+    const DOW_LABELS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const dayOfWeekData = DOW_LABELS.map((day, idx) => {
+      const r = dwRows.find(r => parseInt(r.dow) === idx) || {};
+      return { dow: idx, day, total: parseInt(r.total || 0), arrived: parseInt(r.arrived || 0) };
+    });
+
+    // ── auto insights ──
+    const insights = [];
+    const currentRevenue = +completedRevenue.toFixed(2);
+    if (previousOverview.totalRevenue > 0) {
+      const pct = (currentRevenue - previousOverview.totalRevenue) / previousOverview.totalRevenue * 100;
+      insights.push({ type: pct >= 0 ? 'positive' : 'negative',
+        text: `Revenue ${pct >= 0 ? '▲' : '▼'}${Math.abs(pct).toFixed(1)}% vs previous period (₱${Math.round(previousOverview.totalRevenue).toLocaleString()} → ₱${Math.round(currentRevenue).toLocaleString()})` });
+    }
+    if (funnelData.totalBookings > 0) {
+      const arrRate  = (funnelData.arrived / funnelData.totalBookings * 100).toFixed(1);
+      const convRate = funnelData.arrived > 0 ? (funnelData.bought / funnelData.arrived * 100).toFixed(1) : '0';
+      insights.push({ type: parseFloat(arrRate) >= 55 ? 'positive' : 'warning',
+        text: `${arrRate}% arrival rate · ${convRate}% of arrivals converted to sales` });
+    }
+    if (branch === 'All' && branchPerformance.length > 0) {
+      const best = branchPerformance[0];
+      insights.push({ type: 'positive',
+        text: `Top branch: ${best.name} — ₱${best.revenue.toLocaleString()} revenue, ${best.arrivalRate}% arrival rate` });
+      const byArr = [...branchPerformance].filter(b => b.totalBookings >= 10).sort((a, b) => a.arrivalRate - b.arrivalRate);
+      if (byArr.length > 0 && byArr[0].arrivalRate < 50)
+        insights.push({ type: 'warning',
+          text: `${byArr[0].name} has the lowest arrival rate at ${byArr[0].arrivalRate}% — may need follow-up attention` });
+    }
+    if (dayOfWeekData.some(d => d.total > 0)) {
+      const peak = dayOfWeekData.reduce((a, b) => b.total > a.total ? b : a);
+      insights.push({ type: 'info',
+        text: `Busiest day: ${peak.day} with ${peak.total} bookings` });
+    }
+    if (marketingChannels.length > 0) {
+      const top = [...marketingChannels].filter(c => c.bookings >= 5).sort((a, b) => b.conversionRate - a.conversionRate)[0];
+      if (top) insights.push({ type: 'positive',
+        text: `Best channel: "${top.channel}" at ${top.conversionRate}% conversion rate` });
+    }
 
     res.json({
       success: true,
-      data: analytics
+      data: {
+        branch,
+        range: startDate && endDate ? `${startDate} to ${endDate}` : range,
+        overview: { totalBookings, completedBookings, totalRevenue: +completedRevenue.toFixed(2),
+          avgBookingValue: completedBookings > 0 ? +(completedRevenue / completedBookings).toFixed(2) : 0,
+          uniqueCustomers, repeatCustomerRate: repeatRate, statusBreakdown },
+        branchPerformance: branch === 'All' ? branchPerformance : [],
+        treatmentAnalysis,
+        revenueAnalysis: { byPaymentMode, byPriceRange },
+        agentPerformance,
+        demographicAnalysis: { byGender, byAgeGroup },
+        timeSeriesData: { byMonth },
+        marketingChannels,
+        previousOverview,
+        funnelData,
+        dayOfWeekData,
+        insights
+      }
     });
-
-  } catch (error) {
-    console.error('Analytics error:', error);
+  } catch (err) {
+    console.error('Analytics error:', err);
     res.status(500).json({ error: 'Failed to fetch analytics' });
   }
 }
 
-function filterByDateRange(bookings, range, startDate, endDate) {
-  // Handle custom date range
-  if (startDate && endDate) {
-    const start = new Date(startDate);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(endDate);
-    end.setHours(23, 59, 59, 999);
+// ── getAgentPerformance ──────────────────────────────────────────────────────
 
-    return bookings.filter(b => {
-      if (!b.date) return false;
-      
-      try {
-        const bookingDate = parseDateString(b.date);
-        if (bookingDate && !isNaN(bookingDate.getTime())) {
-          return bookingDate >= start && bookingDate <= end;
-        }
-      } catch (err) {
-        return false;
-      }
-      return false;
-    });
-  }
-
-  // If range is 'year', just return all bookings (don't filter by date)
-  // This ensures we get data even if dates are in weird formats
-  if (range === 'year') {
-    return bookings;
-  }
-
-  const now = new Date();
-  // Reset time to start of day for accurate comparisons
-  now.setHours(0, 0, 0, 0);
-  
-  let cutoffDate = new Date(now);
-
-  switch(range) {
-    case 'today':
-      // cutoffDate is already set to start of today
-      break;
-    case 'week':
-      // Go back 7 days from today
-      cutoffDate.setDate(cutoffDate.getDate() - 7);
-      break;
-    case 'month':
-      // Go back 30 days from today
-      cutoffDate.setDate(cutoffDate.getDate() - 30);
-      break;
-    case 'quarter':
-      // Go back 90 days from today
-      cutoffDate.setDate(cutoffDate.getDate() - 90);
-      break;
-    default:
-      // For any unknown range, return all bookings
-      return bookings;
-  }
-
-  let debugCount = 0;
-  const filtered = bookings.filter(b => {
-    if (!b.date) {
-      // If no date, exclude it from filtered results
-      return false;
-    }
-    
-    try {
-      const bookingDate = parseDateString(b.date);
-      
-      if (bookingDate && !isNaN(bookingDate.getTime())) {
-        const isInRange = bookingDate >= cutoffDate;
-        // Debug: Log first 3 comparisons
-        if (debugCount < 3) {
-          console.log(`Date comparison - Booking: ${b.date}, Parsed: ${bookingDate.toISOString()}, Cutoff: ${cutoffDate.toISOString()}, InRange: ${isInRange}`);
-          debugCount++;
-        }
-        return isInRange;
-      }
-      
-      // If we couldn't parse the date, exclude it
-      return false;
-    } catch (error) {
-      // If error parsing, exclude it
-      return false;
-    }
-  });
-
-  console.log(`FilterByDateRange - Range: ${range}, Filtered: ${filtered.length} of ${bookings.length}`);
-  return filtered;
-}
-
-function calculateOverview(bookings) {
-    const completedBookings = bookings.filter(b => COMPLETED_STATUSES.has(normalizeStatus(b.status)));
-
-    const totalBookings = bookings.length;
-    const totalRevenue = completedBookings.reduce((sum, b) => sum + b.totalPrice, 0);
-    const avgBookingValue = completedBookings.length > 0 ? totalRevenue / completedBookings.length : 0;
-    
-    const statusCounts = {};
-    bookings.forEach(b => {
-      statusCounts[b.status] = (statusCounts[b.status] || 0) + 1;
-    });
-
-    const uniqueCustomers = new Set(bookings.map(b => b.email.toLowerCase())).size;
-    const repeatCustomerRate = totalBookings > 0 
-      ? ((totalBookings - uniqueCustomers) / totalBookings * 100).toFixed(1)
-      : 0;
-
-    return {
-      totalBookings,
-      completedBookings: completedBookings.length,
-      totalRevenue: totalRevenue.toFixed(2),
-      avgBookingValue: avgBookingValue.toFixed(2),
-      uniqueCustomers,
-      repeatCustomerRate: parseFloat(repeatCustomerRate),
-      statusBreakdown: statusCounts
-    };
-}
-
-function calculateBranchPerformance(bookings, range, startDate, endDate) {
-    // Compute range length in days for weekly/monthly averages
-    let rangeDays = 365; // default for 'year'
-    if (startDate && endDate) {
-      const s = new Date(startDate);
-      const e = new Date(endDate);
-      rangeDays = Math.max(1, Math.round((e - s) / (1000 * 60 * 60 * 24)) + 1);
-    } else {
-      switch (range) {
-        case 'today': rangeDays = 1; break;
-        case 'week': rangeDays = 7; break;
-        case 'month': rangeDays = 30; break;
-        case 'quarter': rangeDays = 90; break;
-        case 'year': rangeDays = 365; break;
-        default: rangeDays = 365;
-      }
-    }
-    const rangeWeeks = Math.max(1, rangeDays / 7);
-    const rangeMonths = Math.max(1, rangeDays / 30);
-
-    const branches = {};
-
-    bookings.forEach(booking => {
-      const branch = booking.branch || 'Unknown';
-      const statusNorm = normalizeStatus(booking.status);
-
-      if (!branches[branch]) {
-        branches[branch] = {
-          name: branch,
-          totalBookings: 0,
-          completedBookings: 0,
-          arrivals: 0,
-          revenue: 0
-        };
-      }
-
-      branches[branch].totalBookings++;
-
-      if (COMPLETED_STATUSES.has(statusNorm)) {
-        branches[branch].completedBookings++;
-        branches[branch].revenue += booking.totalPrice;
-      }
-
-      if (ARRIVAL_STATUSES.has(statusNorm)) {
-        branches[branch].arrivals++;
-      }
-    });
-
-    return Object.values(branches)
-      .map(b => ({
-        name: b.name,
-        bookings: b.completedBookings,
-        totalBookings: b.totalBookings,
-        revenue: parseFloat(b.revenue.toFixed(2)),
-        avgBookingValue: b.completedBookings > 0 ? parseFloat((b.revenue / b.completedBookings).toFixed(2)) : 0,
-        arrivals: b.arrivals,
-        arrivalRate: b.totalBookings > 0 ? parseFloat((b.arrivals / b.totalBookings * 100).toFixed(2)) : 0,
-        avgWeeklyArrivals: parseFloat((b.arrivals / rangeWeeks).toFixed(2)),
-        avgMonthlyArrivals: parseFloat((b.arrivals / rangeMonths).toFixed(2))
-      }))
-      .sort((a, b) => b.revenue - a.revenue);
-}
-
-function calculateTreatmentAnalysis(bookings) {
-    const completedBookings = bookings.filter(b => COMPLETED_STATUSES.has(normalizeStatus(b.status)));
-
-    const treatments = {};
-    
-    completedBookings.forEach(b => {
-      const treatment = b.treatment || 'Unknown';
-      
-      if (!treatments[treatment]) {
-        treatments[treatment] = {
-          name: treatment,
-          count: 0,
-          revenue: 0
-        };
-      }
-      
-      treatments[treatment].count++;
-      treatments[treatment].revenue += b.totalPrice;
-    });
-
-    return Object.values(treatments)
-      .map(t => ({
-        ...t,
-        revenue: parseFloat(t.revenue.toFixed(2)),
-        avgPrice: parseFloat((t.revenue / t.count).toFixed(2))
-      }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 15); // Top 15 treatments
-}
-
-function calculateRevenueAnalysis(bookings) {
-    const completedBookings = bookings.filter(b => COMPLETED_STATUSES.has(normalizeStatus(b.status)));
-
-    const byPaymentMode = {};
-    
-    completedBookings.forEach(b => {
-      const mode = b.paymentMode || 'Unknown';
-      byPaymentMode[mode] = (byPaymentMode[mode] || 0) + b.totalPrice;
-    });
-
-    const paymentModes = Object.entries(byPaymentMode).map(([mode, revenue]) => ({
-      mode,
-      revenue: parseFloat(revenue.toFixed(2))
-    })).sort((a, b) => b.revenue - a.revenue);
-
-    // Revenue by price range (using completed bookings only)
-    const priceRanges = {
-      '0-1000': 0,
-      '1001-2000': 0,
-      '2001-3000': 0,
-      '3001-5000': 0,
-      '5000+': 0
-    };
-
-    completedBookings.forEach(b => {
-      const price = b.totalPrice;
-      if (price <= 1000) priceRanges['0-1000']++;
-      else if (price <= 2000) priceRanges['1001-2000']++;
-      else if (price <= 3000) priceRanges['2001-3000']++;
-      else if (price <= 5000) priceRanges['3001-5000']++;
-      else priceRanges['5000+']++;
-    });
-
-    return {
-      byPaymentMode: paymentModes,
-      byPriceRange: Object.entries(priceRanges).map(([range, count]) => ({
-        range,
-        count
-      }))
-    };
-}
-
-function calculateAgentPerformance(bookings, range, startDate, endDate) {
-    const agents = {};
-
-    // Compute range length for weekly/monthly averages
-    let rangeDays = 365;
-    if (startDate && endDate) {
-      const s = new Date(startDate);
-      const e = new Date(endDate);
-      rangeDays = Math.max(1, Math.round((e - s) / (1000 * 60 * 60 * 24)) + 1);
-    } else {
-      switch (range) {
-        case 'today':   rangeDays = 1;   break;
-        case 'week':    rangeDays = 7;   break;
-        case 'month':   rangeDays = 30;  break;
-        case 'quarter': rangeDays = 90;  break;
-        case 'year':    rangeDays = 365; break;
-        default:        rangeDays = 365;
-      }
-    }
-    const rangeWeeks  = Math.max(1, rangeDays / 7);
-    const rangeMonths = Math.max(1, rangeDays / 30);
-    
-    bookings.forEach(b => {
-      const agent = b.agent || 'Unknown';
-      
-      if (!agents[agent]) {
-        agents[agent] = {
-          name: agent,
-          bookings: 0,
-          completedBookings: 0,
-          revenue: 0,
-          arrivals: 0
-        };
-      }
-      
-      agents[agent].bookings++;
-      
-      const statusNormalized = normalizeStatus(b.status);
-      if (ARRIVAL_STATUSES.has(statusNormalized)) {
-        agents[agent].arrivals++;
-      }
-
-      if (COMPLETED_STATUSES.has(statusNormalized)) {
-        agents[agent].completedBookings++;
-        agents[agent].revenue += b.totalPrice;
-      }
-    });
-
-    return Object.values(agents)
-      .map(a => ({
-        ...a,
-        revenue: parseFloat(a.revenue.toFixed(2)),
-        avgBookingValue: a.completedBookings > 0 ? parseFloat((a.revenue / a.completedBookings).toFixed(2)) : 0,
-        arrivalRate: a.bookings > 0 ? Math.round((a.arrivals / a.bookings) * 10000) / 100 : 0,
-        avgWeeklyArrivals:  parseFloat((a.arrivals / rangeWeeks).toFixed(2)),
-        avgMonthlyArrivals: parseFloat((a.arrivals / rangeMonths).toFixed(2))
-      }))
-      .sort((a, b) => b.revenue - a.revenue);
-}
-
-function calculateDemographicAnalysis(bookings) {
-    const byGender = {};
-    const byAgeGroup = {
-      '18-25': 0,
-      '26-35': 0,
-      '36-45': 0,
-      '46-55': 0,
-      '56+': 0
-    };
-
-    bookings.forEach(b => {
-      // Gender
-      const gender = b.gender || 'Unknown';
-      byGender[gender] = (byGender[gender] || 0) + 1;
-
-      // Age group
-      const age = b.age;
-      if (age >= 18 && age <= 25) byAgeGroup['18-25']++;
-      else if (age >= 26 && age <= 35) byAgeGroup['26-35']++;
-      else if (age >= 36 && age <= 45) byAgeGroup['36-45']++;
-      else if (age >= 46 && age <= 55) byAgeGroup['46-55']++;
-      else if (age >= 56) byAgeGroup['56+']++;
-    });
-
-    return {
-      byGender: Object.entries(byGender).map(([gender, count]) => ({
-        gender,
-        count
-      })),
-      byAgeGroup: Object.entries(byAgeGroup).map(([ageGroup, count]) => ({
-        ageGroup,
-        count
-      }))
-    };
-}
-
-function calculateTimeSeriesData(bookings, range, startDate, endDate) {
-    if (bookings.length === 0) {
-      return { byMonth: [] };
-    }
-    
-    const monthNamesFull = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    
-    // Determine grouping based on date range span
-    let daySpan;
-    let groupByDay = false;
-    let groupByWeek = false;
-    let groupByMonth = false;
-    
-    if (startDate && endDate) {
-      // Custom date range - calculate span
-      const start = new Date(startDate);
-      const end = new Date(endDate);
-      daySpan = Math.ceil((end - start) / (1000 * 60 * 60 * 24));
-      
-      if (daySpan <= 31) {
-        groupByDay = true;
-      } else if (daySpan <= 90) {
-        groupByWeek = true;
-      } else {
-        groupByMonth = true;
-      }
-    } else {
-      // Preset ranges
-      switch(range) {
-        case 'today':
-        case 'week':
-        case 'month':
-          groupByDay = true;
-          daySpan = range === 'today' ? 1 : range === 'week' ? 7 : 30;
-          break;
-        case 'quarter':
-          groupByWeek = true;
-          daySpan = 90;
-          break;
-        case 'year':
-        default:
-          groupByMonth = true;
-          daySpan = 365;
-          break;
-      }
-    }
-    
-    const timeSeriesData = {};
-    
-    bookings.forEach(b => {
-      if (!b.date) return;
-      
-      try {
-        const bookingDate = parseDateString(b.date);
-        if (!bookingDate || isNaN(bookingDate.getTime())) return;
-        
-        let key;
-        let label;
-        
-        if (groupByDay) {
-          // Group by day: "Jan 28"
-          const day = bookingDate.getDate();
-          const month = monthNamesFull[bookingDate.getMonth()];
-          const year = bookingDate.getFullYear();
-          key = `${year}-${(bookingDate.getMonth() + 1).toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`;
-          label = `${month} ${day}`;
-        } else if (groupByWeek) {
-          // Group by week: "Week of Jan 21"
-          const weekStart = new Date(bookingDate);
-          weekStart.setDate(bookingDate.getDate() - bookingDate.getDay()); // Start of week (Sunday)
-          const month = monthNamesFull[weekStart.getMonth()];
-          const day = weekStart.getDate();
-          const year = weekStart.getFullYear();
-          key = `${year}-${(weekStart.getMonth() + 1).toString().padStart(2, '0')}-W${Math.ceil(day / 7)}`;
-          label = `Week of ${month} ${day}`;
-        } else {
-          // Group by month: "Jan 2026"
-          const month = monthNamesFull[bookingDate.getMonth()];
-          const year = bookingDate.getFullYear();
-          key = `${year}-${(bookingDate.getMonth() + 1).toString().padStart(2, '0')}`;
-          label = `${month} ${year}`;
-        }
-        
-        if (!timeSeriesData[key]) {
-          timeSeriesData[key] = { 
-            key,
-            label,
-            count: 0, 
-            revenue: 0,
-            sortDate: bookingDate.getTime()
-          };
-        }
-        
-        timeSeriesData[key].count++;
-        timeSeriesData[key].revenue += b.totalPrice;
-      } catch (error) {
-        // Skip invalid dates
-      }
-    });
-
-    // Convert to array and sort by date
-    const sortedData = Object.values(timeSeriesData)
-      .sort((a, b) => a.sortDate - b.sortDate)
-      .map(item => ({
-        month: item.label, // Keep property name as "month" for backwards compatibility
-        count: item.count,
-        revenue: parseFloat(item.revenue.toFixed(2))
-      }));
-
-    return {
-      byMonth: sortedData
-    };
-}
-
-function calculateMarketingChannels(bookings) {
-    const channels = {};
-    
-    bookings.forEach(b => {
-      const channel = b.socialMedia || 'Unknown';
-      
-      if (!channels[channel]) {
-        channels[channel] = { channel, bookings: 0, completedBookings: 0, revenue: 0 };
-      }
-      
-      channels[channel].bookings++;
-      // Only count revenue from completed/arrived bookings
-      if (COMPLETED_STATUSES.has(normalizeStatus(b.status))) {
-        channels[channel].completedBookings++;
-        channels[channel].revenue += b.totalPrice;
-      }
-    });
-
-    return Object.values(channels)
-      .map(c => ({
-        channel: c.channel,
-        bookings: c.bookings,
-        completedBookings: c.completedBookings,
-        revenue: parseFloat(c.revenue.toFixed(2)),
-        conversionRate: c.bookings > 0 ? parseFloat((c.completedBookings / c.bookings * 100).toFixed(1)) : 0,
-        avgRevenuePerBooking: c.completedBookings > 0 ? parseFloat((c.revenue / c.completedBookings).toFixed(2)) : 0
-      }))
-      .sort((a, b) => b.bookings - a.bookings);
-}
-
-/**
- * Get agent performance metrics
- * Query params:
- *  - days (optional - defaults to 30)
- */
 async function getAgentPerformance(req, res) {
   try {
-    const days = parseInt(req.query.days) || 30;
+    const days      = Math.max(1, Math.min(365, Math.floor(parseInt(req.query.days) || 30)));
     const startDate = req.query.startDate;
-    const endDate = req.query.endDate;
-    
-    // Read from DB sheet
-    const dbRows = await sheetsService.readSheet('DB');
-    
-    if (dbRows.length < 2) {
-      return res.json({
-        success: true,
-        data: {
-          summary: {
-            totalAgents: 0,
-            totalBookings: 0,
-            totalRevenue: 0,
-            avgConversion: 0
-          },
-          agents: []
-        }
-      });
-    }
+    const endDate   = req.query.endDate;
 
-    // Calculate date threshold or use custom dates
-    let filterFunction;
-    
+    const SKIP_AGENTS = `agent IS NOT NULL AND TRIM(LOWER(agent)) NOT IN ('unknown','no data','n/a','-','','none','unassigned')`;
+    const VAL_FILTER  = `COALESCE(underage_status,'Approved') = 'Approved' AND COALESCE(db_status,'Approved') = 'Approved'`;
+
+    let WHERE, params;
     if (startDate && endDate) {
-      const start = new Date(startDate);
-      start.setHours(0, 0, 0, 0);
-      const end = new Date(endDate);
-      end.setHours(23, 59, 59, 999);
-      
-      filterFunction = (dateStr) => {
-        if (!dateStr) return false;
-        try {
-          const bookingDate = parseDateString(dateStr);
-          return bookingDate && !isNaN(bookingDate.getTime()) && bookingDate >= start && bookingDate <= end;
-        } catch {
-          return false;
-        }
-      };
+      WHERE  = `WHERE record_status != 'DELETED' AND ${VAL_FILTER} AND appointment_date >= $1::date AND appointment_date <= $2::date AND ${SKIP_AGENTS}`;
+      params = [startDate, endDate];
     } else {
-      const cutoffDate = new Date();
-      cutoffDate.setDate(cutoffDate.getDate() - days);
-      
-      filterFunction = (dateStr) => {
-        if (!dateStr) return false;
-        try {
-          const bookingDate = parseDateString(dateStr);
-          return bookingDate && !isNaN(bookingDate.getTime()) && bookingDate >= cutoffDate;
-        } catch {
-          return false;
-        }
-      };
+      WHERE  = `WHERE record_status != 'DELETED' AND ${VAL_FILTER} AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${days} days' AND ${SKIP_AGENTS}`;
+      params = [];
     }
 
-    // Parse bookings with date filter
-    const recentBookings = dbRows.slice(1).filter(row => {
-      return filterFunction(row[3]); // row[3] is the date column
-    }).map(row => {
-      // Parse price - remove peso sign and any non-numeric characters except decimal point
-      let price = row[12] || '0';
-      if (typeof price === 'string') {
-        price = price.replace(/[^0-9.]/g, '');
-      }
-      const parsedPrice = parseFloat(price) || 0;
-      
+    const { rows } = await pool.query(`
+      SELECT
+        ${SQL_AGENT} AS agent,
+        COUNT(*) AS bookings,
+        COUNT(*) FILTER (WHERE ${COMPLETED_IN})    AS completed,
+        COUNT(*) FILTER (WHERE ${ARRIVAL_IN})      AS arrivals,
+        COUNT(*) FILTER (WHERE LOWER(booking_status) = 'scheduled')   AS scheduled,
+        COUNT(*) FILTER (WHERE LOWER(booking_status) LIKE '%cancel%')  AS cancelled,
+        COUNT(*) FILTER (WHERE is_promo_hunter) AS promo_hunters,
+        SUM(CASE WHEN ${COMPLETED_IN} THEN total_price ELSE 0 END) AS revenue
+      FROM bookings ${WHERE}
+      GROUP BY 1 ORDER BY revenue DESC
+    `, params);
+
+    // Per-agent status breakdown — drives the per-agent modal chart (booking counts by
+    // status: Arrived & Bought / Arrived Not Potential / Cancelled / Scheduled / …).
+    const { rows: sbRows } = await pool.query(`
+      SELECT ${SQL_AGENT} AS agent, LOWER(TRIM(booking_status)) AS status, COUNT(*)::int AS n
+      FROM bookings ${WHERE} AND NULLIF(TRIM(booking_status), '') IS NOT NULL
+      GROUP BY 1, 2
+    `, params);
+    const titleCase = (s) => String(s).replace(/\b\w/g, (c) => c.toUpperCase());
+    const statusByAgent = {};
+    for (const r of sbRows) {
+      (statusByAgent[r.agent] = statusByAgent[r.agent] || {})[titleCase(r.status)] = r.n;
+    }
+
+    // Per-agent treatment distribution — drives the "Treatment Distribution by Agent" section.
+    const { rows: trRows } = await pool.query(`
+      SELECT ${SQL_AGENT} AS agent, UPPER(TRIM(treatment)) AS treatment, COUNT(*)::int AS n
+      FROM bookings ${WHERE} AND NULLIF(TRIM(treatment), '') IS NOT NULL
+      GROUP BY 1, 2
+    `, params);
+    const treatmentsByAgent = {};
+    for (const r of trRows) {
+      (treatmentsByAgent[r.agent] = treatmentsByAgent[r.agent] || []).push({ name: r.treatment, count: r.n });
+    }
+    for (const a of Object.keys(treatmentsByAgent)) {
+      treatmentsByAgent[a].sort((x, y) => y.count - x.count);
+    }
+
+    const rd = startDate && endDate
+      ? Math.max(1, Math.round((new Date(endDate) - new Date(startDate)) / 86400000) + 1) : days;
+    const rW = Math.max(1, rd / 7), rM = Math.max(1, rd / 30);
+
+    const agents = rows.map(r => {
+      const tot = parseInt(r.bookings), comp = parseInt(r.completed);
+      const arr = parseInt(r.arrivals), rev  = parseFloat(r.revenue);
       return {
-        timestamp: row[0] || '',
-        branch: row[1] || '',
-        status: row[2] || '',
-        date: row[3] || '',
-        firstName: row[4] || '',
-        lastName: row[5] || '',
-        age: parseInt(row[6]) || 0,
-        gender: row[7] || '',
-        treatment: row[8] || '',
-        area: row[9] || '',
-        freebie: row[10] || '',
-        companionTreatment: row[11] || '',
-        totalPrice: parsedPrice,
-        paymentMode: row[13] || '',
-        phone: row[14] || '',
-        socialMedia: row[15] || '',
-        email: row[16] || '',
-        agent: row[17] || '',
-        bookingDetails: row[18] || '',
-        adInteracted: row[19] || '',
-        promoHunterStatus: row[30] || '',
-        // Exclusion flags — col 44 = cancel_validation, col 45 = underage_validation
-        cancelValidation:   (row[44] || '').toString().toUpperCase() === 'TRUE',
-        underageValidation: (row[45] || '').toString().toUpperCase() === 'TRUE'
+        name: r.agent, bookings: tot, completedBookings: comp,
+        revenue: +rev.toFixed(2), avgBookingValue: comp > 0 ? +(rev / comp).toFixed(2) : 0,
+        conversionRate: tot > 0 ? +(comp / tot * 100).toFixed(2) : 0,
+        arrivalRate:    tot > 0 ? Math.round(arr / tot * 10000) / 100 : 0,
+        arrivals: arr, avgWeeklyArrivals: +(arr / rW).toFixed(2), avgMonthlyArrivals: +(arr / rM).toFixed(2),
+        converted: comp, scheduled: parseInt(r.scheduled), cancelled: parseInt(r.cancelled),
+        promoHunters: parseInt(r.promo_hunters),
+        statusBreakdown: statusByAgent[r.agent] || {},
+        treatments: treatmentsByAgent[r.agent] || []
       };
     });
 
-    // Group by agent
-    const agentStats = {};
-    const PLACEHOLDER_AGENTS = new Set(['unknown', 'no data', 'n/a', '-', '', 'none', 'unassigned']);
-    
-    recentBookings.forEach(booking => {
-      const agent = booking.agent || 'Unknown';
-      if (PLACEHOLDER_AGENTS.has(agent.toLowerCase().trim())) return; // skip non-agents
-      if (booking.cancelValidation)   return; // cancel_validation: exclude entirely from agent stats
-      if (booking.underageValidation) return; // underage_validation: exclude entirely from agent stats
-      
-      if (!agentStats[agent]) {
-        agentStats[agent] = {
-          name: agent,
-          bookings: 0,
-          completedBookings: 0,
-          revenue: 0,
-          converted: 0,
-          scheduled: 0,
-          cancelled: 0,
-          arrivals: 0,
-          promoHunters: 0,
-          treatments: {},
-          branches: {}
-        };
-      }
-      
-      const stats = agentStats[agent];
-      stats.bookings++;
-      
-      // Track status
-      const statusNormalized = normalizeStatus(booking.status);
-      if (COMPLETED_STATUSES.has(statusNormalized)) {
-        stats.converted++;
-      } else if (statusNormalized === 'scheduled') {
-        stats.scheduled++;
-      } else if (statusNormalized === 'cancelled') {
-        stats.cancelled++;
-      }
-      
-      // Track arrivals — skip if cancel_validation or underage_validation is flagged
-      if (ARRIVAL_STATUSES.has(statusNormalized)) {
-        stats.arrivals++;
-      }
-
-      // Only add revenue for completed/visited bookings
-      if (COMPLETED_STATUSES.has(statusNormalized)) {
-        stats.completedBookings++;
-        stats.revenue += booking.totalPrice;
-      }
-      
-      // Track promo hunters
-      if (statusNormalized === 'promo hunter' || booking.promoHunterStatus) {
-        stats.promoHunters++;
-      }
-      
-      // Track treatments
-      if (booking.treatment) {
-        stats.treatments[booking.treatment] = (stats.treatments[booking.treatment] || 0) + 1;
-      }
-      
-      // Track branches
-      if (booking.branch) {
-        stats.branches[booking.branch] = (stats.branches[booking.branch] || 0) + 1;
-      }
-    });
-
-    // Calculate metrics for each agent
-    const agents = Object.values(agentStats).map(agent => {
-      const conversionRate = agent.bookings > 0 
-        ? (agent.converted / agent.bookings * 100) 
-        : 0;
-      
-      const arrivalRate = agent.bookings > 0 
-        ? Math.round((agent.arrivals / agent.bookings) * 10000) / 100
-        : 0;
-      
-      // Average booking value based on completed bookings only
-      const avgBookingValue = agent.completedBookings > 0 
-        ? agent.revenue / agent.completedBookings 
-        : 0;
-      
-      // Get top treatment
-      const topTreatment = Object.entries(agent.treatments)
-        .sort((a, b) => b[1] - a[1])[0];
-      
-      // Get top branch
-      const topBranch = Object.entries(agent.branches)
-        .sort((a, b) => b[1] - a[1])[0];
-      
-      // Get treatment list
-      const treatments = Object.entries(agent.treatments)
-        .map(([name, count]) => ({ name, count }))
-        .sort((a, b) => b.count - a.count);
-      
-      // Calculate weekly and monthly average arrivals
-      // Range length in days
-      let rangeDays = days;
-      if (startDate && endDate) {
-        const s = new Date(startDate);
-        const e = new Date(endDate);
-        rangeDays = Math.max(1, Math.round((e - s) / (1000 * 60 * 60 * 24)) + 1);
-      }
-      const rangeWeeks = Math.max(1, rangeDays / 7);
-      const rangeMonths = Math.max(1, rangeDays / 30);
-
-      return {
-        name: agent.name,
-        bookings: agent.bookings,
-        completedBookings: agent.completedBookings,
-        revenue: parseFloat(agent.revenue.toFixed(2)),
-        avgBookingValue: parseFloat(avgBookingValue.toFixed(2)),
-        conversionRate: parseFloat(conversionRate.toFixed(2)),
-        arrivalRate: parseFloat(arrivalRate.toFixed(2)),
-        arrivals: agent.arrivals,
-        avgWeeklyArrivals: parseFloat((agent.arrivals / rangeWeeks).toFixed(2)),
-        avgMonthlyArrivals: parseFloat((agent.arrivals / rangeMonths).toFixed(2)),
-        converted: agent.converted,
-        scheduled: agent.scheduled,
-        cancelled: agent.cancelled,
-        promoHunters: agent.promoHunters,
-        topTreatment: topTreatment ? topTreatment[0] : null,
-        topBranch: topBranch ? topBranch[0] : null,
-        treatments: treatments
-      };    }).sort((a, b) => b.revenue - a.revenue);
-
-    // Calculate summary
     const summary = {
-      totalAgents: agents.length,
-      totalBookings: agents.reduce((sum, a) => sum + a.bookings, 0),
-      totalRevenue: parseFloat(agents.reduce((sum, a) => sum + a.revenue, 0).toFixed(2)),
-      avgConversion: agents.length > 0 
-        ? parseFloat((agents.reduce((sum, a) => sum + a.conversionRate, 0) / agents.length).toFixed(2))
-        : 0
+      totalAgents:   agents.length,
+      totalBookings: agents.reduce((s, a) => s + a.bookings, 0),
+      totalRevenue:  +agents.reduce((s, a) => s + a.revenue, 0).toFixed(2),
+      avgConversion: agents.length > 0 ? +(agents.reduce((s, a) => s + a.conversionRate, 0) / agents.length).toFixed(2) : 0
     };
 
-    // Build date range response
-    let dateRangeResponse;
-    if (startDate && endDate) {
-      dateRangeResponse = {
-        from: new Date(startDate).toISOString(),
-        to: new Date(endDate).toISOString(),
-        custom: true
-      };
-    } else {
-      const cutoffDate = new Date();
-      cutoffDate.setDate(cutoffDate.getDate() - days);
-      dateRangeResponse = {
-        from: cutoffDate.toISOString(),
-        to: new Date().toISOString(),
-        days
-      };
-    }
+    const now = new Date();
+    const dateRange = startDate && endDate
+      ? { from: new Date(startDate).toISOString(), to: new Date(endDate).toISOString(), custom: true }
+      : { from: new Date(now.getTime() - days * 86400000).toISOString(), to: now.toISOString(), days };
 
-    res.json({
-      success: true,
-      data: {
-        summary,
-        agents,
-        dateRange: dateRangeResponse
-      }
-    });
-
-  } catch (error) {
-    console.error('Error fetching agent performance:', error);
+    res.json({ success: true, data: { summary, agents, dateRange } });
+  } catch (err) {
+    console.error('Agent performance error:', err);
     res.status(500).json({ error: 'Failed to fetch agent performance data' });
   }
 }
 
-// Get Ad Performance Analytics
+// ── getAdPerformance ─────────────────────────────────────────────────────────
+
 async function getAdPerformance(req, res) {
   try {
-    const days = parseInt(req.query.days) || 30;
+    const days      = Math.max(1, Math.min(365, Math.floor(parseInt(req.query.days) || 30)));
     const startDate = req.query.startDate;
-    const endDate = req.query.endDate;
-    const branch = req.query.branch;
-    
-    // Read from Master DB sheet
-    const rows = await sheetsService.readSheet('DB');
-    
-    if (rows.length < 2) {
-      return res.json({
-        success: true,
-        data: {
-          summary: {
-            totalAds: 0,
-            totalBookings: 0,
-            totalRevenue: 0,
-            avgConversionRate: 0
-          },
-          ads: []
-        }
-      });
-    }
+    const endDate   = req.query.endDate;
+    const branch    = req.query.branch;
 
-    // Parse all bookings from DB sheet (44 columns)
-    let allBookings = rows.slice(1).map((row) => {
-      let price = row[12] || '0';
-      if (typeof price === 'string') {
-        price = price.replace(/[^0-9.]/g, '');
-      }
+    const conds = ["record_status != 'DELETED'", "ad_interacted IS NOT NULL AND ad_interacted != ''"];
+    const params = [];
+    let i = 1;
 
-      return {
-        timestamp: row[0] || '',
-        branch: row[1] || '',
-        status: row[2] || '',
-        date: row[3] || '',
-        firstName: row[4] || '',
-        lastName: row[5] || '',
-        age: row[6] || '',
-        gender: row[7] || '',
-        treatment: row[8] || '',
-        area: row[9] || '',
-        freebie: row[10] || '',
-        companionTreatment: row[11] || '',
-        totalPrice: parseFloat(price) || 0,
-        paymentMode: row[13] || '',
-        phone: row[14] || '',
-        socialMedia: row[15] || '',
-        email: row[16] || '',
-        agent: row[17] || '',
-        bookingDetails: row[18] || '',
-        adInteracted: row[19] || '',
-        companionFirstName: row[20] || '',
-        companionLastName: row[21] || '',
-        companionAge: row[22] || '',
-        companionGender: row[23] || '',
-        companionFreebie: row[24] || ''
-      };
-    }).filter(booking => booking.adInteracted && booking.adInteracted.trim() !== '');
+    if (branch && branch !== 'All') { conds.push(`branch = $${i++}`); params.push(branch); }
 
-    // Filter by date range
     if (startDate && endDate) {
-      const start = new Date(startDate);
-      start.setHours(0, 0, 0, 0);
-      const end = new Date(endDate);
-      end.setHours(23, 59, 59, 999);
-      
-      allBookings = allBookings.filter(booking => {
-        if (!booking.date) return false;
-        try {
-          const bookingDate = parseDateString(booking.date);
-          return bookingDate && !isNaN(bookingDate.getTime()) && bookingDate >= start && bookingDate <= end;
-        } catch {
-          return false;
-        }
-      });
-    } else if (days) {
-      const cutoffDate = new Date();
-      cutoffDate.setDate(cutoffDate.getDate() - days);
-      
-      allBookings = allBookings.filter(booking => {
-        if (!booking.date) return false;
-        try {
-          const bookingDate = parseDateString(booking.date);
-          return bookingDate && !isNaN(bookingDate.getTime()) && bookingDate >= cutoffDate;
-        } catch {
-          return false;
-        }
-      });
+      conds.push(`appointment_date >= $${i++}::date AND appointment_date <= $${i++}::date`);
+      params.push(startDate, endDate);
+    } else {
+      conds.push(`appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${days} days'`);
     }
 
-    // Filter by branch if specified
-    if (branch && branch !== 'All') {
-      allBookings = allBookings.filter(booking => booking.branch === branch);
-    }
+    const WHERE = `WHERE ${conds.join(' AND ')}`;
 
-    console.log('Total bookings with ads:', allBookings.length);
+    const { rows } = await pool.query(`
+      SELECT ad_interacted AS ad_name,
+             branch, treatment,
+             COUNT(*) AS total_bookings,
+             COUNT(*) FILTER (WHERE LOWER(booking_status) LIKE '%bought%' OR LOWER(booking_status) LIKE '%arrived%') AS converted,
+             SUM(CASE WHEN LOWER(booking_status) LIKE '%bought%' OR LOWER(booking_status) LIKE '%arrived%'
+                 THEN total_price ELSE 0 END) AS revenue
+      FROM bookings ${WHERE}
+      GROUP BY ad_interacted, branch, treatment
+    `, params);
 
-    // Group by ad name
     const adMap = {};
+    for (const r of rows) {
+      const key = r.ad_name;
+      if (!adMap[key]) adMap[key] = { adName: key, totalBookings: 0, convertedBookings: 0, totalRevenue: 0, branches: {}, treatments: {} };
+      const ad = adMap[key];
+      ad.totalBookings     += parseInt(r.total_bookings);
+      ad.convertedBookings += parseInt(r.converted);
+      ad.totalRevenue      += parseFloat(r.revenue);
+      if (r.branch)    ad.branches[r.branch]      = (ad.branches[r.branch]     || 0) + parseInt(r.total_bookings);
+      if (r.treatment) ad.treatments[r.treatment]  = (ad.treatments[r.treatment]|| 0) + parseInt(r.total_bookings);
+    }
 
-    allBookings.forEach(booking => {
-      const adName = booking.adInteracted.trim();
-      
-      if (!adMap[adName]) {
-        adMap[adName] = {
-          adName,
-          totalBookings: 0,
-          convertedBookings: 0,
-          totalRevenue: 0,
-          branches: {},
-          treatments: {},
-          statusMap: {},
-          bookings: []
-        };
-      }
-
-      adMap[adName].totalBookings++;
-      adMap[adName].bookings.push(booking);
-      
-      // Status breakdown
-      const ns = normalizeStatus(booking.status) || 'unknown';
-      if (!adMap[adName].statusMap[ns]) {
-        adMap[adName].statusMap[ns] = { count: 0, revenue: 0 };
-      }
-      adMap[adName].statusMap[ns].count++;
-
-      // Count conversions (statuses that indicate successful booking)
-      const statusLower = (booking.status || '').toLowerCase();
-      if (statusLower.includes('bought') || statusLower.includes('arrived')) {
-        adMap[adName].convertedBookings++;
-        adMap[adName].totalRevenue += booking.totalPrice;
-        adMap[adName].statusMap[ns].revenue += booking.totalPrice;
-      }
-
-      // Track branches
-      if (booking.branch) {
-        adMap[adName].branches[booking.branch] = (adMap[adName].branches[booking.branch] || 0) + 1;
-      }
-
-      // Track treatments
-      if (booking.treatment) {
-        adMap[adName].treatments[booking.treatment] = (adMap[adName].treatments[booking.treatment] || 0) + 1;
-      }
-    });
-
-    // Convert to array and calculate metrics
     const ads = Object.values(adMap).map(ad => {
-      const conversionRate = ad.totalBookings > 0 
-        ? (ad.convertedBookings / ad.totalBookings) * 100 
-        : 0;
-
-      const avgRevenuePerBooking = ad.convertedBookings > 0
-        ? ad.totalRevenue / ad.convertedBookings
-        : 0;
-
-      // Find top branch
-      const topBranch = Object.keys(ad.branches).length > 0
-        ? Object.entries(ad.branches).sort((a, b) => b[1] - a[1])[0][0]
-        : null;
-
-      // Find top treatment
-      const topTreatment = Object.keys(ad.treatments).length > 0
-        ? Object.entries(ad.treatments).sort((a, b) => b[1] - a[1])[0][0]
-        : null;
-
+      const cr = ad.totalBookings > 0 ? ad.convertedBookings / ad.totalBookings * 100 : 0;
       return {
-        adName: ad.adName,
-        totalBookings: ad.totalBookings,
-        convertedBookings: ad.convertedBookings,
-        conversionRate: parseFloat(conversionRate.toFixed(2)),
-        totalRevenue: parseFloat(ad.totalRevenue.toFixed(2)),
-        avgRevenuePerBooking: parseFloat(avgRevenuePerBooking.toFixed(2)),
-        topBranch,
-        topTreatment,
-        statusBreakdown: Object.entries(ad.statusMap || {})
-          .map(([status, d]) => ({
-            status,
-            count: d.count,
-            revenue: parseFloat(d.revenue.toFixed(2)),
-            pct: parseFloat(((d.count / ad.totalBookings) * 100).toFixed(1))
-          }))
-          .sort((a, b) => b.count - a.count)
+        adName: ad.adName, totalBookings: ad.totalBookings, convertedBookings: ad.convertedBookings,
+        conversionRate:       +cr.toFixed(2),
+        totalRevenue:         +ad.totalRevenue.toFixed(2),
+        avgRevenuePerBooking: ad.convertedBookings > 0 ? +(ad.totalRevenue / ad.convertedBookings).toFixed(2) : 0,
+        topBranch:    Object.entries(ad.branches).sort((a, b) => b[1] - a[1])[0]?.[0]    || null,
+        topTreatment: Object.entries(ad.treatments).sort((a, b) => b[1] - a[1])[0]?.[0] || null
       };
-    });
+    }).sort((a, b) => b.totalBookings - a.totalBookings);
 
-    console.log('Total unique ads:', ads.length);
-
-    // Calculate summary
     const summary = {
       totalAds: ads.length,
-      totalBookings: ads.reduce((sum, ad) => sum + ad.totalBookings, 0),
-      totalRevenue: parseFloat(ads.reduce((sum, ad) => sum + ad.totalRevenue, 0).toFixed(2)),
-      avgConversionRate: ads.length > 0
-        ? parseFloat((ads.reduce((sum, ad) => sum + ad.conversionRate, 0) / ads.length).toFixed(2))
-        : 0
+      totalBookings: ads.reduce((s, a) => s + a.totalBookings, 0),
+      totalRevenue:  +ads.reduce((s, a) => s + a.totalRevenue, 0).toFixed(2),
+      avgConversionRate: ads.length > 0 ? +(ads.reduce((s, a) => s + a.conversionRate, 0) / ads.length).toFixed(2) : 0
     };
 
-    res.json({
-      success: true,
-      data: {
-        summary,
-        ads
-      }
-    });
-
-  } catch (error) {
-    console.error('Error fetching ad performance:', error);
+    res.json({ success: true, data: { summary, ads } });
+  } catch (err) {
+    console.error('Ad performance error:', err);
     res.status(500).json({ error: 'Failed to fetch ad performance data' });
   }
 }
 
-/**
- * Get comprehensive sales report
- * Query params:
- *  - startDate (optional): YYYY-MM-DD (requires endDate)
- *  - endDate (optional): YYYY-MM-DD (requires startDate)
- *  - timeRange (optional): "30days", "60days", "90days", "6months", "1year" (default: "6months")
- *  - branch (optional): specific branch name or "all" (default: "all")
- */
+// ── getSalesReport ───────────────────────────────────────────────────────────
+
 async function getSalesReport(req, res) {
   try {
-    let timeRange = req.query.timeRange || '6months';
-    const selectedBranch = req.query.branch || 'all';
-    const startDateParam = req.query.startDate;
-    const endDateParam = req.query.endDate;
-    const dbRows = await sheetsService.readSheet('DB');
+    let timeRange    = req.query.timeRange || '6months';
+    const selBranch  = req.query.branch   || 'all';
+    const startDateP = req.query.startDate;
+    const endDateP   = req.query.endDate;
 
-    if (dbRows.length < 2) {
-      return res.json({
-        success: true,
-        data: {
-          timeRange,
-          branch: selectedBranch,
-          arrivalRate: 0,
-          totalArrivals: 0,
-          totalBookings: 0,
-          arrivalRateByBranch: [],
-          rangeSales: { overall: 0, byBranch: [] },
-          previousRangeSales: { overall: 0, byBranch: [] },
-          rangeFirstHalfSales: { overall: 0, byBranch: [] },
-          rangeSecondHalfSales: { overall: 0, byBranch: [] },
-          dailySalesAndBookings: [],
-          dailySales: { overall: 0, byBranch: [] },
-          firstHalfSales: { overall: 0, byBranch: [] },
-          secondHalfSales: { overall: 0, byBranch: [] },
-          currentMonthSales: { overall: 0, byBranch: [] },
-          lastMonthSales: { overall: 0, byBranch: [] },
-          yearlySales: { overall: 0, monthlyBreakdown: [] },
-          monthlySalesAndBookings: []
-        }
-      });
-    }
-
-    const now = new Date();
+    const now   = new Date();
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const currentMonth = now.getMonth();
-    const currentYear = now.getFullYear();
 
-    // Calculate date range based on start/end dates or timeRange parameter
-    let startDate;
-    let endDate = now;
-
-    if (startDateParam && endDateParam) {
-      const parsedStart = new Date(startDateParam);
-      const parsedEnd = new Date(endDateParam);
-      if (!isNaN(parsedStart.getTime()) && !isNaN(parsedEnd.getTime())) {
-        startDate = parsedStart;
-        endDate = parsedEnd;
-        startDate.setHours(0, 0, 0, 0);
-        endDate.setHours(23, 59, 59, 999);
-        timeRange = 'custom';
-      }
-    }
-
-    if (!startDate) {
+    let startDate, endDate = now;
+    if (startDateP && endDateP) {
+      startDate = new Date(startDateP); startDate.setHours(0,0,0,0);
+      endDate   = new Date(endDateP);   endDate.setHours(23,59,59,999);
+      timeRange = 'custom';
+    } else {
+      startDate = new Date(now);
       switch (timeRange) {
-        case '30days':
-          startDate = new Date(now);
-          startDate.setDate(startDate.getDate() - 30);
-          break;
-        case '60days':
-          startDate = new Date(now);
-          startDate.setDate(startDate.getDate() - 60);
-          break;
-        case 'thisMonth':
-          startDate = new Date(now.getFullYear(), now.getMonth(), 1);
-          break;
-        case '90days':
-          startDate = new Date(now.getTime() - (90 * 24 * 60 * 60 * 1000));
-          break;
-        case '6months':
-          startDate = new Date(now);
-          startDate.setMonth(startDate.getMonth() - 6);
-          break;
-        case '1year':
-          startDate = new Date(now);
-          startDate.setFullYear(startDate.getFullYear() - 1);
-          break;
-        default:
-              startDate = new Date(now);
-          startDate.setMonth(startDate.getMonth() - 6);
+        case '30days':    startDate.setDate(startDate.getDate() - 30);        break;
+        case '60days':    startDate.setDate(startDate.getDate() - 60);        break;
+        case 'thisMonth': startDate = new Date(now.getFullYear(), now.getMonth(), 1); break;
+        case '90days':    startDate.setDate(startDate.getDate() - 90);        break;
+        case '1year':     startDate.setFullYear(startDate.getFullYear() - 1); break;
+        default:          startDate.setMonth(startDate.getMonth() - 6);  // 6months
       }
+      startDate.setHours(0,0,0,0);
     }
 
-            startDate.setHours(0, 0, 0, 0);
+    const rdMs     = endDate.getTime() - startDate.getTime();
+    const prevEnd  = new Date(startDate.getTime() - 1);
+    const prevStart = new Date(prevEnd.getTime() - rdMs);
+    const midpoint  = new Date(startDate.getTime() + Math.floor(rdMs / 2));
 
-            const rangeDurationMs = endDate.getTime() - startDate.getTime();
-            const previousRangeEnd = new Date(startDate.getTime() - 1);
-            const previousRangeStart = new Date(previousRangeEnd.getTime() - rangeDurationMs);
-            const rangeMidpoint = new Date(startDate.getTime() + Math.floor(rangeDurationMs / 2));
+    const branchCond = selBranch !== 'all' ? 'AND branch = $3' : '';
+    const params     = selBranch !== 'all'
+      ? [prevStart.toISOString().split('T')[0], endDate.toISOString().split('T')[0], selBranch]
+      : [prevStart.toISOString().split('T')[0], endDate.toISOString().split('T')[0]];
 
-    // Initialize accumulators
-    let dailySales = { overall: 0, byBranch: {} };
-    let firstHalfSales = { overall: 0, byBranch: {} };
-    let secondHalfSales = { overall: 0, byBranch: {} };
-    let rangeSales = { overall: 0, byBranch: {} };
-    let previousRangeSales = { overall: 0, byBranch: {} };
-    let currentMonthSales = { overall: 0, byBranch: {} };
-    let lastMonthSales = { overall: 0, byBranch: {} };
-    let yearlySales = { overall: 0, monthlyBreakdown: {} };
-    let monthlySalesData = {}; // Months within range
-    let dailySalesData = {}; // Days within range
-    let totalArrivals = 0;
-    let totalBookings = 0;
-    let arrivalsByBranch = {};
-    let bookingsByBranch = {};
-    const arrivalStatuses = new Set([
-      'arrived not potential',
-      'arrived & bought'
-    ]);
-    const formatDateKey = (date) => {
-      const year = date.getFullYear();
-      const month = String(date.getMonth() + 1).padStart(2, '0');
-      const day = String(date.getDate()).padStart(2, '0');
-      return `${year}-${month}-${day}`;
-    };
+    const { rows } = await pool.query(`
+      SELECT branch, booking_status, appointment_date, total_price,
+             underage_status, db_status, cancel_validation
+      FROM bookings
+      WHERE record_status != 'DELETED'
+        AND appointment_date >= $1::date
+        AND appointment_date <= $2::date
+        ${branchCond}
+    `, params);
 
-    // Process each booking (skip header row)
-    for (let i = 1; i < dbRows.length; i++) {
-      const row = dbRows[i];
-      
-      const branch = row[1];
-      const status = row[2];
-      const dateStr = row[3]; // Date column
-      const price = parsePrice(row[12]); // Total price column M (index 12)
+    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const curYear  = now.getFullYear();
+    const curMonth = now.getMonth();
+    const lastMonth     = curMonth === 0 ? 11 : curMonth - 1;
+    const lastMonthYear = curMonth === 0 ? curYear - 1 : curYear;
+    const todayStr = today.toISOString().split('T')[0];
 
-      // Filter by branch if specified (not "all")
-      if (selectedBranch !== 'all' && branch !== selectedBranch) continue;
+    const rangeSales = {}, prevSales = {}, firstHalf = {}, secondHalf = {};
+    const dailySalesData = {}, monthlySalesData = {}, yearlyMonths = {};
+    let dailySalesOverall = 0;
+    const dailyBranch = {}, curMonthSales = {}, lastMonthSales = {};
+    let totalBookings = 0, totalArrivals = 0;
+    const bookByBranch = {}, arrByBranch = {};
 
-      // Parse booking date
-      const bookingDate = parseDateString(dateStr);
-      if (!bookingDate || isNaN(bookingDate.getTime())) continue;
+    for (const r of rows) {
+      if (!r.appointment_date) continue;
+      const bDate  = new Date(r.appointment_date);
+      const bStr   = bDate.toISOString().split('T')[0];
+      const bYear  = bDate.getFullYear();
+      const bMonth = bDate.getMonth();
+      const branch = r.branch || 'Unknown';
+      const status = (r.booking_status || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const price  = parseFloat(r.total_price) || 0;
+      const isArr  = ARRIVAL_STATUSES.has(status) && (r.underage_status || 'Approved') === 'Approved' && (r.db_status || 'Approved') === 'Approved' && !r.cancel_validation;
+      const isSale = SALE_STATUSES.has(status);
 
-      if (bookingDate >= startDate && bookingDate <= endDate) {
-        totalBookings += 1;
-        bookingsByBranch[branch] = (bookingsByBranch[branch] || 0) + 1;
-        const statusNorm = (status || '').toLowerCase().replace(/\s+/g, ' ').trim();
-        if (arrivalStatuses.has(statusNorm)) {
-          totalArrivals += 1;
-          arrivalsByBranch[branch] = (arrivalsByBranch[branch] || 0) + 1;
+      if (bDate >= startDate && bDate <= endDate) {
+        totalBookings++;
+        bookByBranch[branch] = (bookByBranch[branch] || 0) + 1;
+        if (isArr) { totalArrivals++; arrByBranch[branch] = (arrByBranch[branch] || 0) + 1; }
+
+        if (isSale) {
+          rangeSales[branch] = (rangeSales[branch] || 0) + price;
+          if (bDate <= midpoint) firstHalf[branch]  = (firstHalf[branch]  || 0) + price;
+          else                   secondHalf[branch]  = (secondHalf[branch] || 0) + price;
+
+          if (bStr === todayStr) { dailySalesOverall += price; dailyBranch[branch] = (dailyBranch[branch] || 0) + price; }
+          if (bYear === curYear  && bMonth === curMonth)   curMonthSales[branch]  = (curMonthSales[branch]  || 0) + price;
+          if (bYear === lastMonthYear && bMonth === lastMonth) lastMonthSales[branch] = (lastMonthSales[branch] || 0) + price;
+
+          if (bYear === curYear) {
+            if (!yearlyMonths[bMonth]) yearlyMonths[bMonth] = { sales: 0, bookings: 0 };
+            yearlyMonths[bMonth].sales   += price;
+            yearlyMonths[bMonth].bookings++;
+          }
+
+          if (!dailySalesData[bStr]) dailySalesData[bStr] = { date: bStr, sales: 0, bookings: 0 };
+          dailySalesData[bStr].sales   += price;
+          dailySalesData[bStr].bookings++;
         }
       }
 
-      // Only count ACTUAL SALES: "Arrived & bought", "Arrived not potential", or "Comeback & bought"
-      const statusNormSales = (status || '').toLowerCase().replace(/\s+/g, ' ').trim();
-      if (statusNormSales !== 'arrived & bought' && statusNormSales !== 'comeback & bought' && statusNormSales !== 'arrived not potential') continue;
-
-      // Range sales totals
-      if (bookingDate >= startDate && bookingDate <= endDate) {
-        rangeSales.overall += price;
-        rangeSales.byBranch[branch] = (rangeSales.byBranch[branch] || 0) + price;
+      if (isSale && bDate >= prevStart && bDate <= prevEnd) {
+        prevSales[branch] = (prevSales[branch] || 0) + price;
       }
-
-      if (bookingDate >= previousRangeStart && bookingDate <= previousRangeEnd) {
-        previousRangeSales.overall += price;
-        previousRangeSales.byBranch[branch] = (previousRangeSales.byBranch[branch] || 0) + price;
-      }
-
-      // Filter by time range
-      if (bookingDate < startDate || bookingDate > endDate) continue;
-
-      const bookingYear = bookingDate.getFullYear();
-      const bookingMonth = bookingDate.getMonth();
-      const bookingDay = bookingDate.getDate();
-
-      // Daily Sales (today)
-      if (bookingDate >= today && bookingDate < new Date(today.getTime() + 86400000)) {
-        dailySales.overall += price;
-        dailySales.byBranch[branch] = (dailySales.byBranch[branch] || 0) + price;
-      }
-
-      // Range split (first half / second half)
-      if (bookingDate <= rangeMidpoint) {
-        firstHalfSales.overall += price;
-        firstHalfSales.byBranch[branch] = (firstHalfSales.byBranch[branch] || 0) + price;
-      } else {
-        secondHalfSales.overall += price;
-        secondHalfSales.byBranch[branch] = (secondHalfSales.byBranch[branch] || 0) + price;
-      }
-
-      // Last Month Sales
-      const lastMonth = currentMonth === 0 ? 11 : currentMonth - 1;
-      const lastMonthYear = currentMonth === 0 ? currentYear - 1 : currentYear;
-      if (bookingYear === lastMonthYear && bookingMonth === lastMonth) {
-        lastMonthSales.overall += price;
-        lastMonthSales.byBranch[branch] = (lastMonthSales.byBranch[branch] || 0) + price;
-      }
-
-      // Yearly Sales (current year)
-      if (bookingYear === currentYear) {
-        yearlySales.overall += price;
-        const monthKey = bookingMonth;
-        if (!yearlySales.monthlyBreakdown[monthKey]) {
-          yearlySales.monthlyBreakdown[monthKey] = { sales: 0, bookings: 0 };
-        }
-        yearlySales.monthlyBreakdown[monthKey].sales += price;
-        yearlySales.monthlyBreakdown[monthKey].bookings += 1;
-      }
-
-      // Monthly Sales & Bookings (within time range)
-      const monthYearKey = `${bookingYear}-${bookingMonth}`;
-      if (!monthlySalesData[monthYearKey]) {
-        monthlySalesData[monthYearKey] = { year: bookingYear, month: bookingMonth, sales: 0, bookings: 0 };
-      }
-      monthlySalesData[monthYearKey].sales += price;
-      monthlySalesData[monthYearKey].bookings += 1;
-
-      // Daily Sales & Bookings (within time range)
-      const dayKey = formatDateKey(bookingDate);
-      if (!dailySalesData[dayKey]) {
-        dailySalesData[dayKey] = { date: dayKey, sales: 0, bookings: 0 };
-      }
-      dailySalesData[dayKey].sales += price;
-      dailySalesData[dayKey].bookings += 1;
     }
 
-    // Format byBranch data
-    const formatBranchData = (branchObj) => {
-      return Object.keys(branchObj).map(branch => ({
-        branch,
-        sales: Math.round(branchObj[branch] * 100) / 100
-      })).sort((a, b) => b.sales - a.sales);
-    };
-
-    // Format monthly breakdown for yearly sales
-    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    const monthlyBreakdownArray = [];
-    for (let i = 0; i < 12; i++) {
-      const data = yearlySales.monthlyBreakdown[i] || { sales: 0, bookings: 0 };
-      monthlyBreakdownArray.push({
-        month: monthNames[i],
-        sales: Math.round(data.sales * 100) / 100,
-        bookings: data.bookings
-      });
+    // Fix monthly sales data accumulation (redo cleanly)
+    const monthlySalesClean = {};
+    for (const r of rows) {
+      if (!r.appointment_date) continue;
+      const bDate = new Date(r.appointment_date);
+      if (bDate < startDate || bDate > endDate) continue;
+      const status = (r.booking_status || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      if (!SALE_STATUSES.has(status)) continue;
+      const mk = `${bDate.getFullYear()}-${bDate.getMonth()}`;
+      if (!monthlySalesClean[mk]) monthlySalesClean[mk] = { year: bDate.getFullYear(), month: bDate.getMonth(), sales: 0, bookings: 0 };
+      monthlySalesClean[mk].sales   += parseFloat(r.total_price) || 0;
+      monthlySalesClean[mk].bookings++;
     }
 
-    // Format monthly data across selected range
+    const fmtBr = obj => Object.entries(obj).map(([branch, sales]) => ({ branch, sales: Math.round(sales * 100) / 100 })).sort((a, b) => b.sales - a.sales);
+    const sumBr = obj => Math.round(Object.values(obj).reduce((s, v) => s + v, 0) * 100) / 100;
+
+    const monthlyBreakdownArray = Array.from({ length: 12 }, (_, idx) => ({
+      month: MONTHS[idx], sales: Math.round((yearlyMonths[idx]?.sales || 0) * 100) / 100, bookings: yearlyMonths[idx]?.bookings || 0
+    }));
+
     const monthlySalesArray = [];
-    const rangeMonthStart = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
-    const rangeMonthEnd = new Date(endDate.getFullYear(), endDate.getMonth(), 1);
-    const cursor = new Date(rangeMonthStart);
-
-    while (cursor <= rangeMonthEnd) {
-      const targetYear = cursor.getFullYear();
-      const targetMonth = cursor.getMonth();
-      const key = `${targetYear}-${targetMonth}`;
-      const data = monthlySalesData[key] || { sales: 0, bookings: 0 };
-
-      monthlySalesArray.push({
-        month: `${monthNames[targetMonth]} ${targetYear}`,
-        sales: Math.round(data.sales * 100) / 100,
-        bookings: data.bookings
-      });
-
-      cursor.setMonth(cursor.getMonth() + 1);
+    const cur = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
+    const mEnd = new Date(endDate.getFullYear(), endDate.getMonth(), 1);
+    while (cur <= mEnd) {
+      const mk = `${cur.getFullYear()}-${cur.getMonth()}`;
+      const d  = monthlySalesClean[mk] || { sales: 0, bookings: 0 };
+      monthlySalesArray.push({ month: `${MONTHS[cur.getMonth()]} ${cur.getFullYear()}`, sales: Math.round(d.sales * 100) / 100, bookings: d.bookings });
+      cur.setMonth(cur.getMonth() + 1);
     }
 
-    // Format daily data across selected range
     const dailySalesArray = [];
-    const dayCursor = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
-    const dayEnd = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
-    while (dayCursor <= dayEnd) {
-      const key = formatDateKey(dayCursor);
-      const data = dailySalesData[key] || { date: key, sales: 0, bookings: 0 };
-      dailySalesArray.push({
-        date: data.date,
-        sales: Math.round(data.sales * 100) / 100,
-        bookings: data.bookings
-      });
-      dayCursor.setDate(dayCursor.getDate() + 1);
+    const dc = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+    const de = new Date(endDate.getFullYear(),   endDate.getMonth(),   endDate.getDate());
+    while (dc <= de) {
+      const key = dc.toISOString().split('T')[0];
+      const d   = dailySalesData[key] || { date: key, sales: 0, bookings: 0 };
+      dailySalesArray.push({ date: d.date, sales: Math.round(d.sales * 100) / 100, bookings: d.bookings });
+      dc.setDate(dc.getDate() + 1);
     }
+
+    const yearlySalesOverall = monthlyBreakdownArray.reduce((s, m) => s + m.sales, 0);
 
     res.json({
       success: true,
       data: {
-        timeRange,
-        branch: selectedBranch,
-        arrivalRate: totalBookings > 0 ? Math.round((totalArrivals / totalBookings) * 10000) / 100 : 0,
-        totalArrivals,
-        totalBookings,
-        arrivalRateByBranch: Object.keys(bookingsByBranch).map((branch) => {
-          const bookings = bookingsByBranch[branch] || 0;
-          const arrivals = arrivalsByBranch[branch] || 0;
-          return {
-            branch,
-            bookings,
-            arrivals,
-            arrivalRate: bookings > 0 ? Math.round((arrivals / bookings) * 10000) / 100 : 0
-          };
-        }).sort((a, b) => b.arrivalRate - a.arrivalRate),
-        rangeSales: {
-          overall: Math.round(rangeSales.overall * 100) / 100,
-          byBranch: formatBranchData(rangeSales.byBranch)
-        },
-        previousRangeSales: {
-          overall: Math.round(previousRangeSales.overall * 100) / 100,
-          byBranch: formatBranchData(previousRangeSales.byBranch)
-        },
-        rangeFirstHalfSales: {
-          overall: Math.round(firstHalfSales.overall * 100) / 100,
-          byBranch: formatBranchData(firstHalfSales.byBranch)
-        },
-        rangeSecondHalfSales: {
-          overall: Math.round(secondHalfSales.overall * 100) / 100,
-          byBranch: formatBranchData(secondHalfSales.byBranch)
-        },
+        timeRange, branch: selBranch,
+        arrivalRate:  totalBookings > 0 ? Math.round(totalArrivals / totalBookings * 10000) / 100 : 0,
+        totalArrivals, totalBookings,
+        arrivalRateByBranch: Object.keys(bookByBranch).map(br => ({
+          branch: br, bookings: bookByBranch[br] || 0, arrivals: arrByBranch[br] || 0,
+          arrivalRate: bookByBranch[br] > 0 ? Math.round((arrByBranch[br] || 0) / bookByBranch[br] * 10000) / 100 : 0
+        })).sort((a, b) => b.arrivalRate - a.arrivalRate),
+        rangeSales:           { overall: sumBr(rangeSales),  byBranch: fmtBr(rangeSales)  },
+        previousRangeSales:   { overall: sumBr(prevSales),   byBranch: fmtBr(prevSales)   },
+        rangeFirstHalfSales:  { overall: sumBr(firstHalf),   byBranch: fmtBr(firstHalf)   },
+        rangeSecondHalfSales: { overall: sumBr(secondHalf),  byBranch: fmtBr(secondHalf)  },
         dailySalesAndBookings: dailySalesArray,
-        dailySales: {
-          overall: Math.round(dailySales.overall * 100) / 100,
-          byBranch: formatBranchData(dailySales.byBranch)
-        },
-        currentMonthSales: {
-          overall: Math.round(currentMonthSales.overall * 100) / 100,
-          byBranch: formatBranchData(currentMonthSales.byBranch)
-        },
-        lastMonthSales: {
-          overall: Math.round(lastMonthSales.overall * 100) / 100,
-          byBranch: formatBranchData(lastMonthSales.byBranch)
-        },
-        yearlySales: {
-          overall: Math.round(yearlySales.overall * 100) / 100,
-          monthlyBreakdown: monthlyBreakdownArray
-        },
+        dailySales:           { overall: Math.round(dailySalesOverall * 100) / 100, byBranch: fmtBr(dailyBranch) },
+        firstHalfSales:       { overall: sumBr(firstHalf),   byBranch: fmtBr(firstHalf)   },
+        secondHalfSales:      { overall: sumBr(secondHalf),  byBranch: fmtBr(secondHalf)  },
+        currentMonthSales:    { overall: sumBr(curMonthSales),  byBranch: fmtBr(curMonthSales)  },
+        lastMonthSales:       { overall: sumBr(lastMonthSales), byBranch: fmtBr(lastMonthSales) },
+        yearlySales:          { overall: Math.round(yearlySalesOverall * 100) / 100, monthlyBreakdown: monthlyBreakdownArray },
         monthlySalesAndBookings: monthlySalesArray
       }
     });
-
-  } catch (error) {
-    console.error('Error fetching sales report:', error);
+  } catch (err) {
+    console.error('Sales report error:', err);
     res.status(500).json({ error: 'Failed to fetch sales report data' });
   }
 }
 
-module.exports = { getAnalytics, getAgentPerformance, getAdPerformance, getSalesReport };
+// ── getAgentBookings ─────────────────────────────────────────────────────────
+// GET /analytics/agent-bookings?agent=&status=&days=|startDate=&endDate=
+// Booking list behind one bar of the per-agent breakdown modal — same WHERE as
+// getAgentPerformance so counts always match the chart.
+async function getAgentBookings(req, res) {
+  try {
+    const agent  = (req.query.agent  || '').trim();
+    if (!agent) return res.status(400).json({ error: 'agent is required' });
+    const status = (req.query.status || '').trim();
+    const days      = Math.max(1, Math.min(365, Math.floor(parseInt(req.query.days) || 30)));
+    const startDate = req.query.startDate;
+    const endDate   = req.query.endDate;
 
+    const VAL_FILTER = `COALESCE(underage_status,'Approved') = 'Approved' AND COALESCE(db_status,'Approved') = 'Approved'`;
+    const conds  = [`record_status != 'DELETED'`, VAL_FILTER];
+    const params = [];
+    let   idx    = 1;
+    if (startDate && endDate) {
+      conds.push(`appointment_date >= $${idx++}::date`); params.push(startDate);
+      conds.push(`appointment_date <= $${idx++}::date`); params.push(endDate);
+    } else {
+      conds.push(`appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date - INTERVAL '${days} days'`);
+    }
+    conds.push(`${SQL_AGENT} = UPPER(TRIM($${idx++}))`); params.push(agent);
+    if (status) { conds.push(`LOWER(TRIM(booking_status)) = $${idx++}`); params.push(status.toLowerCase()); }
 
+    const { rows } = await pool.query(`
+      SELECT record_id, appointment_date, appointment_time, first_name, last_name,
+             branch, treatment, booking_status, total_price, phone, email, is_promo_hunter
+      FROM bookings
+      WHERE ${conds.join(' AND ')}
+      ORDER BY appointment_date DESC, appointment_time DESC
+      LIMIT 500
+    `, params);
+
+    res.json({
+      success: true,
+      bookings: rows.map(r => ({
+        recordId:  r.record_id,
+        date:      r.appointment_date || '',
+        time:      r.appointment_time || '',
+        firstName: r.first_name || '',
+        lastName:  r.last_name  || '',
+        branch:    r.branch     || '',
+        treatment: r.treatment  || '',
+        status:    r.booking_status || '',
+        totalPrice: parseFloat(r.total_price) || 0,
+        phone:     r.phone || '',
+        email:     r.email || '',
+        isPromoHunter: r.is_promo_hunter || false,
+      })),
+    });
+  } catch (err) {
+    console.error('Agent bookings error:', err);
+    res.status(500).json({ error: 'Failed to fetch agent bookings' });
+  }
+}
+
+module.exports = { getAnalytics, getAgentPerformance, getAdPerformance, getSalesReport, getAgentBookings };

@@ -1,16 +1,17 @@
+'use strict';
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { v4: uuidv4 } = require('uuid');
-const sheetsService = require('../services/sheets.service');
 const Joi = require('joi');
-const { invalidateUsersCache } = require('../middleware/auth.middleware');
+const pool = require('../db/pool');
+const { invalidateUserCache } = require('../middleware/auth.middleware');
 
-// Validation schemas
 const signupSchema = Joi.object({
   email: Joi.string().email().required(),
   password: Joi.string().min(8).required(),
   name: Joi.string().min(2).required(),
-  role: Joi.string().valid('Admin', 'Agent').required()
+  role: Joi.string().valid('Admin', 'Agent').required(),
+  // Authorizes creating an Admin via self-signup (internal tool). Optional for Agents.
+  masterPassword: Joi.string().allow('').optional()
 });
 
 const loginSchema = Joi.object({
@@ -21,46 +22,56 @@ const loginSchema = Joi.object({
 class AuthController {
   async signup(req, res) {
     try {
-      // Validate input
       const { error, value } = signupSchema.validate(req.body);
-      if (error) {
-        return res.status(400).json({ error: error.details[0].message });
+      if (error) return res.status(400).json({ error: error.details[0].message });
+
+      const { email, password, name, role, masterPassword } = value;
+
+      // Admin accounts are authorized either by the shared master password (internal
+      // self-signup) OR by an already-authenticated Admin (e.g. Users Management).
+      if (role === 'Admin') {
+        const master   = process.env.ADMIN_MASTER_PASSWORD || '';
+        const masterOk = master !== '' && (masterPassword || '') === master;
+
+        if (!masterOk) {
+          const authHeader = req.headers.authorization;
+          if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(403).json({ error: 'Incorrect master password for creating an Admin account' });
+          }
+          try {
+            const decoded = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET, { algorithms: ['HS256'] });
+            const { rows: callerRows } = await pool.query(
+              'SELECT role FROM users WHERE user_id = $1', [decoded.userId]
+            );
+            if (!callerRows.length || callerRows[0].role !== 'Admin') {
+              return res.status(403).json({ error: 'Admin accounts require the master password or an existing Admin login' });
+            }
+          } catch {
+            return res.status(403).json({ error: 'Incorrect master password for creating an Admin account' });
+          }
+        }
       }
 
-      const { email, password, name, role } = value;
-
-      // Read Users sheet
-      const users = await sheetsService.readSheet('Users');
-      
-      // Check if email already exists
-      const emailExists = users.slice(1).some(user => user[1] === email.toLowerCase());
-      if (emailExists) {
+      const existing = await pool.query(
+        'SELECT user_id FROM users WHERE email = $1',
+        [email.toLowerCase()]
+      );
+      if (existing.rows.length) {
         return res.status(400).json({ error: 'Email already registered' });
       }
 
-      // Hash password
       const passwordHash = await bcrypt.hash(password, 10);
+      const now = new Date();
 
-      // Generate user ID
-      const userId = uuidv4();
-      const now = new Date().toISOString();
+      const { rows } = await pool.query(
+        `INSERT INTO users (email, password_hash, name, role, created_at, last_login)
+         VALUES ($1, $2, $3, $4, $5, $5)
+         RETURNING user_id`,
+        [email.toLowerCase(), passwordHash, name, role, now]
+      );
 
-      // Prepare user data (columns: userId, email, passwordHash, name, role, created_at, last_login)
-      const newUser = [
-        userId,
-        email.toLowerCase(),
-        passwordHash,
-        name,
-        role, // Admin or Agent
-        now,  // created_at
-        now   // last_login
-      ];
+      const userId = rows[0].user_id;
 
-      // Append to Users sheet
-      await sheetsService.appendRow('Users', newUser);
-      invalidateUsersCache();
-
-      // Generate JWT token
       const token = jwt.sign(
         { userId, email: email.toLowerCase() },
         process.env.JWT_SECRET,
@@ -70,62 +81,45 @@ class AuthController {
       res.status(201).json({
         message: 'User created successfully',
         token,
-        user: {
-          userId,
-          email: email.toLowerCase(),
-          name,
-          role
-        }
+        user: { userId, email: email.toLowerCase(), name, role }
       });
-    } catch (error) {
-      console.error('Signup error:', error);
+    } catch (err) {
+      console.error('Signup error:', err);
       res.status(500).json({ error: 'Failed to create user' });
     }
   }
 
   async login(req, res) {
     try {
-      // Validate input
       const { error, value } = loginSchema.validate(req.body);
-      if (error) {
-        return res.status(400).json({ error: error.details[0].message });
-      }
+      if (error) return res.status(400).json({ error: error.details[0].message });
 
       const { email, password } = value;
 
-      // Read Users sheet
-      const users = await sheetsService.readSheet('Users');
-      
-      if (users.length < 2) {
+      const { rows } = await pool.query(
+        'SELECT user_id, email, password_hash, name, role, last_login FROM users WHERE email = $1',
+        [email.toLowerCase()]
+      );
+
+      if (!rows.length) {
         return res.status(401).json({ error: 'Invalid credentials' });
       }
 
-      // Find user by email
-      const userRow = users.slice(1).find(user => user[1] === email.toLowerCase());
-      
-      if (!userRow) {
+      const u = rows[0];
+      const valid = await bcrypt.compare(password, u.password_hash);
+      if (!valid) {
         return res.status(401).json({ error: 'Invalid credentials' });
       }
 
-      // Verify password
-      const [userId, userEmail, passwordHash, name, role] = userRow;
-      const isValidPassword = await bcrypt.compare(password, passwordHash);
+      const now = new Date();
+      await pool.query(
+        'UPDATE users SET last_login = $1 WHERE user_id = $2',
+        [now, u.user_id]
+      );
+      invalidateUserCache(u.user_id.toString());
 
-      if (!isValidPassword) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
-
-      // Update last_login
-      const rowIndex = users.findIndex(user => user[1] === email.toLowerCase());
-      if (rowIndex > 0) {
-        userRow[6] = new Date().toISOString(); // Update last_login (column 6)
-        await sheetsService.updateRow('Users', rowIndex + 1, userRow);
-        invalidateUsersCache();
-      }
-
-      // Generate JWT token
       const token = jwt.sign(
-        { userId, email: userEmail },
+        { userId: u.user_id, email: u.email },
         process.env.JWT_SECRET,
         { expiresIn: '7d' }
       );
@@ -134,15 +128,15 @@ class AuthController {
         message: 'Login successful',
         token,
         user: {
-          userId,
-          email: userEmail,
-          name,
-          role,
-          lastLogin: userRow[6]
+          userId: u.user_id,
+          email: u.email,
+          name: u.name,
+          role: u.role,
+          lastLogin: now.toISOString()
         }
       });
-    } catch (error) {
-      console.error('Login error:', error);
+    } catch (err) {
+      console.error('Login error:', err);
       res.status(500).json({ error: 'Failed to login' });
     }
   }
@@ -151,208 +145,160 @@ class AuthController {
     try {
       const { userId } = req.user;
 
-      // Read Users sheet
-      const users = await sheetsService.readSheet('Users');
-      
-      // Find user by userId
-      const userRow = users.slice(1).find(user => user[0] === userId);
-      
-      if (!userRow) {
-        return res.status(404).json({ error: 'User not found' });
-      }
+      const { rows } = await pool.query(
+        'SELECT user_id, email, name, role, created_at, last_login FROM users WHERE user_id = $1',
+        [userId]
+      );
 
-      const [id, email, , name, role, createdAt, lastLogin] = userRow;
+      if (!rows.length) return res.status(404).json({ error: 'User not found' });
 
+      const u = rows[0];
       res.json({
         user: {
-          userId: id,
-          email,
-          name,
-          role,
-          createdAt,
-          lastLogin
+          userId: u.user_id,
+          email: u.email,
+          name: u.name,
+          role: u.role,
+          createdAt: u.created_at,
+          lastLogin: u.last_login
         }
       });
-    } catch (error) {
-      console.error('Get user error:', error);
+    } catch (err) {
+      console.error('Get user error:', err);
       res.status(500).json({ error: 'Failed to get user' });
     }
   }
 
   async getAllUsers(req, res) {
     try {
-      const { userId } = req.user;
-
-      // Read Users sheet
-      const users = await sheetsService.readSheet('Users');
-      
-      // Find requesting user to check if admin
-      const requestingUser = users.slice(1).find(user => user[0] === userId);
-      
-      if (!requestingUser || requestingUser[4] !== 'Admin') {
+      if (req.user?.role !== 'Admin') {
         return res.status(403).json({ error: 'Access denied. Admin only.' });
       }
 
-      // Map all users (excluding password hash)
-      const allUsers = users.slice(1).map(user => ({
-        userId: user[0],
-        email: user[1],
-        name: user[3],
-        role: user[4],
-        createdAt: user[5],
-        lastLogin: user[6]
-      }));
+      const { rows } = await pool.query(
+        'SELECT user_id, email, name, role, created_at, last_login FROM users ORDER BY created_at'
+      );
 
       res.json({
         success: true,
-        users: allUsers
+        users: rows.map(u => ({
+          userId: u.user_id,
+          email: u.email,
+          name: u.name,
+          role: u.role,
+          createdAt: u.created_at,
+          lastLogin: u.last_login
+        }))
       });
-    } catch (error) {
-      console.error('Get all users error:', error);
+    } catch (err) {
+      console.error('Get all users error:', err);
       res.status(500).json({ error: 'Failed to fetch users' });
     }
   }
 
   async updateUserRole(req, res) {
     try {
-      const { userId } = req.user;
+      if (req.user?.role !== 'Admin') {
+        return res.status(403).json({ error: 'Access denied. Admin only.' });
+      }
+
       const { userId: targetUserId } = req.params;
       const { role } = req.body;
 
-      // Validate role
       if (!['Admin', 'Agent'].includes(role)) {
         return res.status(400).json({ error: 'Invalid role. Must be Admin or Agent.' });
       }
 
-      // Read Users sheet
-      const users = await sheetsService.readSheet('Users');
-      
-      // Find requesting user to check if admin
-      const requestingUser = users.slice(1).find(user => user[0] === userId);
-      
-      if (!requestingUser || requestingUser[4] !== 'Admin') {
-        return res.status(403).json({ error: 'Access denied. Admin only.' });
-      }
-
-      // Find target user
-      const targetRowIndex = users.findIndex(user => user[0] === targetUserId);
-      
-      if (targetRowIndex < 1) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      // Prevent admin from changing their own role
-      if (userId === targetUserId) {
+      if (String(req.user.userId) === String(targetUserId)) {
         return res.status(400).json({ error: 'Cannot change your own role' });
       }
 
-      // Update role
-      users[targetRowIndex][4] = role;
-      await sheetsService.updateRow('Users', targetRowIndex + 1, users[targetRowIndex]);
+      const { rows } = await pool.query(
+        `UPDATE users SET role = $1 WHERE user_id = $2
+         RETURNING user_id, email, name, role`,
+        [role, targetUserId]
+      );
 
+      if (!rows.length) return res.status(404).json({ error: 'User not found' });
+
+      invalidateUserCache(targetUserId.toString());
+
+      const u = rows[0];
       res.json({
         success: true,
         message: 'User role updated successfully',
-        user: {
-          userId: users[targetRowIndex][0],
-          email: users[targetRowIndex][1],
-          name: users[targetRowIndex][3],
-          role: users[targetRowIndex][4]
-        }
+        user: { userId: u.user_id, email: u.email, name: u.name, role: u.role }
       });
-    } catch (error) {
-      console.error('Update user role error:', error);
+    } catch (err) {
+      console.error('Update user role error:', err);
       res.status(500).json({ error: 'Failed to update user role' });
     }
   }
 
   async changeUserPassword(req, res) {
     try {
-      const { userId } = req.user;
+      if (req.user?.role !== 'Admin') {
+        return res.status(403).json({ error: 'Access denied. Admin only.' });
+      }
+
       const { userId: targetUserId } = req.params;
       const { newPassword } = req.body;
 
-      // Validate password
       if (!newPassword || newPassword.length < 8) {
         return res.status(400).json({ error: 'Password must be at least 8 characters long' });
       }
 
-      // Read Users sheet
-      const users = await sheetsService.readSheet('Users');
-      
-      // Find requesting user to check if admin
-      const requestingUser = users.slice(1).find(user => user[0] === userId);
-      
-      if (!requestingUser || requestingUser[4] !== 'Admin') {
-        return res.status(403).json({ error: 'Access denied. Admin only.' });
-      }
-
-      // Find target user
-      const targetRowIndex = users.findIndex(user => user[0] === targetUserId);
-      
-      if (targetRowIndex < 1) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-
-      // Hash new password
       const passwordHash = await bcrypt.hash(newPassword, 10);
 
-      // Update password
-      users[targetRowIndex][2] = passwordHash;
-      await sheetsService.updateRow('Users', targetRowIndex + 1, users[targetRowIndex]);
+      const { rowCount } = await pool.query(
+        'UPDATE users SET password_hash = $1 WHERE user_id = $2',
+        [passwordHash, targetUserId]
+      );
 
-      res.json({
-        success: true,
-        message: 'Password changed successfully'
-      });
-    } catch (error) {
-      console.error('Change password error:', error);
+      if (!rowCount) return res.status(404).json({ error: 'User not found' });
+
+      invalidateUserCache(targetUserId.toString());
+
+      res.json({ success: true, message: 'Password changed successfully' });
+    } catch (err) {
+      console.error('Change password error:', err);
       res.status(500).json({ error: 'Failed to change password' });
     }
   }
 
   async deleteUser(req, res) {
     try {
-      const { userId } = req.user;
-      const { userId: targetUserId } = req.params;
-
-      // Read Users sheet
-      const users = await sheetsService.readSheet('Users');
-      
-      // Find requesting user to check if admin
-      const requestingUser = users.slice(1).find(user => user[0] === userId);
-      
-      if (!requestingUser || requestingUser[4] !== 'Admin') {
+      if (req.user?.role !== 'Admin') {
         return res.status(403).json({ error: 'Access denied. Admin only.' });
       }
 
-      // Find target user
-      const targetRowIndex = users.findIndex(user => user[0] === targetUserId);
-      
-      if (targetRowIndex < 1) {
-        return res.status(404).json({ error: 'User not found' });
-      }
+      const { userId: targetUserId } = req.params;
 
-      // Prevent admin from deleting themselves
-      if (userId === targetUserId) {
+      if (String(req.user.userId) === String(targetUserId)) {
         return res.status(400).json({ error: 'Cannot delete your own account' });
       }
 
-      // Count remaining admins
-      const adminCount = users.slice(1).filter(user => user[4] === 'Admin').length;
-      if (users[targetRowIndex][4] === 'Admin' && adminCount <= 1) {
+      // Guard: don't delete the last admin
+      const { rows: adminRows } = await pool.query(
+        "SELECT COUNT(*) AS cnt FROM users WHERE role = 'Admin'"
+      );
+      const { rows: targetRows } = await pool.query(
+        'SELECT role FROM users WHERE user_id = $1',
+        [targetUserId]
+      );
+
+      if (!targetRows.length) return res.status(404).json({ error: 'User not found' });
+
+      if (targetRows[0].role === 'Admin' && parseInt(adminRows[0].cnt) <= 1) {
         return res.status(400).json({ error: 'Cannot delete the last admin user' });
       }
 
-      // Delete user
-      await sheetsService.deleteRow('Users', targetRowIndex + 1);
+      await pool.query('DELETE FROM users WHERE user_id = $1', [targetUserId]);
+      invalidateUserCache(targetUserId.toString());
 
-      res.json({
-        success: true,
-        message: 'User deleted successfully'
-      });
-    } catch (error) {
-      console.error('Delete user error:', error);
+      res.json({ success: true, message: 'User deleted successfully' });
+    } catch (err) {
+      console.error('Delete user error:', err);
       res.status(500).json({ error: 'Failed to delete user' });
     }
   }

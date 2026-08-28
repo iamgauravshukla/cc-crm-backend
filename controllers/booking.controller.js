@@ -1,1857 +1,2205 @@
+'use strict';
 const { v4: uuidv4 } = require('uuid');
-const sheetsService = require('../services/sheets.service');
-const NodeCache = require('node-cache');
 const Joi = require('joi');
-const { parseDateString, parsePrice, mapRowToBooking } = require('../utils/dataParser');
-
-// Cache with 5 minute TTL
-const cache = new NodeCache({ stdTTL: 300 });
-
-// Helper function to format current timestamp as "Feb 21 2026 10:53 AM"
-const getCurrentTimestamp = () => {
-  const now = new Date();
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  const monthName = months[now.getMonth()];
-  const day = now.getDate();
-  const year = now.getFullYear();
-  const hours = now.getHours();
-  const minutes = now.getMinutes().toString().padStart(2, '0');
-  const displayHours = hours % 12 || 12;
-  const ampm = hours >= 12 ? 'PM' : 'AM';
-  
-  return `${monthName} ${day} ${year} ${displayHours}:${minutes} ${ampm}`;
-};
+const pool = require('../db/pool');
 
 // Validation schema for booking creation
 const bookingSchema = Joi.object({
-  branch: Joi.string().required(),
-  status: Joi.string().default('Scheduled'),
-  firstName: Joi.string().required(),
-  lastName: Joi.string().required(),
-  age: Joi.number().integer().min(1).max(150).required(),
-  phone: Joi.string().required(),
-  socialMedia: Joi.string().allow('').optional(),
-  email: Joi.string().email().required(),
-  treatment: Joi.string().required(),
-  area: Joi.string().allow('').optional(),
-  freebie: Joi.string().allow('').optional(),
-  date: Joi.string().required(),
-  time: Joi.string().required(),
-  paymentMode: Joi.string().valid('Cash', 'Debit', 'Credit').required(),
-  totalPrice: Joi.number().min(0).required(),
-  gender: Joi.string().valid('Male', 'Female').required(),
-  companionFirstName: Joi.string().allow('').optional(),
-  companionLastName: Joi.string().allow('').optional(),
-  companionAge: Joi.alternatives().try(Joi.number(), Joi.string().allow('')).optional(),
-  companionFreebie: Joi.string().allow('').optional(),
-  companionTreatment: Joi.string().allow('').optional(),
-  companionGender: Joi.string().valid('Male', 'Female', '').allow('').optional(),
-  companionArea: Joi.string().allow('').optional(),
-  bookingDetails: Joi.string().allow('').optional(),
-  adInteracted: Joi.string().allow('').optional(),
-  agent: Joi.string().required()
+  branch:              Joi.string().required(),
+  status:              Joi.string().default('Scheduled'),
+  firstName:           Joi.string().trim().required(),
+  lastName:            Joi.string().trim().required(),
+  age:                 Joi.number().integer().min(1).max(150).required(),
+  phone:               Joi.string().trim().required(),
+  socialMedia:         Joi.string().allow('', null).optional(),
+  email:               Joi.string().allow('', null).optional(),   // freeform — agents may write "N/A" or leave blank
+  treatment:           Joi.string().required(),
+  area:                Joi.string().allow('', null).optional(),
+  freebie:             Joi.string().allow('', null).optional(),
+  date:                Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).required(),  // YYYY-MM-DD
+  time:                Joi.string().pattern(/^\d{2}:\d{2}$/).required(),        // HH:MM (24h)
+  paymentMode:         Joi.string().required(),
+  totalPrice:          Joi.number().min(0).required(),
+  gender:              Joi.string().valid('Male', 'Female').required(),
+  companionFirstName:  Joi.string().allow('', null).optional(),
+  companionLastName:   Joi.string().allow('', null).optional(),
+  companionAge:        Joi.alternatives().try(Joi.number().integer().min(1), Joi.string().allow('')).optional(),
+  companionFreebie:    Joi.string().allow('', null).optional(),
+  companionTreatment:  Joi.string().allow('', null).optional(),
+  companionGender:     Joi.string().valid('Male', 'Female', '').allow('', null).optional(),
+  companionArea:       Joi.string().allow('', null).optional(),
+  bookingDetails:      Joi.string().allow('', null).optional(),
+  adInteracted:        Joi.string().allow('', null).optional(),
+  remarks:             Joi.string().allow('', null).optional(),
+  followUpDate:        Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).allow('', null).optional(),
+  agent:               Joi.string().required(),
+  isOts:               Joi.boolean().default(false),
+  isCompanion:         Joi.boolean().default(false),
+  isPromoHunter:       Joi.boolean().default(false)
 });
 
+// ── Activity log helper ───────────────────────────────────────────────────────
+async function logActivity(bookingId, user, action, changes = {}) {
+  try {
+    await pool.query(
+      `INSERT INTO booking_activity_log (booking_id, user_id, user_name, action, changes)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        bookingId,
+        user?.userId || null,
+        user?.name   || user?.email || 'System',
+        action,
+        JSON.stringify(changes)
+      ]
+    );
+  } catch (err) {
+    console.error('Activity log write failed:', err.message);
+  }
+}
+
+const normDate = v => {
+  if (v == null) return '';
+  const d = v instanceof Date ? v : new Date(v);
+  if (isNaN(d.getTime())) return '';
+  // Use UTC methods — PostgreSQL DATE columns come back as midnight UTC, so UTC parts = stored date
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
+};
+
+// Appends the "Booked On" (booking_date) and Appointment-date filters shared by
+// the Master Bookings table (getOldBookings) and its CSV export (exportBookings),
+// so the two never drift. Mutates conds/params; returns the next param index.
+const pushBookingDateFilters = (conds, params, idx, q) => {
+  const TODAY = "(NOW() AT TIME ZONE 'Asia/Manila')::date";
+
+  // Booked On — filters by booking_date (the date agents enter, shown in the table)
+  if (q.createdStartDate && q.createdEndDate) {
+    conds.push(`booking_date >= $${idx++}::date AND booking_date <= $${idx++}::date`);
+    params.push(q.createdStartDate, q.createdEndDate);
+  } else if (q.createdDateRange && q.createdDateRange !== 'all') {
+    if (q.createdDateRange === 'today') {
+      conds.push(`booking_date = ${TODAY}`);
+    } else {
+      const d = { last7: 7, last30: 30, last90: 90 }[q.createdDateRange];
+      if (d) conds.push(`booking_date >= ${TODAY} - INTERVAL '${d} days'`);
+    }
+  }
+
+  // Appointment date
+  if (q.appointmentStartDate && q.appointmentEndDate) {
+    conds.push(`appointment_date >= $${idx++}::date AND appointment_date <= $${idx++}::date`);
+    params.push(q.appointmentStartDate, q.appointmentEndDate);
+  } else if (q.appointmentDateRange && q.appointmentDateRange !== 'all') {
+    const r = q.appointmentDateRange;
+    if      (r === 'today')     conds.push(`appointment_date = ${TODAY}`);
+    else if (r === 'yesterday') conds.push(`appointment_date = ${TODAY} - 1`);
+    else if (r === 'tomorrow')  conds.push(`appointment_date = ${TODAY} + 1`);
+    else if (r === 'thisWeek')  conds.push(`appointment_date >= ${TODAY} AND appointment_date <= ${TODAY} + (6 - EXTRACT(DOW FROM ${TODAY})::int)`);
+    else if (r === 'next7')     conds.push(`appointment_date >= ${TODAY} AND appointment_date <= ${TODAY} + 7`);
+    else if (r === 'next30')    conds.push(`appointment_date >= ${TODAY} AND appointment_date <= ${TODAY} + 30`);
+    else if (r === 'last7')     conds.push(`appointment_date >= ${TODAY} - 7 AND appointment_date < ${TODAY}`);
+    else if (r === 'last30')    conds.push(`appointment_date >= ${TODAY} - 30 AND appointment_date < ${TODAY}`);
+    else if (r === 'last90')    conds.push(`appointment_date >= ${TODAY} - 90 AND appointment_date < ${TODAY}`);
+    else if (r === 'thisMonth') conds.push(`DATE_TRUNC('month', appointment_date) = DATE_TRUNC('month', ${TODAY})`);
+    else if (r === 'lastMonth') conds.push(`DATE_TRUNC('month', appointment_date) = DATE_TRUNC('month', ${TODAY} - INTERVAL '1 month')`);
+  }
+
+  return idx;
+};
+
+// Appends the Branch / Status / Agent / Gender filters shared by getOldBookings and
+// exportBookings. Each text field supports an include list ("A,B"), the legacy
+// "NOT:A,B" prefix, and a separate <field>Not param so an "is" and an "is not"
+// filter on the SAME field can be active together (#6 team request).
+const pushTextFilters = (conds, params, idx, q) => {
+  const split = (v) => String(v || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  const apply = (raw, notRaw, colExpr) => {
+    let exc = split(notRaw);
+    let inc = [];
+    const val = (raw || '').trim();
+    if (val && val !== 'All') {
+      if (val.startsWith('NOT:')) exc = exc.concat(split(val.slice(4)));
+      else inc = split(val);
+    }
+    if (inc.length) { conds.push(`${colExpr} = ANY($${idx++}::text[])`); params.push(inc); }
+    if (exc.length) { conds.push(`NOT (${colExpr} = ANY($${idx++}::text[]))`); params.push(exc); }
+  };
+  apply(q.branch, q.branchNot, 'LOWER(branch)');
+  apply(q.status, q.statusNot, 'LOWER(booking_status)');
+  apply(q.agent,  q.agentNot,  `LOWER(COALESCE(agent,''))`);
+  if (q.gender && q.gender !== 'All') {
+    conds.push(`LOWER(COALESCE(gender,'')) = $${idx++}`);
+    params.push(q.gender.toLowerCase());
+  }
+  return idx;
+};
+
+// ── Per-widget "refine" filters ──────────────────────────────────────────────
+// Each report widget can carry conditions on branch / status / agent / date-range,
+// with is / isNot / isLike operators, combined by AND or OR. They REFINE (narrow)
+// the widget's built-in formula — evaluated per row in JS during aggregation.
+const _apptStr = row => row.appointment_date ? new Date(row.appointment_date).toISOString().slice(0, 10) : null;
+const _bookedStr = row => row.booking_date ? new Date(row.booking_date).toISOString().slice(0, 10) : null;
+// Manila "today" as YYYY-MM-DD, and a day-shift helper for date presets.
+const _phToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date());
+const _shiftStr = (baseStr, days) => {
+  const d = new Date(baseStr + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+};
+// Does date string `d` fall in the named preset window, relative to `today`?
+// Presets mirror Monday's date filter values (is Today / is not Tomorrow / …).
+const matchDatePreset = (d, preset, today) => {
+  if (!d) return false;
+  switch (preset) {
+    case 'today':     return d === today;
+    case 'yesterday': return d === _shiftStr(today, -1);
+    case 'tomorrow':  return d === _shiftStr(today, 1);
+    case 'next7':     return d >= today && d <= _shiftStr(today, 7);
+    case 'thisWeek': {
+      // Mon–Sun week containing today.
+      const dow = new Date(today + 'T00:00:00Z').getUTCDay(); // 0=Sun..6=Sat
+      const start = _shiftStr(today, -((dow + 6) % 7));
+      return d >= start && d <= _shiftStr(start, 6);
+    }
+    case 'past':   return d < today;
+    case 'future': return d > today;
+    default:       return true; // unknown preset → don't constrain
+  }
+};
+// Values may be a single value or an array (multi-select). Normalize to an array.
+const _asArr = v => Array.isArray(v) ? v : (v == null || v === '' ? [] : [v]);
+const evalWidgetCondition = (row, c, ctx) => {
+  const op  = c.op || 'is';
+  const today = (ctx && ctx.today) || _phToday();
+  const txt = (field) => {
+    const cell = String(row[field] || '').toLowerCase();
+    const vals = _asArr(c.value).map(v => String(v).toLowerCase().trim()).filter(Boolean);
+    if (!vals.length) return true;
+    // Multi-select: "is" = equals any, "is not" = equals none, "is like" = contains any.
+    if (op === 'isNot')  return vals.every(v => cell !== v);
+    if (op === 'isLike') return vals.some(v => cell.includes(v));
+    return vals.some(v => cell === v);
+  };
+  if (c.field === 'branch') return txt('branch');
+  if (c.field === 'status') return txt('booking_status');
+  if (c.field === 'agent')  return txt('agent');
+  // Date fields: bookingSchedule → appointment_date, bookedOn → booking_date.
+  // (dateRange kept as an alias of bookingSchedule for backward compatibility.)
+  if (c.field === 'bookingSchedule' || c.field === 'dateRange' || c.field === 'bookedOn') {
+    const d = c.field === 'bookedOn' ? _bookedStr(row) : _apptStr(row);
+    // Custom {from,to} range (single object value).
+    if (c.value && !Array.isArray(c.value) && typeof c.value === 'object') {
+      const from = c.value.from, to = c.value.to;
+      const inRange = !!d && (!from || d >= from) && (!to || d <= to);
+      return op === 'isNot' ? !inRange : inRange;
+    }
+    const presets = _asArr(c.value).filter(v => typeof v === 'string');
+    if (!presets.length) return true;
+    const inAny = presets.some(p => matchDatePreset(d, p, today)); // is any selected preset
+    return op === 'isNot' ? !inAny : inAny;
+  }
+  return true;
+};
+const matchesWidgetFilter = (row, filter, ctx) => {
+  if (!filter || !Array.isArray(filter.conditions) || filter.conditions.length === 0) return true;
+  const rs = filter.conditions.map(c => evalWidgetCondition(row, c, ctx));
+  return String(filter.logic).toLowerCase() === 'or' ? rs.some(Boolean) : rs.every(Boolean);
+};
+const parseWidgetFilters = (q) => { try { return JSON.parse(q.filters || '{}') || {}; } catch { return {}; } };
+const parseSingleFilter  = (q) => { try { return q.filter ? JSON.parse(q.filter) : null; } catch { return null; } };
+const widgetCtx = () => ({ today: _phToday() });
+
+// Placeholder emails entered when a client has no real address (e.g. n/a@gmail.com,
+// na@gmail.com). Many unrelated clients share these, so they must NOT drive Promo
+// Hunter matching — normalize them to '' ("no email") for both storage and matching.
+const PLACEHOLDER_EMAIL_LOCALS = new Set(['n/a', 'na', 'none', 'noemail', 'nil', 'n.a', 'n-a']);
+const normalizeEmail = (email) => {
+  const e = (email || '').toLowerCase().trim();
+  if (!e) return '';
+  const local = e.split('@')[0];
+  return PLACEHOLDER_EMAIL_LOCALS.has(local) ? '' : e;
+};
+
+const normalizeGender = v => {
+  const l = (v || '').toLowerCase();
+  if (l === 'female') return 'Female';
+  if (l === 'male')   return 'Male';
+  return v || '';
+};
+
+const normalizePaymentMode = v => {
+  const l = (v || '').toLowerCase();
+  if (l.startsWith('cash'))   return 'Cash';
+  if (l.startsWith('debit'))  return 'Debit';
+  if (l.startsWith('credit')) return 'Credit';
+  return v || '';
+};
+
 class BookingController {
+
+  // ── createBooking ──────────────────────────────────────────────────────────
   async createBooking(req, res) {
     try {
-      // Validate input
       const { error, value } = bookingSchema.validate(req.body);
-      if (error) {
-        return res.status(400).json({ error: error.details[0].message });
-      }
+      if (error) return res.status(400).json({ error: error.details[0].message });
 
-      const bookingData = value;
-      const userId = req.user.userId;
+      const d = value;
+      // Guard against any client-side float drift on the price (e.g. 599.98 for 600) — store clean 2-decimal pesos.
+      if (typeof d.totalPrice === 'number') d.totalPrice = Math.round(d.totalPrice * 100) / 100;
+      const recordId = `BK-${new Date().toISOString().slice(0,10).replace(/-/g,'')}-${uuidv4().slice(0,8).toUpperCase()}`;
+      const now      = new Date();
 
-      // Generate booking ID and timestamp
-      const bookingId = uuidv4();
-      const timestamp = getCurrentTimestamp();
+      // Parse appointment date + time into separate DB columns
+      const appointmentDate = d.date;  // YYYY-MM-DD
+      const appointmentTime = formatTime12h(d.time); // "HH:MM" → "H:MM AM/PM"
 
-      // Format date and time to match "Feb 25 2026 12:00 AM" format
-      const formatDateTime = (dateStr, timeStr) => {
-        // dateStr is in format "YYYY-MM-DD" (from date input)
-        // timeStr is in format "HH:MM" (from time input)
-        const [year, month, day] = dateStr.split('-');
-        const [hours, minutes] = timeStr ? timeStr.split(':') : ['00', '00'];
-        
-        const date = new Date(year, parseInt(month) - 1, day, hours, minutes);
-        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-        const monthName = months[date.getMonth()];
-        const dayNum = date.getDate();
-        const yearNum = date.getFullYear();
-        const displayHours = parseInt(hours) % 12 || 12;
-        const minutesStr = minutes.toString().padStart(2, '0');
-        const ampm = parseInt(hours) >= 12 ? 'PM' : 'AM';
-        
-        return `${monthName} ${dayNum} ${yearNum} ${displayHours}:${minutesStr} ${ampm}`;
-      };
-      
-      const formattedDate = formatDateTime(bookingData.date, bookingData.time);
+      // booking_date/time = when this booking was created, in Philippine time (UTC+8)
+      const phFmt       = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
+      const phTimeFmt   = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit', hour12: false });
+      const bookingDate = phFmt.format(now);                  // "YYYY-MM-DD"
+      const bookingTime = formatTime12h(phTimeFmt.format(now)); // "HH:MM" → "H:MM AM/PM"
 
-      // Check for promo hunter status BEFORE saving
-      const promoHunterResult = await checkPromoHunter(
-        bookingData.firstName,
-        bookingData.lastName,
-        bookingData.email,
-        bookingData.phone,
-        bookingData.socialMedia,
-        bookingData.companionFirstName,
-        bookingData.companionLastName
+      // Promo hunter check
+      const promoResult = await checkPromoHunter(
+        d.firstName, d.lastName, d.email, d.phone, d.socialMedia,
+        d.companionFirstName, d.companionLastName
       );
 
-      // Update booking status if customer is a Promo Hunter
-      let finalStatus = bookingData.status || 'Scheduled';
-      if (promoHunterResult.status === 'Promo hunter') {
-        finalStatus = 'Promo hunter';
-      }
+      // Keep the real appointment status; "promo hunter" is a separate flag (customer trait),
+      // set by auto-detection OR a manual toggle from the form — never overwrites the status.
+      const finalStatus   = d.status || 'Scheduled';
+      const isPromoHunter = d.isPromoHunter === true || promoResult.status === 'Promo hunter';
 
-      // Prepare row matching Google Sheet columns (Intake sheet: 37 columns A-AK)
-      const newRow = [
-        timestamp,                              // A: Timestamp
-        bookingData.branch,                     // B: Ad Interacted
-        bookingData.branch,                     // C: Branch
-        finalStatus,                            // D: Booking Status (updated if promo hunter)
-        bookingData.firstName,                  // E: First Name
-        bookingData.lastName,                   // F: Last Name
-        bookingData.age,                        // G: Age
-        bookingData.phone,                      // H: Phone
-        bookingData.socialMedia || '',          // I: Facebook / Instagram Name
-        bookingData.email || '',                // J: Email
-        bookingData.treatment,                  // K: Promo/Treatment
-        bookingData.area || '',                 // L: Area
-        bookingData.freebie || '',              // M: Freebie
-        formattedDate,                          // N: Date
-        bookingData.paymentMode,                // O: Mode of payment
-        bookingData.totalPrice,                 // P: Total Price
-        bookingData.gender,                     // Q: Gender
-        bookingData.companionFirstName || '',   // R: Companion First Name
-        bookingData.companionLastName || '',    // S: Companion Last Name
-        bookingData.companionAge || '',         // T: Companion Age
-        bookingData.companionFreebie || '',     // U: Companion Freebie
-        bookingData.companionTreatment || '',   // V: Companion Promo/Treatment
-        bookingData.companionGender || '',      // W: Companion Gender
-        bookingData.bookingDetails || '',       // X: Booking Details
-        bookingData.agent,                      // Y: Agent
-        (bookingData.email || '').toLowerCase(),        // Z: email_norm
-        bookingData.phone.replace(/\D/g, ''),   // AA: phone_norm
-        (bookingData.socialMedia || '').toLowerCase(), // AB: social_norm
-        `${bookingData.firstName} ${bookingData.lastName}`.toLowerCase(), // AC: full_name_norm
-        `${bookingData.companionFirstName || ''} ${bookingData.companionLastName || ''}`.trim().toLowerCase(), // AD: companion_full_name_norm
-        promoHunterResult.status,               // AE: promo_hunter_status
-        promoHunterResult.matchReason,          // AF: match_reason
-        promoHunterResult.matchedSource,        // AG: matched_source
-        promoHunterResult.matchedRow,           // AH: matched_row
-        bookingId,                              // AI: record_id (UUID)
-        'active',                               // AJ: record_status
-        timestamp                               // AK: last_checked_at
-      ];
+      // Normalized fields
+      const emailNorm   = normalizeEmail(d.email);
+      const phoneNorm   = (d.phone        || '').replace(/\D/g, '');
+      const socialNorm  = (d.socialMedia  || '').toLowerCase().trim();
+      const fullName    = `${d.firstName} ${d.lastName}`.toLowerCase().trim();
+      const companionFN = (d.companionFirstName || '').trim() && (d.companionLastName || '').trim()
+        ? `${d.companionFirstName} ${d.companionLastName}`.toLowerCase().trim()
+        : '';
 
-      // Append to Intake sheet
-      await sheetsService.appendRow('Intake', newRow);
+      await pool.query(`
+        INSERT INTO bookings (
+          record_id, record_status, created_at,
+          branch, booking_status,
+          booking_date, booking_time, appointment_date, appointment_time,
+          first_name, last_name, age, gender,
+          phone, email, social_media,
+          treatment, area, freebie, total_price, payment_mode,
+          companion_treatment, companion_first_name, companion_last_name,
+          companion_age, companion_gender, companion_freebie, companion_area,
+          agent, booking_details, remarks, ad_interacted,
+          email_norm, phone_norm, social_norm, full_name_norm, companion_full_name_norm,
+          promo_hunter_status, match_reason, matched_source, matched_row, last_checked_at,
+          is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion, is_promo_hunter,
+          follow_up_date, underage_status, db_status
+        ) VALUES (
+          $1,'ACTIVE',$2,
+          $3,$4,
+          $5,$6,$7,$8,
+          $9,$10,$11,$12,
+          $13,$14,$15,
+          $16,$17,$18,$19,$20,
+          $21,$22,$23,
+          $24,$25,$26,$27,
+          $28,$29,$30,$31,
+          $32,$33,$34,$35,$36,
+          $37,$38,$39,$40,$2,
+          $42,false,$43,false,false,$44,
+          $41,'Pending','Pending'
+        )`,
+        [
+          recordId, now,
+          d.branch, finalStatus,
+          bookingDate, bookingTime, appointmentDate, appointmentTime,
+          d.firstName, d.lastName, d.age, d.gender,
+          d.phone, d.email || null, d.socialMedia || null,
+          d.treatment, d.area || null, d.freebie || null, d.totalPrice, d.paymentMode,
+          d.companionTreatment || null, d.companionFirstName || null, d.companionLastName || null,
+          d.companionAge || null, d.companionGender || null, d.companionFreebie || null, d.companionArea || null,
+          d.agent, d.bookingDetails || null, d.remarks || null, d.adInteracted || null,
+          emailNorm, phoneNorm, socialNorm, fullName, companionFN,
+          promoResult.status, promoResult.matchReason || null, promoResult.matchedSource || null, promoResult.matchedRow || null,
+          d.followUpDate || null,
+          d.isOts === true,        // $42 is_ots
+          d.isCompanion === true,  // $43 is_companion
+          isPromoHunter            // $44 is_promo_hunter
+        ]
+      );
 
-      // Also append to DB Sheet (Master DB) for permanent storage
-      // DB Sheet has 44 columns matching the actual Google Sheet structure
-      const masterDbRow = [
-        timestamp,                              // 0: Timestamp
-        bookingData.branch,                     // 1: Branch
-        bookingData.status || 'Scheduled',      // 2: Booking Status
-        formattedDate,                          // 3: Date
-        bookingData.firstName,                  // 4: First Name
-        bookingData.lastName,                   // 5: Last Name
-        bookingData.age,                        // 6: Age
-        bookingData.gender,                     // 7: Gender
-        bookingData.treatment,                  // 8: Promo/Treatment
-        bookingData.area || '',                 // 9: Area
-        bookingData.freebie || '',              // 10: Freebie
-        bookingData.companionTreatment || '',   // 11: Companion Promo/Treatment
-        bookingData.totalPrice,                 // 12: Total Price
-        bookingData.paymentMode,                // 13: Mode of payment
-        bookingData.phone,                      // 14: Phone
-        bookingData.socialMedia || '',          // 15: Facebook / Instagram Name
-        bookingData.email || '',                // 16: Email
-        bookingData.agent,                      // 17: Agent
-        bookingData.bookingDetails || '',       // 18: Booking Details
-        bookingData.adInteracted || '',         // 19: Ad Interacted
-        bookingData.companionFirstName || '',   // 20: Companion First Name
-        bookingData.companionLastName || '',    // 21: Companion Last Name
-        bookingData.companionAge || '',         // 22: Companion Age
-        bookingData.companionGender || '',      // 23: Companion Gender
-        bookingData.companionFreebie || '',     // 24: Companion Freebie
-        bookingData.email.toLowerCase(),        // 25: email_norm
-        bookingData.phone.replace(/\D/g, ''),   // 26: phone_norm
-        (bookingData.socialMedia || '').toLowerCase(), // 27: social_norm
-        `${bookingData.firstName} ${bookingData.lastName}`.toLowerCase(), // 28: full_name_norm
-        `${bookingData.companionFirstName || ''} ${bookingData.companionLastName || ''}`.trim().toLowerCase(), // 29: companion_full_name_norm
-        promoHunterResult.status,               // 30: promo_hunter_status
-        promoHunterResult.matchReason,          // 31: match_reason
-        promoHunterResult.matchedSource,        // 32: matched_source
-        promoHunterResult.matchedRow,           // 33: matched_row
-        bookingId,                              // 34: record_id
-        'active',                               // 35: record_status
-        timestamp,                              // 36: last_checked_at
-        '',                                     // 37: legacy_full_name
-        '',                                     // 38: exclude_from_dashboards
-        timestamp,                              // 39: dash_booking_created_at
-        formattedDate,                          // 40: dash_appointment_date
-        bookingData.branch,                     // 41: dash_branch
-        finalStatus,                            // 42: dash_booking_status (updated if promo hunter)
-        '',                                     // 43: cancellation_time (empty for new bookings)
-        '',                                     // 44: cancel_validation (FALSE by default)
-        '',                                     // 45: underage_validation (FALSE by default)
-        bookingData.companionArea || ''          // 46: companion_area
-      ];
-      await sheetsService.appendRow('DB', masterDbRow);
-
-      // Clear cache
-      cache.del('old_bookings_all');
+      await logActivity(recordId, req.user, 'CREATED', {
+        branch: { to: d.branch }, booking_status: { to: finalStatus },
+        treatment: { to: d.treatment }, total_price: { to: d.totalPrice }
+      });
 
       res.status(201).json({
         message: 'Booking created successfully',
         booking: {
-          bookingId,
-          timestamp,
-          ...bookingData,
-          promoHunterStatus: promoHunterResult.status
+          recordId,
+          ...d,
+          promoHunterStatus: promoResult.status,
+          isPromoHunter,
+          finalStatus
         }
       });
-    } catch (error) {
-      console.error('Create booking error:', error);
+    } catch (err) {
+      console.error('Create booking error:', err);
       res.status(500).json({ error: 'Failed to create booking' });
     }
   }
 
+  // ── getOldBookings ─────────────────────────────────────────────────────────
   async getOldBookings(req, res) {
     try {
-      const page = parseInt(req.query.page) || 1;
-      const limit = parseInt(req.query.limit) || 50;
-      const search = req.query.search || '';
-      const branch = req.query.branch || '';
-      const status = req.query.status || '';
-      const agent  = req.query.agent  || '';
-      const gender = req.query.gender || '';
-      const sortOrder = req.query.sortOrder || 'newest'; // 'newest' or 'oldest'
-      
-      // Booking Created Date filters (timestamp based)
-      const createdDateRange = req.query.createdDateRange;
-      const createdStartDate = req.query.createdStartDate;
-      const createdEndDate = req.query.createdEndDate;
-      
-      // Appointment Date filters (scheduled date based)
+      const page      = Math.max(1, parseInt(req.query.page)  || 1);
+      const limit     = Math.min(200, parseInt(req.query.limit) || 50);
+      const search    = (req.query.search    || '').trim();
+      const branch    = (req.query.branch    || '').trim();
+      const status    = (req.query.status    || '').trim();
+      const agent     = (req.query.agent     || '').trim();
+      const gender    = (req.query.gender    || '').trim();
+      const sortOrder = req.query.sortOrder  || 'newest';
+      const sortField = req.query.sortField  || 'appointment_date';
+
+      const createdDateRange    = req.query.createdDateRange;
+      const createdStartDate    = req.query.createdStartDate;
+      const createdEndDate      = req.query.createdEndDate;
       const appointmentDateRange = req.query.appointmentDateRange;
       const appointmentStartDate = req.query.appointmentStartDate;
-      const appointmentEndDate = req.query.appointmentEndDate;
-      
-      // Always read fresh from Google Sheets (no caching)
-      const rows = await sheetsService.readSheet('DB');
+      const appointmentEndDate   = req.query.appointmentEndDate;
 
-      if (rows.length < 2) {
-        return res.json({
-          bookings: [],
-          pagination: {
-            page: 1,
-            limit,
-            total: 0,
-            totalPages: 0
-          }
-        });
-      }
+      const conds  = ["record_status != 'DELETED'"];
+      const params = [];
+      let   idx    = 1;
 
-      // Parse rows into objects
-      const allBookings = rows.slice(1).map((row, index) => {
-        // Parse price - remove peso sign and any non-numeric characters except decimal point
-        let price = row[12] || '0';
-        if (typeof price === 'string') {
-          price = price.replace(/[^0-9.]/g, '');
-        }
-
-        return {
-          rowNumber: index + 2,
-          timestamp: row[0] || '',
-          branch: row[1] || '',
-          status: row[2] || '',
-          date: row[3] || '',
-          firstName: row[4] || '',
-          lastName: row[5] || '',
-          age: row[6] || '',
-          gender: row[7] || '',
-          treatment: row[8] || '',
-          area: row[9] || '',
-          freebie: row[10] || '',
-          companionTreatment: row[11] || '',
-          totalPrice: parseFloat(price) || 0,
-          paymentMode: row[13] || '',
-          phone: row[14] || '',
-          socialMedia: row[15] || '',
-          email: row[16] || '',
-          agent: row[17] || '',
-          bookingDetails: row[18] || '',
-          adInteracted: row[19] || '',
-          companionFirstName: row[20] || '',
-          companionLastName: row[21] || '',
-          companionAge: row[22] || '',
-          companionGender: row[23] || '',
-          companionFreebie: row[24] || '',
-          companionArea: row[46] || '',
-          promoHunterStatus: row[30] || '',
-          // Exclusion validation flags (cols 44–45)
-          cancelValidation:   (row[44] || '').toString().toUpperCase() === 'TRUE',
-          underageValidation: (row[45] || '').toString().toUpperCase() === 'TRUE'
-        };
+      // Branch / Status / Agent / Gender filters (is + is-not combinable) — shared with exportBookings
+      idx = pushTextFilters(conds, params, idx, {
+        branch, branchNot: req.query.branchNot,
+        status, statusNot: req.query.statusNot,
+        agent,  agentNot:  req.query.agentNot,
+        gender,
       });
 
-      // Pre-calculate all date boundaries once (outside the filter loop for performance)
-      const now = new Date();
-      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      
-      // Helper function to safely parse dates with caching
-      const parseDate = (dateStr, isTimestamp = false) => {
-        if (!dateStr) return null;
-        try {
-          return parseDateString(dateStr);
-        } catch {
-          return null;
-        }
-      };
-      
-      // Pre-calculate created date filter boundaries
-      let createdDateStart = null;
-      let createdDateEnd = null;
-      let applyCreatedFilter = false;
-      
-      if (createdStartDate && createdEndDate) {
-        createdDateStart = new Date(createdStartDate);
-        createdDateStart.setHours(0, 0, 0, 0);
-        createdDateEnd = new Date(createdEndDate);
-        createdDateEnd.setHours(23, 59, 59, 999);
-        applyCreatedFilter = true;
-      } else if (createdDateRange && createdDateRange !== 'all') {
-        applyCreatedFilter = true;
-        if (createdDateRange === 'today') {
-          createdDateStart = today;
-          createdDateEnd = tomorrow;
-        } else if (createdDateRange === 'last7' || createdDateRange === 'last30' || createdDateRange === 'last90') {
-          let days = createdDateRange === 'last7' ? 7 : createdDateRange === 'last30' ? 30 : 90;
-          createdDateStart = new Date(today);
-          createdDateStart.setDate(createdDateStart.getDate() - days);
-          createdDateEnd = tomorrow;
-        }
-      }
-      
-      // Pre-calculate appointment date filter boundaries
-      let appointmentDateStart = null;
-      let appointmentDateEnd = null;
-      let applyAppointmentFilter = false;
-      
-      if (appointmentStartDate && appointmentEndDate) {
-        appointmentDateStart = new Date(appointmentStartDate);
-        appointmentDateStart.setHours(0, 0, 0, 0);
-        appointmentDateEnd = new Date(appointmentEndDate);
-        appointmentDateEnd.setHours(23, 59, 59, 999);
-        applyAppointmentFilter = true;
-      } else if (appointmentDateRange && appointmentDateRange !== 'all') {
-        applyAppointmentFilter = true;
-        if (appointmentDateRange === 'today') {
-          appointmentDateStart = today;
-          appointmentDateEnd = tomorrow;
-        } else if (appointmentDateRange === 'tomorrow') {
-          appointmentDateStart = tomorrow;
-          const dayAfterTomorrow = new Date(tomorrow);
-          dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 1);
-          appointmentDateEnd = dayAfterTomorrow;
-        } else if (appointmentDateRange === 'thisWeek') {
-          appointmentDateStart = today;
-          const endOfWeek = new Date(today);
-          endOfWeek.setDate(endOfWeek.getDate() + (6 - today.getDay())); // Days until Sunday
-          endOfWeek.setHours(23, 59, 59, 999);
-          appointmentDateEnd = endOfWeek;
-        }
-      }
-      
-      const searchLower = search ? search.toLowerCase() : null;
-      
-      // Single-pass filtering for performance
-      let filteredBookings = allBookings.filter(booking => {
-        // Branch filter — supports single value, comma-separated multi-values, and NOT: prefix
-        if (branch && branch !== 'All') {
-          const isNot = branch.startsWith('NOT:');
-          const raw = isNot ? branch.slice(4) : branch;
-          const vals = raw.split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
-          const matches = vals.includes((booking.branch || '').toLowerCase());
-          if (isNot ? matches : !matches) return false;
-        }
-        
-        // Status filter — supports single value, comma-separated multi-values, and NOT: prefix
-        if (status && status !== 'All') {
-          const isNot = status.startsWith('NOT:');
-          const raw = isNot ? status.slice(4) : status;
-          const vals = raw.split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
-          const matches = vals.includes((booking.status || '').toLowerCase());
-          if (isNot ? matches : !matches) return false;
-        }
-
-        // Agent filter — supports single or comma-separated multi-values (case-insensitive)
-        if (agent && agent !== 'All') {
-          const vals = agent.split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
-          if (!vals.includes(booking.agent.toLowerCase())) return false;
-        }
-
-        // Gender filter (case-insensitive)
-        if (gender && gender !== 'All' && booking.gender.toLowerCase() !== gender.toLowerCase()) return false;
-        
-        // Created date filter
-        if (applyCreatedFilter) {
-          const createdDate = parseDate(booking.timestamp, true);
-          if (createdDate && !isNaN(createdDate.getTime())) {
-            if (createdDate < createdDateStart || createdDate >= createdDateEnd) {
-              return false;
-            }
-          }
-        }
-        
-        // Appointment date filter
-        if (applyAppointmentFilter) {
-          const appointmentDate = parseDate(booking.date, false);
-          if (appointmentDate && !isNaN(appointmentDate.getTime())) {
-            if (appointmentDate < appointmentDateStart || appointmentDate >= appointmentDateEnd) {
-              return false;
-            }
-          }
-        }
-        
-        // Search filter
-        if (searchLower) {
-          const searchMatch = (
-            booking.firstName.toLowerCase().includes(searchLower) ||
-            booking.lastName.toLowerCase().includes(searchLower) ||
-            booking.email.toLowerCase().includes(searchLower) ||
-            booking.phone.includes(search) ||
-            booking.socialMedia.toLowerCase().includes(searchLower) ||
-            booking.agent.toLowerCase().includes(searchLower) ||
-            booking.treatment.toLowerCase().includes(searchLower) ||
-            booking.branch.toLowerCase().includes(searchLower)
-          );
-          if (!searchMatch) {
-            return false;
-          }
-        }
-        
-        return true;
+      // Booked On (booking_date) + Appointment-date filters — shared with exportBookings
+      idx = pushBookingDateFilters(conds, params, idx, {
+        createdStartDate, createdEndDate, createdDateRange,
+        appointmentStartDate, appointmentEndDate, appointmentDateRange,
       });
 
-      // Sort by appointment date (booking.date), not by sheet row order.
-      // Row order reflects creation time, which has nothing to do with scheduled date.
-      filteredBookings.sort((a, b) => {
-        const da = parseDate(a.date);
-        const db = parseDate(b.date);
-        const ta = da && !isNaN(da.getTime()) ? da.getTime() : 0;
-        const tb = db && !isNaN(db.getTime()) ? db.getTime() : 0;
-        return sortOrder === 'newest' ? tb - ta : ta - tb;
-      });
+      // Search filter
+      if (search) {
+        const q = `%${search.toLowerCase()}%`;
+        conds.push(`(LOWER(COALESCE(first_name,'')) LIKE $${idx} OR LOWER(COALESCE(last_name,'')) LIKE $${idx} OR (LOWER(COALESCE(first_name,'')) || ' ' || LOWER(COALESCE(last_name,''))) LIKE $${idx} OR LOWER(COALESCE(full_name_norm,'')) LIKE $${idx} OR LOWER(COALESCE(email,'')) LIKE $${idx} OR phone LIKE $${idx} OR LOWER(COALESCE(social_media,'')) LIKE $${idx} OR LOWER(COALESCE(agent,'')) LIKE $${idx} OR LOWER(COALESCE(treatment,'')) LIKE $${idx} OR LOWER(COALESCE(branch,'')) LIKE $${idx} OR LOWER(COALESCE(companion_first_name,'')) LIKE $${idx} OR LOWER(COALESCE(companion_last_name,'')) LIKE $${idx} OR (LOWER(COALESCE(companion_first_name,'')) || ' ' || LOWER(COALESCE(companion_last_name,''))) LIKE $${idx} OR LOWER(COALESCE(companion_full_name_norm,'')) LIKE $${idx})`);
+        params.push(q);
+        idx++;
+      }
 
-      // Calculate pagination
-      const total = filteredBookings.length;
+      const WHERE  = `WHERE ${conds.join(' AND ')}`;
+      const ORDER  = sortOrder === 'oldest' ? 'ASC' : 'DESC';
+      const OFFSET = (page - 1) * limit;
+      const ALLOWED_SORT = { appointment_date: 'appointment_date', booking_date: 'booking_date', age: 'age' };
+      const SORT_COL = ALLOWED_SORT[sortField] || 'appointment_date';
+      // Secondary sort by the matching time column, parsed from "10:00 AM" text into a
+      // real time so it orders chronologically (not lexically). Malformed times sort last.
+      const TIME_COL = { appointment_date: 'appointment_time', booking_date: 'booking_time' }[SORT_COL];
+      // Times are stored either 12-hour ("9:19 AM") or 24-hour ("09:19") — parse both.
+      let TIME_SORT = '';
+      if (TIME_COL) {
+        const parsed = `CASE
+              WHEN ${TIME_COL} ~* '(AM|PM)'            THEN to_timestamp(${TIME_COL}, 'HH12:MI AM')::time
+              WHEN ${TIME_COL} ~ '^[0-9]{1,2}:[0-9]{2}$' THEN to_timestamp(${TIME_COL}, 'HH24:MI')::time
+              ELSE NULL END`;
+        // "Booked On" (booking_date): when booking_time is blank, fall back to the
+        // creation time so those rows still order chronologically instead of dropping to the bottom.
+        const expr = SORT_COL === 'booking_date'
+          ? `COALESCE(${parsed}, (created_at AT TIME ZONE 'Asia/Manila')::time)`
+          : parsed;
+        TIME_SORT = `, ${expr} ${ORDER} NULLS LAST`;
+      }
+
+      const [{ rows: countRows }, { rows }] = await Promise.all([
+        pool.query(`SELECT COUNT(*) AS total FROM bookings ${WHERE}`, params),
+        pool.query(`
+          SELECT
+            record_id, created_at, branch, booking_status AS status,
+            appointment_date, appointment_time,
+            first_name, last_name, age, gender,
+            treatment, area, freebie, companion_treatment,
+            total_price, payment_mode,
+            phone, social_media, email, agent,
+            booking_details, ad_interacted,
+            companion_first_name, companion_last_name, companion_age, companion_gender,
+            companion_freebie, companion_area,
+            promo_hunter_status,
+            cancel_validation, underage_cancellation, underage_status, db_status,
+            remarks, purchase_details,
+            is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion, is_promo_hunter,
+            do_not_call, is_rescheduled,
+            follow_up_date, booking_date, booking_time,
+            to_char(created_at AT TIME ZONE 'Asia/Manila', 'FMHH12:MI AM') AS created_time_ph
+          FROM bookings ${WHERE}
+          ORDER BY ${SORT_COL} ${ORDER} NULLS LAST${TIME_SORT}, created_at ${ORDER}
+          LIMIT ${limit} OFFSET ${OFFSET}
+        `, params)
+      ]);
+
+      const total      = parseInt(countRows[0].total);
       const totalPages = Math.ceil(total / limit);
-      const startIndex = (page - 1) * limit;
-      const endIndex = startIndex + limit;
 
-      // Get page data
-      const paginatedBookings = filteredBookings.slice(startIndex, endIndex);
+      const bookings = rows.map(r => ({
+        recordId:           r.record_id,
+        rowNumber:          r.record_id,   // backward-compat alias
+        timestamp:          r.created_at,
+        branch:             r.branch             || '',
+        status:             r.status             || '',
+        date:               normDate(r.appointment_date),
+        time:               r.appointment_time   || '',
+        firstName:          r.first_name         || '',
+        lastName:           r.last_name          || '',
+        age:                r.age                ?? '',
+        gender:             normalizeGender(r.gender),
+        treatment:          r.treatment          || '',
+        area:               r.area               || '',
+        freebie:            r.freebie            || '',
+        companionTreatment: r.companion_treatment || '',
+        totalPrice:         parseFloat(r.total_price) ?? 0,
+        paymentMode:        normalizePaymentMode(r.payment_mode),
+        phone:              r.phone              || '',
+        socialMedia:        r.social_media        || '',
+        email:              r.email              || '',
+        agent:              r.agent              || '',
+        bookingDetails:     r.booking_details     || '',
+        adInteracted:       r.ad_interacted       || '',
+        companionFirstName: r.companion_first_name  || '',
+        companionLastName:  r.companion_last_name   || '',
+        companionAge:       r.companion_age         ?? '',
+        companionGender:    normalizeGender(r.companion_gender),
+        companionFreebie:   r.companion_freebie     || '',
+        companionArea:      r.companion_area        || '',
+        promoHunterStatus:  r.promo_hunter_status   || '',
+        cancelValidation:   r.cancel_validation     || false,
+        underageValidation: r.underage_cancellation || false,
+        underageStatus:     r.underage_status      || 'Approved',
+        dbStatus:           r.db_status            || 'Approved',
+        remarks:            r.remarks              || '',
+        purchaseDetails:    r.purchase_details      || '',
+        isOts:             r.is_ots              || false,
+        isAdId:            r.is_ad_id            || false,
+        isCompanion:       r.is_companion        || false,
+        isHighPriority:    r.is_high_priority    || false,
+        isMetaConversion:  r.is_meta_conversion  || false,
+        isPromoHunter:     r.is_promo_hunter     || false,
+        doNotCall:         r.do_not_call         || false,
+        isRescheduled:     r.is_rescheduled      || false,
+        followUpDate:       normDate(r.follow_up_date) || null,
+        bookingDate:        normDate(r.booking_date)   || null,
+        bookingTime:        r.booking_time             || '',   // actual value (used by the edit form)
+        // Display-only: show the creation time when no booking_time was captured (#6).
+        // Kept separate so editing an unrelated field never persists this fallback as real data.
+        bookingTimeDisplay: r.booking_time || r.created_time_ph || '',
+      }));
 
       res.json({
-        bookings: paginatedBookings,
-        pagination: {
-          page,
-          limit,
-          total,
-          totalPages,
-          hasNext: page < totalPages,
-          hasPrev: page > 1
-        }
+        bookings,
+        pagination: { page, limit, total, totalPages, hasNext: page < totalPages, hasPrev: page > 1 }
       });
-    } catch (error) {
-      console.error('Get old bookings error:', error);
+    } catch (err) {
+      console.error('Get old bookings error:', err);
       res.status(500).json({ error: 'Failed to fetch bookings' });
     }
   }
 
+  // ── getBookingById ─────────────────────────────────────────────────────────
   async getBookingById(req, res) {
     try {
       const { id } = req.params;
 
-      // Try both sheets
-      const newBookings = await sheetsService.readSheet('Intake');
-      const oldBookings = await sheetsService.readSheet('DB');
+      const { rows } = await pool.query(
+        `SELECT * FROM bookings WHERE record_id = $1 AND record_status != 'DELETED'`,
+        [id]
+      );
 
-      // Search in new bookings (has record_id in column AI - index 33)
-      const newBookingRow = newBookings.slice(1).find(row => row[33] === id);
-      
-      // Search in old bookings (has record_id in column AI - index 33)
-      const oldBookingRow = oldBookings.slice(1).find(row => row[33] === id);
+      if (!rows.length) return res.status(404).json({ error: 'Booking not found' });
 
-      if (!newBookingRow && !oldBookingRow) {
-        return res.status(404).json({ error: 'Booking not found' });
-      }
-
-      const bookingRow = newBookingRow || oldBookingRow;
-
-      // Parse booking data matching DB/Intake sheet structure (37-44 columns)
-      const booking = {
-        recordId: bookingRow[33],      // AI: record_id
-        timestamp: bookingRow[0],      // A: Timestamp
-        branch: bookingRow[1],         // B: Branch
-        status: bookingRow[2],         // C: Booking Status
-        date: bookingRow[3],           // D: Date
-        firstName: bookingRow[4],      // E: First Name
-        lastName: bookingRow[5],       // F: Last Name
-        age: bookingRow[6],            // G: Age
-        gender: bookingRow[7],         // H: Gender
-        treatment: bookingRow[8],      // I: Promo/Treatment
-        area: bookingRow[9],           // J: Area
-        freebie: bookingRow[10],       // K: Freebie
-        companionTreatment: bookingRow[11], // L: Companion Promo/Treatment
-        totalPrice: bookingRow[12],    // M: Total Price
-        paymentMode: bookingRow[13],   // N: Mode of payment
-        phone: bookingRow[14],         // O: Phone
-        socialMedia: bookingRow[15],   // P: Facebook/Instagram
-        email: bookingRow[16],         // Q: Email
-        agent: bookingRow[17],         // R: Agent
-        bookingDetails: bookingRow[18], // S: Booking Details
-        adInteracted: bookingRow[19],  // T: Ad Interacted
-        companionFirstName: bookingRow[20],  // U: Companion First Name
-        companionLastName: bookingRow[21],   // V: Companion Last Name
-        companionAge: bookingRow[22],        // W: Companion Age
-        companionGender: bookingRow[23],     // X: Companion Gender
-        companionPhone: bookingRow[24]       // Y: Companion Phone
-      };
-
-      return res.json({ booking });
-    } catch (error) {
-      console.error('Get booking error:', error);
+      const r = rows[0];
+      res.json({
+        booking: {
+          recordId:           r.record_id,
+          rowNumber:          r.record_id,
+          timestamp:          r.created_at,
+          branch:             r.branch             || '',
+          status:             r.booking_status     || '',
+          date:               normDate(r.appointment_date),
+          time:               r.appointment_time   || '',
+          firstName:          r.first_name         || '',
+          lastName:           r.last_name          || '',
+          age:                r.age                ?? '',
+          gender:             normalizeGender(r.gender),
+          treatment:          r.treatment          || '',
+          area:               r.area               || '',
+          freebie:            r.freebie            || '',
+          companionTreatment: r.companion_treatment || '',
+          totalPrice:         parseFloat(r.total_price) ?? 0,
+          paymentMode:        normalizePaymentMode(r.payment_mode),
+          phone:              r.phone              || '',
+          socialMedia:        r.social_media        || '',
+          email:              r.email              || '',
+          agent:              r.agent              || '',
+          bookingDetails:     r.booking_details     || '',
+          adInteracted:       r.ad_interacted       || '',
+          companionFirstName: r.companion_first_name  || '',
+          companionLastName:  r.companion_last_name   || '',
+          companionAge:       r.companion_age         ?? '',
+          companionGender:    normalizeGender(r.companion_gender),
+          companionFreebie:   r.companion_freebie     || '',
+          companionArea:      r.companion_area        || '',
+          remarks:            r.remarks              || '',
+          purchaseDetails:    r.purchase_details      || '',
+          promoHunterStatus:  r.promo_hunter_status   || '',
+          cancelValidation:   r.cancel_validation     || false,
+          underageValidation: r.underage_cancellation || false,
+          underageStatus:     r.underage_status      || 'Approved',
+          dbStatus:           r.db_status            || 'Approved',
+          isOts:             r.is_ots             || false,
+          isAdId:            r.is_ad_id           || false,
+          isCompanion:       r.is_companion       || false,
+          isHighPriority:    r.is_high_priority   || false,
+          isMetaConversion:  r.is_meta_conversion || false,
+          isPromoHunter:     r.is_promo_hunter    || false,
+          doNotCall:         r.do_not_call        || false,
+          isRescheduled:     r.is_rescheduled     || false,
+          followUpDate:      normDate(r.follow_up_date) || null,
+          bookingDate:       normDate(r.booking_date)   || null,
+          bookingTime:       r.booking_time             || '',
+        }
+      });
+    } catch (err) {
+      console.error('Get booking by id error:', err);
       res.status(500).json({ error: 'Failed to fetch booking' });
     }
   }
 
+  // ── updateBooking ──────────────────────────────────────────────────────────
+  // :id is the record_id
   async updateBooking(req, res) {
     try {
-      const { id: rowNumber } = req.params;
-      const bookingData = req.body;
-      const user = req.user; // Set by auth middleware
+      const recordId = req.params.id;
+      const d        = req.body;
+      const user     = req.user;
 
-      console.log('========== UPDATE BOOKING START ==========');
-      console.log('Updating booking at row number:', rowNumber);
-      console.log('User:', user?.name, 'Role:', user?.role);
-      console.log('Booking data:', JSON.stringify(bookingData, null, 2));
-
-      // Read DB sheet to find the row
-      const dbRows = await sheetsService.readSheet('DB');
-      
-      console.log('Total rows in DB sheet:', dbRows.length);
-      console.log('Header row:', dbRows[0]);
-
-      if (!dbRows || dbRows.length < 2) {
-        console.error('No bookings found in DB sheet');
-        return res.status(404).json({ error: 'No bookings found' });
+      // Guard against client-side float drift on the price — store clean 2-decimal pesos.
+      if (d.totalPrice !== undefined && d.totalPrice !== null && d.totalPrice !== '') {
+        d.totalPrice = Math.round(Number(d.totalPrice) * 100) / 100;
       }
 
-      // Convert rowNumber to 0-indexed position in dbRows array
-      // rowNumber from frontend = Google Sheet row number (1-indexed)
-      // dbRows[0] = header (Google Sheet row 1)
-      // dbRows[1] = first data (Google Sheet row 2)
-      // So dbRows index = rowNumber - 1
-      const dbRowIndex = parseInt(rowNumber) - 1;
-      
-      console.log('Calculated dbRowIndex:', dbRowIndex);
-      console.log('dbRows array length:', dbRows.length);
+      const { rows: existing } = await pool.query(
+        `SELECT * FROM bookings WHERE record_id = $1 AND record_status != 'DELETED'`,
+        [recordId]
+      );
+      if (!existing.length) return res.status(404).json({ error: 'Booking not found' });
 
-      if (dbRowIndex < 1 || dbRowIndex >= dbRows.length) {
-        console.error(`Row index ${dbRowIndex} out of bounds. Array length: ${dbRows.length}`);
-        return res.status(404).json({ 
-          error: `Booking not found. Row ${rowNumber} does not exist in database (total rows: ${dbRows.length})`
-        });
-      }
+      const cur = existing[0];
 
-      // Get the existing row
-      const existingRow = dbRows[dbRowIndex];
-      console.log('Existing row at index', dbRowIndex, ':', existingRow);
-
-      // Role-based access control: Only block modifications to status or agent if values are changing
+      // RBAC: agents cannot change status or agent assignment
       if (user?.role !== 'Admin') {
-        // Check if status is being changed to a different value
-        if (bookingData.status !== undefined && bookingData.status !== existingRow[2]) {
-          console.warn(`⚠️ Agent ${user?.name} attempted to modify booking status from "${existingRow[2]}" to "${bookingData.status}"`);
-          return res.status(403).json({ 
-            error: 'Agents cannot modify booking status',
-            code: 'RESTRICTED_FIELDS'
-          });
+        if (d.status !== undefined && (d.status || '').toLowerCase() !== (cur.booking_status || '').toLowerCase()) {
+          return res.status(403).json({ error: 'Agents cannot modify booking status', code: 'RESTRICTED_FIELDS' });
         }
-        
-        // Check if agent is being changed to a different value
-        if (bookingData.agent !== undefined && bookingData.agent !== existingRow[17]) {
-          console.warn(`⚠️ Agent ${user?.name} attempted to modify agent assignment from "${existingRow[17]}" to "${bookingData.agent}"`);
-          return res.status(403).json({ 
-            error: 'Agents cannot modify agent assignment',
-            code: 'RESTRICTED_FIELDS'
-          });
+        if (d.agent !== undefined && (d.agent || '').toLowerCase() !== (cur.agent || '').toLowerCase()) {
+          return res.status(403).json({ error: 'Agents cannot modify agent assignment', code: 'RESTRICTED_FIELDS' });
         }
       }
 
-      // Log all existing columns
-      console.log('========== EXISTING ROW COLUMNS ==========');
-      const columnNames = [
-        '0: Timestamp',
-        '1: Branch',
-        '2: Booking Status',
-        '3: Date',
-        '4: First Name',
-        '5: Last Name',
-        '6: Age',
-        '7: Gender',
-        '8: Treatment',
-        '9: Area',
-        '10: Freebie',
-        '11: Companion Treatment',
-        '12: Total Price',
-        '13: Payment Mode',
-        '14: Phone',
-        '15: Social Media',
-        '16: Email',
-        '17: Agent',
-        '18: Booking Details',
-        '19: Ad Interacted',
-        '20: Companion First Name',
-        '21: Companion Last Name',
-        '22: Companion Age',
-        '23: Companion Gender',
-        '24: Companion Freebie',
-        '25: email_norm',
-        '26: phone_norm',
-        '27: social_norm',
-        '28: full_name_norm',
-        '29: companion_full_name_norm',
-        '30: promo_hunter_status',
-        '31: match_reason',
-        '32: matched_source',
-        '33: matched_row',
-        '34: record_id',
-        '35: record_status',
-        '36: last_checked_at',
-        '37: legacy_full_name',
-        '38: exclude_from_dashboards',
-        '39: dash_booking_created_at',
-        '40: dash_appointment_date',
-        '41: dash_branch',
-        '42: dash_booking_status',
-        '43: cancellation_time'
-      ];
+      // Parse appointment date/time (accept YYYY-MM-DD + HH:MM, or keep existing)
+      const newApptDate = d.date  || (cur.appointment_date ? new Date(cur.appointment_date).toISOString().split('T')[0] : null);
+      const newApptTime = d.time  ? formatTime12h(d.time) : (cur.appointment_time || null);
 
-      existingRow.forEach((value, index) => {
-        console.log(`${columnNames[index]}: ${value}`);
-      });
-
-      // ===== BOOKING DETAILS DEBUG =====
-      console.log('========== BOOKING DETAILS DEBUG ==========');
-      console.log(`Existing bookingDetails (col 18): "${existingRow[18]}"`);
-      console.log(`Incoming bookingDetails from request: "${bookingData.bookingDetails}"`);
-      console.log(`Existing adInteracted (col 19): "${existingRow[19]}"`);
-      console.log(`Incoming adInteracted from request: "${bookingData.adInteracted}"`);
-      console.log('============================================');
-
-      // Prepare updated row for DB sheet (47 columns total, indices 0-46)
-      // NOTE: preserve the original creation timestamp (col 0) — do NOT overwrite it on edit
-      const originalTimestamp = existingRow[0] || '';
-      const nowTimestamp = getCurrentTimestamp(); // used only for cancellation_time
-      
-      // Handle dateTime - if provided, use it; otherwise preserve existing
-      const dateTimeValue = bookingData.dateTime || existingRow[3] || '';
-      
-      // Update normalized fields with safety checks
-      const emailNorm = (bookingData.email || '').toLowerCase();
-      const phoneNorm = (bookingData.phone || '').replace(/\D/g, '');
-      const socialNorm = (bookingData.socialMedia || '').toLowerCase();
-      const fullNameNorm = `${bookingData.firstName || ''} ${bookingData.lastName || ''}`.toLowerCase().trim();
-      const companionFullNameNorm = (bookingData.companionFirstName || '').trim() && (bookingData.companionLastName || '').trim()
-        ? `${bookingData.companionFirstName} ${bookingData.companionLastName}`.toLowerCase().trim()
-        : '';
-      
-      // Track cancellation time if status is being set to Cancelled
-      let cancellationTime = existingRow[43] || ''; // preserve existing cancellation_time
-      if (bookingData.status && bookingData.status.toLowerCase() === 'cancelled') {
-        cancellationTime = nowTimestamp; // set cancellation time to now if cancelled
-        console.log('Setting cancellation_time to:', cancellationTime);
+      // Cancellation timestamp
+      let cancellationTime = cur.cancellation_time;
+      if (d.status && d.status.toLowerCase() === 'cancelled' && !cancellationTime) {
+        cancellationTime = new Date();
       }
-      
-      const updatedDbRow = [
-        originalTimestamp,                      // 0: Timestamp (PRESERVED — original creation time)
-        bookingData.branch,                     // 1: Branch
-        bookingData.status || 'Scheduled',      // 2: Booking Status
-        dateTimeValue,                          // 3: Date (updated or preserved)
-        bookingData.firstName,                  // 4: First Name
-        bookingData.lastName,                   // 5: Last Name
-        bookingData.age,                        // 6: Age
-        bookingData.gender || existingRow[7] || '',     // 7: Gender (preserve if incoming is empty)
-        bookingData.treatment || existingRow[8] || '',  // 8: Promo/Treatment (preserve if incoming is empty)
-        bookingData.area || '',                 // 9: Area
-        bookingData.freebie || '',              // 10: Freebie
-        bookingData.companionTreatment || '',   // 11: Companion Promo/Treatment
-        bookingData.totalPrice,                 // 12: Total Price
-        bookingData.paymentMode || existingRow[13] || '',  // 13: Mode of payment (preserve if incoming is empty)
-        bookingData.phone,                      // 14: Phone
-        bookingData.socialMedia || '',          // 15: Facebook / Instagram Name
-        bookingData.email || '',                // 16: Email
-        bookingData.agent || existingRow[17] || '',     // 17: Agent (preserve if incoming is empty)
-        bookingData.bookingDetails || '',       // 18: Booking Details
-        bookingData.adInteracted || '',         // 19: Ad Interacted
-        bookingData.companionFirstName || '',   // 20: Companion First Name
-        bookingData.companionLastName || '',    // 21: Companion Last Name
-        bookingData.companionAge || '',         // 22: Companion Age
-        bookingData.companionGender || '',      // 23: Companion Gender
-        bookingData.companionFreebie || '',     // 24: Companion Freebie
-        emailNorm,                              // 25: email_norm (updated)
-        phoneNorm,                              // 26: phone_norm (updated)
-        socialNorm,                             // 27: social_norm (updated)
-        fullNameNorm,                           // 28: full_name_norm (updated)
-        companionFullNameNorm,                  // 29: companion_full_name_norm (updated)
-        existingRow[30] || '',                  // 30: promo_hunter_status (preserve)
-        existingRow[31] || '',                  // 31: match_reason (preserve)
-        existingRow[32] || '',                  // 32: matched_source (preserve)
-        existingRow[33] || '',                  // 33: matched_row (preserve)
-        existingRow[34] || '',                  // 34: record_id (preserve)
-        existingRow[35] || 'active',            // 35: record_status (preserve)
-        existingRow[36] || '',                  // 36: last_checked_at (preserve)
-        existingRow[37] || '',                  // 37: legacy_full_name (preserve)
-        existingRow[38] || '',                  // 38: exclude_from_dashboards (preserve)
-        existingRow[39] || '',                  // 39: dash_booking_created_at (preserve)
-        dateTimeValue || existingRow[40] || '', // 40: dash_appointment_date (sync with updated date)
-        bookingData.branch,                     // 41: dash_branch (update to match)
-        bookingData.status || 'Scheduled',      // 42: dash_booking_status (update to match)
-        cancellationTime,                        // 43: cancellation_time (track when cancelled)
-        existingRow[44] || '',                  // 44: cancel_validation (preserve)
-        existingRow[45] || '',                  // 45: underage_validation (preserve)
-        bookingData.companionArea || ''          // 46: companion_area
+
+      // Normalized fields
+      const emailNorm   = normalizeEmail(d.email || cur.email);
+      const phoneNorm   = (d.phone       || cur.phone        || '').replace(/\D/g, '');
+      const socialNorm  = (d.socialMedia || cur.social_media || '').toLowerCase().trim();
+      const fullName    = `${d.firstName || cur.first_name || ''} ${d.lastName || cur.last_name || ''}`.toLowerCase().trim();
+      const companionFN = (d.companionFirstName || cur.companion_first_name || '').trim() &&
+                          (d.companionLastName  || cur.companion_last_name  || '').trim()
+        ? `${d.companionFirstName || cur.companion_first_name || ''} ${d.companionLastName || cur.companion_last_name || ''}`.toLowerCase().trim()
+        : (cur.companion_full_name_norm || '');
+
+      await pool.query(`
+        UPDATE bookings SET
+          branch             = $1,
+          booking_status     = $2,
+          appointment_date   = $3,
+          appointment_time   = $4,
+          cancellation_time  = $5,
+          first_name         = $6,
+          last_name          = $7,
+          age                = $8,
+          gender             = $9,
+          treatment          = $10,
+          area               = $11,
+          freebie            = $12,
+          companion_treatment= $13,
+          total_price        = $14,
+          payment_mode       = $15,
+          phone              = $16,
+          social_media       = $17,
+          email              = $18,
+          agent              = $19,
+          booking_details    = $20,
+          ad_interacted      = $21,
+          companion_first_name  = $22,
+          companion_last_name   = $23,
+          companion_age         = $24,
+          companion_gender      = $25,
+          companion_freebie     = $26,
+          companion_area        = $27,
+          remarks            = $28,
+          purchase_details   = $29,
+          is_ots             = $30,
+          is_ad_id           = $31,
+          is_companion       = $32,
+          is_high_priority   = $33,
+          is_meta_conversion = $34,
+          email_norm         = $35,
+          phone_norm         = $36,
+          social_norm        = $37,
+          full_name_norm     = $38,
+          companion_full_name_norm = $39,
+          follow_up_date   = $40,
+          booking_date     = $41,
+          booking_time     = $42,
+          do_not_call      = $43,
+          is_rescheduled   = $44,
+          is_promo_hunter  = $46
+        WHERE record_id = $45
+      `, [
+        d.branch           || cur.branch,
+        d.status           || cur.booking_status,
+        newApptDate,
+        newApptTime,
+        cancellationTime,
+        d.firstName        || cur.first_name,
+        d.lastName         || cur.last_name,
+        d.age              ?? cur.age,
+        d.gender           || cur.gender,
+        d.treatment        || cur.treatment,
+        d.area             !== undefined ? (d.area || null) : cur.area,
+        d.freebie          !== undefined ? (d.freebie || null) : cur.freebie,
+        d.companionTreatment !== undefined ? (d.companionTreatment || null) : cur.companion_treatment,
+        d.totalPrice       !== undefined ? d.totalPrice : cur.total_price,
+        d.paymentMode      || cur.payment_mode,
+        d.phone            || cur.phone,
+        d.socialMedia      !== undefined ? (d.socialMedia || null) : cur.social_media,
+        d.email            || cur.email,
+        d.agent            || cur.agent,
+        d.bookingDetails   !== undefined ? (d.bookingDetails || null) : cur.booking_details,
+        d.adInteracted     !== undefined ? (d.adInteracted || null) : cur.ad_interacted,
+        d.companionFirstName !== undefined ? (d.companionFirstName || null) : cur.companion_first_name,
+        d.companionLastName  !== undefined ? (d.companionLastName  || null) : cur.companion_last_name,
+        d.companionAge       !== undefined ? (d.companionAge       || null) : cur.companion_age,
+        d.companionGender    !== undefined ? (d.companionGender    || null) : cur.companion_gender,
+        d.companionFreebie   !== undefined ? (d.companionFreebie   || null) : cur.companion_freebie,
+        d.companionArea      !== undefined ? (d.companionArea      || null) : cur.companion_area,
+        d.remarks            !== undefined ? (d.remarks            || null) : cur.remarks,
+        d.purchaseDetails    !== undefined ? (d.purchaseDetails    || null) : cur.purchase_details,
+        d.isOts              !== undefined ? d.isOts              : cur.is_ots,
+        d.isAdId             !== undefined ? d.isAdId             : cur.is_ad_id,
+        d.isCompanion        !== undefined ? d.isCompanion        : cur.is_companion,
+        d.isHighPriority     !== undefined ? d.isHighPriority     : cur.is_high_priority,
+        d.isMetaConversion   !== undefined ? d.isMetaConversion   : cur.is_meta_conversion,
+        emailNorm, phoneNorm, socialNorm, fullName, companionFN,
+        d.followUpDate !== undefined ? (d.followUpDate || null) : cur.follow_up_date,
+        d.bookingDate  !== undefined ? (d.bookingDate  || null) : cur.booking_date,
+        d.bookingTime  !== undefined ? (d.bookingTime  || null) : cur.booking_time,
+        d.doNotCall      !== undefined ? d.doNotCall      : cur.do_not_call,
+        d.isRescheduled  !== undefined ? d.isRescheduled  : cur.is_rescheduled,
+        recordId,
+        d.isPromoHunter  !== undefined ? d.isPromoHunter  : cur.is_promo_hunter
+      ]);
+
+      // Compute diff and log activity
+      const nv = (incoming, current) => incoming !== undefined ? (incoming ?? '') : (current ?? '');
+      const diffPairs = [
+        ['booking_status',        d.status        || cur.booking_status,    cur.booking_status],
+        ['branch',                d.branch        || cur.branch,            cur.branch],
+        ['appointment_date',      newApptDate,                              normDate(cur.appointment_date)],
+        ['appointment_time',      newApptTime,                              cur.appointment_time],
+        ['first_name',            d.firstName     || cur.first_name,        cur.first_name],
+        ['last_name',             d.lastName      || cur.last_name,         cur.last_name],
+        ['age',                   String(d.age          !== undefined ? (d.age    ?? '') : (cur.age          ?? '')), String(cur.age          ?? '')],
+        ['gender',                nv(d.gender,          cur.gender),                   cur.gender          ?? ''],
+        ['email',                 nv(d.email,           cur.email),                    cur.email           ?? ''],
+        ['phone',                 d.phone         || cur.phone,             cur.phone],
+        ['social_media',          nv(d.socialMedia,     cur.social_media),             cur.social_media    ?? ''],
+        ['treatment',             d.treatment     || cur.treatment,         cur.treatment],
+        ['area',                  nv(d.area,            cur.area),                     cur.area            ?? ''],
+        ['freebie',               nv(d.freebie,         cur.freebie),                  cur.freebie         ?? ''],
+        ['total_price',           String(d.totalPrice   !== undefined ? d.totalPrice   : cur.total_price),  String(cur.total_price)],
+        ['payment_mode',          d.paymentMode   || cur.payment_mode,      cur.payment_mode],
+        ['agent',                 d.agent         || cur.agent,             cur.agent],
+        ['booking_details',       nv(d.bookingDetails,  cur.booking_details),          cur.booking_details ?? ''],
+        ['ad_interacted',         nv(d.adInteracted,    cur.ad_interacted),            cur.ad_interacted   ?? ''],
+        ['companion_treatment',   nv(d.companionTreatment, cur.companion_treatment),   cur.companion_treatment ?? ''],
+        ['companion_first_name',  nv(d.companionFirstName, cur.companion_first_name),  cur.companion_first_name ?? ''],
+        ['companion_last_name',   nv(d.companionLastName,  cur.companion_last_name),   cur.companion_last_name  ?? ''],
+        ['companion_age',         String(d.companionAge !== undefined ? (d.companionAge ?? '') : (cur.companion_age ?? '')), String(cur.companion_age ?? '')],
+        ['companion_gender',      nv(d.companionGender, cur.companion_gender),         cur.companion_gender ?? ''],
+        ['companion_freebie',     nv(d.companionFreebie,cur.companion_freebie),        cur.companion_freebie ?? ''],
+        ['companion_area',        nv(d.companionArea,   cur.companion_area),           cur.companion_area  ?? ''],
+        ['remarks',               nv(d.remarks,         cur.remarks),                  cur.remarks         ?? ''],
+        ['purchase_details',      nv(d.purchaseDetails, cur.purchase_details),         cur.purchase_details ?? ''],
+        ['follow_up_date',        normDate(d.followUpDate !== undefined ? d.followUpDate : cur.follow_up_date), normDate(cur.follow_up_date)],
+        ['booking_date',          normDate(d.bookingDate !== undefined ? d.bookingDate : cur.booking_date),    normDate(cur.booking_date)],
+        ['booking_time',          nv(d.bookingTime,     cur.booking_time),             cur.booking_time    ?? ''],
+        ['is_ots',                String(d.isOts            !== undefined ? d.isOts            : cur.is_ots),            String(cur.is_ots)],
+        ['is_ad_id',              String(d.isAdId           !== undefined ? d.isAdId           : cur.is_ad_id),          String(cur.is_ad_id)],
+        ['is_companion',          String(d.isCompanion      !== undefined ? d.isCompanion      : cur.is_companion),      String(cur.is_companion)],
+        ['is_promo_hunter',       String(d.isPromoHunter    !== undefined ? d.isPromoHunter    : cur.is_promo_hunter),   String(cur.is_promo_hunter)],
+        ['is_high_priority',      String(d.isHighPriority   !== undefined ? d.isHighPriority   : cur.is_high_priority),  String(cur.is_high_priority)],
+        ['is_meta_conversion',    String(d.isMetaConversion !== undefined ? d.isMetaConversion : cur.is_meta_conversion), String(cur.is_meta_conversion)],
+        ['do_not_call',           String(d.doNotCall     !== undefined ? d.doNotCall     : cur.do_not_call),     String(cur.do_not_call)],
+        ['is_rescheduled',        String(d.isRescheduled !== undefined ? d.isRescheduled : cur.is_rescheduled),  String(cur.is_rescheduled)],
       ];
+      const changes = {};
+      for (const [field, nv, ov] of diffPairs) {
+        if (String(nv ?? '') !== String(ov ?? '')) changes[field] = { from: ov, to: nv };
+      }
+      const logAction = changes.booking_status ? 'STATUS_CHANGED'
+                      : Object.keys(changes).length > 0 ? 'UPDATED'
+                      : null;
+      if (logAction) await logActivity(recordId, user, logAction, changes);
 
-      console.log('========== UPDATED ROW COLUMNS ==========');
-      updatedDbRow.forEach((value, index) => {
-        console.log(`${columnNames[index]}: ${value}`);
-      });
-
-      console.log('Updating row number:', parseInt(rowNumber));
-      // Update the row in DB sheet
-      await sheetsService.updateRow('DB', parseInt(rowNumber), updatedDbRow);
-
-      // IMPORTANT: Clear the cache to reflect changes immediately
-      cache.del('old_bookings_all');
-      console.log('✅ Cache cleared - bookings will refresh immediately');
-
-      console.log('========== UPDATE BOOKING SUCCESS ==========');
-      res.json({
-        success: true,
-        message: 'Booking updated successfully',
-        data: bookingData,
-        rowNumber: parseInt(rowNumber),
-        cancellationTime: cancellationTime
-      });
-
-
-    } catch (error) {
-      console.error('========== UPDATE BOOKING ERROR ==========');
-      console.error('Error message:', error.message);
-      console.error('Error stack:', error.stack);
-      console.error('Full error:', error);
-      res.status(500).json({ 
-        error: 'Failed to update booking',
-        details: error.message,
-        rowNumber: req.params.id
-      });
+      res.json({ success: true, message: 'Booking updated successfully', recordId, cancellationTime });
+    } catch (err) {
+      console.error('Update booking error:', err);
+      res.status(500).json({ error: 'Failed to update booking', details: err.message });
     }
   }
 
-  // PATCH /bookings/:rowNumber/validation
-  // Updates only cancel_validation (col 44) and underage_validation (col 45) in the DB sheet.
-  // Admin-only — agents cannot toggle these flags.
+  // ── updateValidation ───────────────────────────────────────────────────────
+  // PATCH /bookings/:rowNumber/validation  (rowNumber is record_id)
+  // Sets the tri-state Underage Status / Double Booking Status columns and the
+  // Cancel Validation checkbox (checked = excluded from agent arrivals/arrival rate).
   async updateValidation(req, res) {
     try {
-      const { rowNumber } = req.params;
-      const { cancelValidation, underageValidation } = req.body;
-
       if (req.user?.role !== 'Admin') {
-        return res.status(403).json({ error: 'Only admins can set validation flags' });
+        return res.status(403).json({ error: 'Only admins can set validation status' });
       }
 
-      const row = parseInt(rowNumber, 10);
-      if (!row || row < 2) {
-        return res.status(400).json({ error: 'Invalid row number' });
+      const recordId = req.params.rowNumber;
+      const { underageStatus, dbStatus, cancelValidation } = req.body;
+      const ALLOWED = ['Approved', 'Pending', 'Rejected'];
+
+      const { rows: curRows } = await pool.query(
+        `SELECT underage_status, db_status, cancel_validation FROM bookings WHERE record_id = $1 AND record_status != 'DELETED'`,
+        [recordId]
+      );
+      if (!curRows.length) return res.status(404).json({ error: 'Booking not found' });
+      const cur = curRows[0];
+
+      // Build a partial update from whichever field(s) were supplied
+      const sets = [], vals = [], changes = {};
+      if (underageStatus !== undefined) {
+        if (!ALLOWED.includes(underageStatus)) return res.status(400).json({ error: `underageStatus must be one of ${ALLOWED.join(', ')}` });
+        vals.push(underageStatus); sets.push(`underage_status = $${vals.length}`);
+        if (underageStatus !== cur.underage_status) changes.underage_status = { from: cur.underage_status, to: underageStatus };
       }
+      if (dbStatus !== undefined) {
+        if (!ALLOWED.includes(dbStatus)) return res.status(400).json({ error: `dbStatus must be one of ${ALLOWED.join(', ')}` });
+        vals.push(dbStatus); sets.push(`db_status = $${vals.length}`);
+        if (dbStatus !== cur.db_status) changes.db_status = { from: cur.db_status, to: dbStatus };
+      }
+      if (cancelValidation !== undefined) {
+        const cv = cancelValidation === true;
+        vals.push(cv); sets.push(`cancel_validation = $${vals.length}`);
+        if (cv !== cur.cancel_validation) changes.cancel_validation = { from: cur.cancel_validation, to: cv };
+      }
+      if (!sets.length) return res.status(400).json({ error: 'Nothing to update: provide underageStatus, dbStatus and/or cancelValidation' });
 
-      // Write only AS (col 44) and AT (col 45) for the given row.
-      // Store "TRUE"/"FALSE" strings for easy sheet readability.
-      const cancelVal   = cancelValidation   ? 'TRUE' : 'FALSE';
-      const underageVal = underageValidation ? 'TRUE' : 'FALSE';
+      vals.push(recordId);
+      const { rowCount } = await pool.query(
+        `UPDATE bookings SET ${sets.join(', ')} WHERE record_id = $${vals.length}`,
+        vals
+      );
 
-      await sheetsService.updateCellRange('DB', `AS${row}:AT${row}`, [cancelVal, underageVal]);
+      if (!rowCount) return res.status(404).json({ error: 'Booking not found' });
+      if (Object.keys(changes).length) await logActivity(recordId, req.user, 'UPDATED', changes);
 
-      // Clear booking cache so OldBookings reflects the change immediately
-      cache.del('old_bookings_all');
-
-      return res.json({
-        success: true,
-        rowNumber: row,
-        cancelValidation:   cancelValidation,
-        underageValidation: underageValidation
-      });
-    } catch (error) {
-      console.error('updateValidation error:', error.message);
-      res.status(500).json({ error: 'Failed to update validation flags' });
+      res.json({ success: true, recordId, underageStatus, dbStatus, cancelValidation });
+    } catch (err) {
+      console.error('updateValidation error:', err);
+      res.status(500).json({ error: 'Failed to update validation status' });
     }
   }
 
-  // Get daily reports with 6 sections
-  // NOTE: This endpoint automatically updates based on TODAY's date
-  // Each request calculates dates fresh, so tomorrow it will show different data
-  // No caching is used to ensure always showing current day's information
-  async getDailyReports(req, res) {
+  // ── updateFlags ────────────────────────────────────────────────────────────
+  // PATCH /bookings/:id/flags — toggle the OTS / With-Companion identifier columns
+  async updateFlags(req, res) {
     try {
-      const dbRows = await sheetsService.readSheet('DB');
-      console.log(`📊 getDailyReports - Total DB rows: ${dbRows.length}`);
-      
-      if (dbRows.length < 2) {
-        console.log('⚠️ No data in DB sheet');
-        return res.json({
-          success: true,
-          date: new Date().toISOString().split('T')[0],
-          reports: {
-            otsBookings: { total: 0, revenue: 0, count: 0, byBranch: {} },
-            overallBookings: { total: 0, revenue: 0, count: 0, byBranch: {} },
-            bookedTomorrow: { byBranch: {} },
-            bookedNext7Days: { byBranch: {} },
-            cancellations: { total: 0, revenue: 0, count: 0, byBranch: {} },
-            overallBookingsTomorrow: { total: 0, revenue: 0, count: 0 }
-          }
-        });
+      const recordId = req.params.id;
+      const { isOts, isCompanion } = req.body;
+      const { rows: curRows } = await pool.query(
+        `SELECT is_ots, is_companion FROM bookings WHERE record_id = $1 AND record_status != 'DELETED'`,
+        [recordId]
+      );
+      if (!curRows.length) return res.status(404).json({ error: 'Booking not found' });
+      const cur = curRows[0];
+
+      const sets = [], vals = [], changes = {};
+      if (isOts !== undefined) {
+        vals.push(isOts === true); sets.push(`is_ots = $${vals.length}`);
+        if ((isOts === true) !== cur.is_ots) changes.is_ots = { from: cur.is_ots, to: isOts === true };
       }
-      
-      // Calculate dates FRESH on each request to ensure daily updates
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      const dayAfterTomorrow = new Date(tomorrow);
-      dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 1);
-      const nextSevenDaysEnd = new Date(today);
-      nextSevenDaysEnd.setDate(nextSevenDaysEnd.getDate() + 7);
+      if (isCompanion !== undefined) {
+        vals.push(isCompanion === true); sets.push(`is_companion = $${vals.length}`);
+        if ((isCompanion === true) !== cur.is_companion) changes.is_companion = { from: cur.is_companion, to: isCompanion === true };
+      }
+      if (!sets.length) return res.status(400).json({ error: 'Nothing to update: provide isOts and/or isCompanion' });
 
-      console.log(`📅 Today: ${today.toDateString()}, Tomorrow: ${tomorrow.toDateString()}, DayAfterTomorrow: ${dayAfterTomorrow.toDateString()}`);
+      vals.push(recordId);
+      const { rowCount } = await pool.query(
+        `UPDATE bookings SET ${sets.join(', ')} WHERE record_id = $${vals.length}`, vals
+      );
+      if (!rowCount) return res.status(404).json({ error: 'Booking not found' });
+      if (Object.keys(changes).length) await logActivity(recordId, req.user, 'UPDATED', changes);
 
-
-      // Helper to extract date-only from timestamp string (e.g. "May 5 2026 10:30 AM")
-      // Uses parseDateString which correctly handles all custom timestamp formats
-      const getDateFromTimestamp = (timestampStr) => {
-        if (!timestampStr) return null;
-        try {
-          const parsed = parseDateString(timestampStr);
-          if (!parsed || isNaN(parsed.getTime())) return null;
-          return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 0, 0, 0, 0);
-        } catch (e) {
-          return null;
-        }
-      };
-
-      // Helper to parse date from DB formatted date string
-      const parseBookingDate = (dateStr) => {
-        if (!dateStr) return null;
-        const parsed = parseDateString(dateStr);
-        if (!parsed) return null;
-        const d = new Date(parsed);
-        d.setHours(0, 0, 0, 0);
-        return d;
-      };
-
-      // Helper to check if date falls in range
-      const isToday = (date) => date && date.getTime() === today.getTime();
-      const isTomorrow = (date) => date && date.getTime() === tomorrow.getTime();
-      const isNext7Days = (date) => date && date > today && date <= nextSevenDaysEnd;
-      const isInNext7Days = (date) => date && date >= dayAfterTomorrow && date <= nextSevenDaysEnd;
-
-      // row[43] = cancellation_time: set by updateBooking when status changed to Cancelled
-      // Covers: cancelled via CRM today (any creation date) OR created+cancelled today without CRM
-      const isCancelledToday = (cancellationTimeStr) => {
-        if (!cancellationTimeStr) return false;
-        const cancelledDate = getDateFromTimestamp(cancellationTimeStr);
-        return cancelledDate && isToday(cancelledDate);
-      };
-
-      // Branches list
-      const branches = ['STA LUCIA', 'FELIZ', 'ESTANCIA', 'Spa', 'Clinic', 'Lab', 
-                       'Dermatology', 'Wellness', 'Med Spa', 'Aesthetic', 'Hydro', 
-                       'Hair Care', 'Anti-Aging', 'Mother Care', 'Other', 
-                       'AI SKIN', 'CENTRIS', 'DNA MANILA', 'GENEVA', 'GLORIETTA', 'HERA',
-                       'LIONESSE', 'LUMIA', 'PARIS', 'SM NORTH', 'VENICE'];
-
-      // Initialize report objects
-      const reports = {
-        otsBookings: { total: 0, revenue: 0, count: 0, byBranch: {} },
-        overallBookings: { total: 0, revenue: 0, count: 0, byBranch: {} },
-        bookedTomorrow: { byBranch: {} },
-        bookedNext7Days: { byBranch: {} },
-        cancellations: { total: 0, revenue: 0, count: 0, byBranch: {} },
-        overallBookingsTomorrow: { total: 0, revenue: 0, count: 0 },
-        arrivalsToday: { count: 0, byBranch: {}, byStatus: { 'Arrived & bought': 0, 'Arrived not potential': 0 } }
-      };
-
-      // Initialize branch-level data
-      branches.forEach(branch => {
-        reports.otsBookings.byBranch[branch] = { count: 0, revenue: 0 };
-        reports.overallBookings.byBranch[branch] = { count: 0, revenue: 0 };
-        reports.bookedTomorrow.byBranch[branch] = { count: 0, revenue: 0 };
-        reports.bookedNext7Days.byBranch[branch] = { count: 0, revenue: 0 };
-        reports.cancellations.byBranch[branch] = { count: 0, revenue: 0 };
-        reports.arrivalsToday.byBranch[branch] = { count: 0 };
-      });
-
-      // Process each booking row
-      // VALIDATION LOGIC:
-      // 1. OTS: Created TODAY + Scheduled TODAY (all statuses)
-      // 2. OVERALL: Created TODAY + Scheduled TODAY→+7 days (all statuses, OTS ⊆ Overall)
-      // 3. Tomorrow: Created TODAY + Scheduled TOMORROW + NOT cancelled
-      // 4. Next7Days: Scheduled (Next7Days incl TODAY) + NOT cancelled (ignores when created)
-      // 5. Cancellations: cancelled via CRM today OR created+cancelled today (no CRM update)
-      // 6. TomorrowSummary: Scheduled TOMORROW + NOT cancelled (ignores when created)
-      // 7. ArrivalsToday: Booking date = TODAY + status is "Arrived & bought" or "Arrived not potential"
-      
-      let processedCount = 0;
-      console.log(`🔄 Processing ${dbRows.length - 1} booking rows...`);
-      
-      for (let i = 1; i < dbRows.length; i++) {
-        const row = dbRows[i];
-        const timestamp = row[0];
-        const branch = row[1];
-        const status = (row[2] || '').toLowerCase();
-        const bookingDateStr = row[3];
-        const firstName = row[4];
-        const lastName = row[5];
-        const price = parsePrice(row[12]);
-        const cancellationTime = row[43];
-
-        // Parse booking date from formatted date column
-        const bookingDate = parseBookingDate(bookingDateStr);
-        if (!bookingDate) {
-          console.log(`⚠️ Row ${i}: Could not parse booking date: "${bookingDateStr}"`);
-          continue;
-        }
-
-        // Extract created date from timestamp (ISO format)
-        const createdDate = getDateFromTimestamp(timestamp);
-        const createdToday = createdDate && createdDate.getTime() === today.getTime();
-        
-        // Log first 3 rows and last 12 rows (our demo bookings start at row ~30231)
-        if (i <= 3 || i >= dbRows.length - 12) {
-          console.log(`📝 Row ${i}: ${firstName} ${lastName} | Created: ${createdDate?.toDateString()} (${createdToday ? '✓TODAY' : ''}) | Booking: ${bookingDate.toDateString()} | Status: ${status} | Branch: ${branch}`);
-        }
-        
-        processedCount++;
-
-        // Section 1: OTS Bookings (Created today + Scheduled for today, all statuses)
-        if (createdToday && isToday(bookingDate)) {
-          reports.otsBookings.count++;
-          reports.otsBookings.revenue += price;
-          reports.otsBookings.total++;
-          if (reports.otsBookings.byBranch[branch]) {
-            reports.otsBookings.byBranch[branch].count++;
-            reports.otsBookings.byBranch[branch].revenue += price;
-          }
-        }
-
-        // Section 2: OVERALL Bookings (Created today + Scheduled today→+7 days, all statuses)
-        // Includes OTS (today) + next 7 days so Overall is always >= OTS
-        if (createdToday && (isToday(bookingDate) || isNext7Days(bookingDate))) {
-          reports.overallBookings.count++;
-          reports.overallBookings.revenue += price;
-          reports.overallBookings.total++;
-          if (reports.overallBookings.byBranch[branch]) {
-            reports.overallBookings.byBranch[branch].count++;
-            reports.overallBookings.byBranch[branch].revenue += price;
-          }
-        }
-
-        // Section 3: Booked Tomorrow per Branch (Created today, scheduled tomorrow, Scheduled status only)
-        if (createdToday && isTomorrow(bookingDate) && status === 'scheduled') {
-          if (reports.bookedTomorrow.byBranch[branch]) {
-            reports.bookedTomorrow.byBranch[branch].count++;
-            reports.bookedTomorrow.byBranch[branch].revenue += price;
-          }
-        }
-
-        // Section 4: Booked Next 7 Days per Branch (Created today, day-after-tomorrow→+7, Scheduled only)
-        if (createdToday && isInNext7Days(bookingDate) && status === 'scheduled') {
-          if (reports.bookedNext7Days.byBranch[branch]) {
-            reports.bookedNext7Days.byBranch[branch].count++;
-            reports.bookedNext7Days.byBranch[branch].revenue += price;
-          }
-        }
-
-        // Section 5: Cancellations per Branch
-        // Counts: cancelled via CRM today (cancellationTime = today) OR created+cancelled today
-        if (status.includes('cancel') && (isCancelledToday(cancellationTime) || (!cancellationTime && createdToday))) {
-          reports.cancellations.count++;
-          reports.cancellations.revenue += price;
-          reports.cancellations.total++;
-          if (reports.cancellations.byBranch[branch]) {
-            reports.cancellations.byBranch[branch].count++;
-            reports.cancellations.byBranch[branch].revenue += price;
-          }
-        }
-
-        // Section 6: Overall Bookings Tomorrow (Scheduled tomorrow, any creation date, Scheduled status only)
-        if (isTomorrow(bookingDate) && status === 'scheduled') {
-          reports.overallBookingsTomorrow.count++;
-          reports.overallBookingsTomorrow.revenue += price;
-          reports.overallBookingsTomorrow.total++;
-        }
-
-        // Section 7: Arrivals Today (Booking date = today, status is arrived)
-        // Also exclude underage_validation rows (col 45) from arrival count
-        const underageValidation = (row[45] || '').toString().toUpperCase() === 'TRUE';
-        const normalizedStatus = (row[2] || '').toLowerCase().replace(/\s+/g, ' ').trim();
-        if (isToday(bookingDate) && !underageValidation &&
-            (normalizedStatus === 'arrived & bought' || normalizedStatus === 'arrived not potential')) {
-          reports.arrivalsToday.count++;
-          if (reports.arrivalsToday.byBranch[branch]) {
-            reports.arrivalsToday.byBranch[branch].count++;
-          }
-          // Track by exact status label for breakdown
-          const statusLabel = row[2] || '';
-          if (reports.arrivalsToday.byStatus[statusLabel] !== undefined) {
-            reports.arrivalsToday.byStatus[statusLabel]++;
-          } else {
-            reports.arrivalsToday.byStatus[statusLabel] = 1;
-          }
-        }
-
-      } // end for loop
-
-      console.log(`✅ Processed ${processedCount} bookings`);
-      console.log(`📊 Reports Summary:`);
-      console.log(`   OTS: ${reports.otsBookings.count}, Revenue: ₱${reports.otsBookings.revenue}`);
-      console.log(`   OVERALL: ${reports.overallBookings.count}, Revenue: ₱${reports.overallBookings.revenue}`);
-      console.log(`   Tomorrow: ${Object.values(reports.bookedTomorrow.byBranch).reduce((sum, b) => sum + b.count, 0)} bookings`);
-      console.log(`   Next7Days: ${Object.values(reports.bookedNext7Days.byBranch).reduce((sum, b) => sum + b.count, 0)} bookings`);
-      console.log(`   Cancellations: ${reports.cancellations.count}, Revenue: ₱${reports.cancellations.revenue}`);
-      console.log(`   Tomorrow Summary: ${reports.overallBookingsTomorrow.count}, Revenue: ₱${reports.overallBookingsTomorrow.revenue}`);
-      console.log(`   Arrivals Today: ${reports.arrivalsToday.count}`);
-
-      res.json({
-        success: true,
-        date: today.toISOString().split('T')[0],
-        reports
-      });
-
-    } catch (error) {
-      console.error('Get daily reports error:', error);
-      res.status(500).json({ error: 'Failed to fetch daily reports' });
+      res.json({ success: true, recordId, isOts, isCompanion });
+    } catch (err) {
+      console.error('updateFlags error:', err);
+      res.status(500).json({ error: 'Failed to update flags' });
     }
   }
 
-  // Get OTS detailed bookings (Created today + Scheduled today)
-  async getOTSBookings(req, res) {
-    try {
-      const dbRows = await sheetsService.readSheet('DB');
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-
-      const getDateFromTimestamp = (timestampStr) => {
-        if (!timestampStr) return null;
-        const parsed = parseDateString(timestampStr);
-        if (!parsed || isNaN(parsed.getTime())) return null;
-        return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 0, 0, 0, 0);
-      };
-
-      const parseBookingDate = (dateStr) => {
-        if (!dateStr) return null;
-        const parsed = parseDateString(dateStr);
-        if (!parsed) return null;
-        const d = new Date(parsed);
-        d.setHours(0, 0, 0, 0);
-        return d;
-      };
-
-      const isToday = (date) => date && date.getTime() === today.getTime();
-
-      const bookings = [];
-      for (let i = 1; i < dbRows.length; i++) {
-        const row = dbRows[i];
-        const timestamp = row[0];
-        const bookingDateStr = row[3];
-        const status = (row[2] || '').toLowerCase();
-
-        const bookingDate = parseBookingDate(bookingDateStr);
-        const createdDate = getDateFromTimestamp(timestamp);
-        const createdToday = createdDate && createdDate.getTime() === today.getTime();
-
-        if (createdToday && isToday(bookingDate)) {
-          bookings.push({
-            firstName: row[4] || '',
-            lastName: row[5] || '',
-            branch: row[1] || '',
-            date: row[3] || '',
-            treatment: row[8] || '',
-            totalPrice: row[12] || 0,
-            status: row[2] || '',
-            phone: row[14] || '',
-            email: row[16] || '',
-            agent: row[17] || ''
-          });
-        }
-      }
-
-      res.json({ success: true, bookings });
-    } catch (error) {
-      console.error('Get OTS bookings error:', error);
-      res.status(500).json({ error: 'Failed to fetch OTS bookings' });
-    }
-  }
-
-  // Get Overall detailed bookings (Created today + Scheduled next 7 days)
-  async getOverallBookings(req, res) {
-    try {
-      const dbRows = await sheetsService.readSheet('DB');
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      const nextSevenDaysEnd = new Date(today);
-      nextSevenDaysEnd.setDate(nextSevenDaysEnd.getDate() + 7);
-
-      const getDateFromTimestamp = (timestampStr) => {
-        if (!timestampStr) return null;
-        const parsed = parseDateString(timestampStr);
-        if (!parsed || isNaN(parsed.getTime())) return null;
-        return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 0, 0, 0, 0);
-      };
-
-      const parseBookingDate = (dateStr) => {
-        if (!dateStr) return null;
-        const parsed = parseDateString(dateStr);
-        if (!parsed) return null;
-        const d = new Date(parsed);
-        d.setHours(0, 0, 0, 0);
-        return d;
-      };
-
-      const isToday = (date) => date && date.getTime() === today.getTime();
-      const isNext7Days = (date) => date && date > today && date <= nextSevenDaysEnd;
-
-      const bookings = [];
-      for (let i = 1; i < dbRows.length; i++) {
-        const row = dbRows[i];
-        const timestamp = row[0];
-        const bookingDateStr = row[3];
-        const status = (row[2] || '').toLowerCase();
-
-        const bookingDate = parseBookingDate(bookingDateStr);
-        const createdDate = getDateFromTimestamp(timestamp);
-        const createdToday = createdDate && createdDate.getTime() === today.getTime();
-
-        // Include today (OTS) + next 7 days so Overall is always >= OTS
-        if (createdToday && (isToday(bookingDate) || isNext7Days(bookingDate))) {
-          bookings.push({
-            firstName: row[4] || '',
-            lastName: row[5] || '',
-            branch: row[1] || '',
-            date: row[3] || '',
-            treatment: row[8] || '',
-            totalPrice: row[12] || 0,
-            status: row[2] || '',
-            phone: row[14] || '',
-            email: row[16] || '',
-            agent: row[17] || ''
-          });
-        }
-      }
-
-      res.json({ success: true, bookings });
-    } catch (error) {
-      console.error('Get overall bookings error:', error);
-      res.status(500).json({ error: 'Failed to fetch overall bookings' });
-    }
-  }
-
-  // Get Tomorrow detailed bookings (Created today + Scheduled tomorrow)
-  async getTomorrowBookings(req, res) {
-    try {
-      const dbRows = await sheetsService.readSheet('DB');
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-
-      const getDateFromTimestamp = (timestampStr) => {
-        if (!timestampStr) return null;
-        const parsed = parseDateString(timestampStr);
-        if (!parsed || isNaN(parsed.getTime())) return null;
-        return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 0, 0, 0, 0);
-      };
-
-      const parseBookingDate = (dateStr) => {
-        if (!dateStr) return null;
-        const parsed = parseDateString(dateStr);
-        if (!parsed) return null;
-        const d = new Date(parsed);
-        d.setHours(0, 0, 0, 0);
-        return d;
-      };
-
-      const isTomorrow = (date) => date && date.getTime() === tomorrow.getTime();
-
-      const bookings = [];
-      for (let i = 1; i < dbRows.length; i++) {
-        const row = dbRows[i];
-        const timestamp = row[0];
-        const bookingDateStr = row[3];
-        const status = (row[2] || '').toLowerCase();
-
-        const bookingDate = parseBookingDate(bookingDateStr);
-        const createdDate = getDateFromTimestamp(timestamp);
-        const createdToday = createdDate && createdDate.getTime() === today.getTime();
-
-        if (createdToday && isTomorrow(bookingDate) && status === 'scheduled') {
-          bookings.push({
-            firstName: row[4] || '',
-            lastName: row[5] || '',
-            branch: row[1] || '',
-            date: row[3] || '',
-            treatment: row[8] || '',
-            totalPrice: row[12] || 0,
-            status: row[2] || '',
-            phone: row[14] || '',
-            email: row[16] || '',
-            agent: row[17] || ''
-          });
-        }
-      }
-
-      res.json({ success: true, bookings });
-    } catch (error) {
-      console.error('Get tomorrow bookings error:', error);
-      res.status(500).json({ error: 'Failed to fetch tomorrow bookings' });
-    }
-  }
-
-  // Get Next 7 Days detailed bookings
-  async getNext7DaysBookings(req, res) {
-    try {
-      const dbRows = await sheetsService.readSheet('DB');
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      const nextSevenDaysEnd = new Date(today);
-      nextSevenDaysEnd.setDate(nextSevenDaysEnd.getDate() + 7);
-
-      const parseBookingDate = (dateStr) => {
-        if (!dateStr) return null;
-        const parsed = parseDateString(dateStr);
-        if (!parsed) return null;
-        const d = new Date(parsed);
-        d.setHours(0, 0, 0, 0);
-        return d;
-      };
-
-      const dayAfterTomorrow = new Date(tomorrow);
-      dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 1);
-
-      const getDateFromTimestamp = (timestampStr) => {
-        if (!timestampStr) return null;
-        const parsed = parseDateString(timestampStr);
-        if (!parsed || isNaN(parsed.getTime())) return null;
-        return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 0, 0, 0, 0);
-      };
-
-      const isInNext7Days = (date) => date && date >= dayAfterTomorrow && date <= nextSevenDaysEnd;
-
-      const bookings = [];
-      for (let i = 1; i < dbRows.length; i++) {
-        const row = dbRows[i];
-        const timestamp = row[0];
-        const bookingDateStr = row[3];
-        const status = (row[2] || '').toLowerCase();
-
-        const bookingDate = parseBookingDate(bookingDateStr);
-        const createdDate = getDateFromTimestamp(timestamp);
-        const createdToday = createdDate && createdDate.getTime() === today.getTime();
-
-        if (createdToday && isInNext7Days(bookingDate) && status === 'scheduled') {
-          bookings.push({
-            firstName: row[4] || '',
-            lastName: row[5] || '',
-            branch: row[1] || '',
-            date: row[3] || '',
-            treatment: row[8] || '',
-            totalPrice: row[12] || 0,
-            status: row[2] || '',
-            phone: row[14] || '',
-            email: row[16] || '',
-            agent: row[17] || ''
-          });
-        }
-      }
-
-      res.json({ success: true, bookings });
-    } catch (error) {
-      console.error('Get next 7 days bookings error:', error);
-      res.status(500).json({ error: 'Failed to fetch next 7 days bookings' });
-    }
-  }
-
-  // Get Cancellations detailed bookings (Created today + status is Cancelled)
-  async getCancellations(req, res) {
-    try {
-      const dbRows = await sheetsService.readSheet('DB');
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-
-      const getDateFromTimestamp = (timestampStr) => {
-        if (!timestampStr) return null;
-        const parsed = parseDateString(timestampStr);
-        if (!parsed || isNaN(parsed.getTime())) return null;
-        return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 0, 0, 0, 0);
-      };
-
-      const bookings = [];
-      for (let i = 1; i < dbRows.length; i++) {
-        const row = dbRows[i];
-        const timestamp = row[0];
-        const status = (row[2] || '').toLowerCase();
-        const cancellationTime = row[43];
-
-        const createdDate = getDateFromTimestamp(timestamp);
-        const createdToday = createdDate && createdDate.getTime() === today.getTime();
-        const isCancelledToday = (ts) => {
-          if (!ts) return false;
-          const d = getDateFromTimestamp(ts);
-          return d && d.getTime() === today.getTime();
-        };
-
-        if (status.includes('cancel') && (isCancelledToday(cancellationTime) || (!cancellationTime && createdToday))) {
-          bookings.push({
-            firstName: row[4] || '',
-            lastName: row[5] || '',
-            branch: row[1] || '',
-            date: row[3] || '',
-            treatment: row[8] || '',
-            totalPrice: row[12] || 0,
-            status: row[2] || '',
-            phone: row[14] || '',
-            email: row[16] || '',
-            agent: row[17] || ''
-          });
-        }
-      }
-
-      res.json({ success: true, bookings });
-    } catch (error) {
-      console.error('Get cancellations error:', error);
-      res.status(500).json({ error: 'Failed to fetch cancellations' });
-    }
-  }
-
-  // Get Arrivals Today detailed bookings (Booking date = today + arrived status)
-  async getArrivalsToday(req, res) {
-    try {
-      const dbRows = await sheetsService.readSheet('DB');
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-
-      const parseBookingDate = (dateStr) => {
-        if (!dateStr) return null;
-        const parsed = parseDateString(dateStr);
-        if (!parsed) return null;
-        const d = new Date(parsed);
-        d.setHours(0, 0, 0, 0);
-        return d;
-      };
-
-      const isToday = (date) => date && date.getTime() === today.getTime();
-
-      const arrivalStatuses = new Set(['arrived & bought', 'arrived not potential']);
-
-      const bookings = [];
-      for (let i = 1; i < dbRows.length; i++) {
-        const row = dbRows[i];
-        const bookingDateStr = row[3];
-        const rawStatus = row[2] || '';
-        const normalizedStatus = rawStatus.toLowerCase().replace(/\s+/g, ' ').trim();
-
-        const bookingDate = parseBookingDate(bookingDateStr);
-
-        const underageValidation = (row[45] || '').toString().toUpperCase() === 'TRUE';
-        if (isToday(bookingDate) && arrivalStatuses.has(normalizedStatus) && !underageValidation) {
-          bookings.push({
-            firstName: row[4] || '',
-            lastName: row[5] || '',
-            branch: row[1] || '',
-            date: row[3] || '',
-            treatment: row[8] || '',
-            totalPrice: row[12] || 0,
-            status: rawStatus,
-            phone: row[14] || '',
-            email: row[16] || '',
-            agent: row[17] || ''
-          });
-        }
-      }
-
-      res.json({ success: true, bookings });
-    } catch (error) {
-      console.error('Get arrivals today error:', error);
-      res.status(500).json({ error: 'Failed to fetch arrivals today' });
-    }
-  }
-
-  // Get Tomorrow Summary detailed bookings (Scheduled tomorrow, any creation date)
-  async getTomorrowSummary(req, res) {
-    try {
-      const dbRows = await sheetsService.readSheet('DB');
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-
-      // getTomorrowSummary doesn't filter by creation date, so no getDateFromTimestamp needed
-
-      const parseBookingDate = (dateStr) => {
-        if (!dateStr) return null;
-        const parsed = parseDateString(dateStr);
-        if (!parsed) return null;
-        const d = new Date(parsed);
-        d.setHours(0, 0, 0, 0);
-        return d;
-      };
-
-      const isTomorrow = (date) => date && date.getTime() === tomorrow.getTime();
-
-      const bookings = [];
-      for (let i = 1; i < dbRows.length; i++) {
-        const row = dbRows[i];
-        const bookingDateStr = row[3];
-        const status = (row[2] || '').toLowerCase();
-
-        const bookingDate = parseBookingDate(bookingDateStr);
-
-        if (isTomorrow(bookingDate) && status === 'scheduled') {
-          bookings.push({
-            firstName: row[4] || '',
-            lastName: row[5] || '',
-            branch: row[1] || '',
-            date: row[3] || '',
-            treatment: row[8] || '',
-            totalPrice: row[12] || 0,
-            status: row[2] || '',
-            phone: row[14] || '',
-            email: row[16] || '',
-            agent: row[17] || ''
-          });
-        }
-      }
-
-      res.json({ success: true, bookings });
-    } catch (error) {
-      console.error('Get tomorrow summary error:', error);
-      res.status(500).json({ error: 'Failed to fetch tomorrow summary' });
-    }
-  }
-
-  // GET /bookings/cc-report
-  // All-in-one payload for the CC Booking Report dashboard.
-  // Sections:
-  //   totalSchedulesToday    – byBranch count/revenue + ots/additional split
-  //   totalArrivalsToday     – byBranch count + otsArrivals/additionalArrivals split
-  // DELETE /bookings/:rowNumber — Admin only.
-  // Deletes a booking row from the DB sheet and the matching row from the Intake sheet
-  // (matched by the bookingId UUID stored at DB col 34 / Intake col AI index 34).
+  // ── deleteBooking ──────────────────────────────────────────────────────────
+  // DELETE /bookings/:rowNumber  (rowNumber is record_id)
   async deleteBooking(req, res) {
     try {
       if (req.user?.role !== 'Admin') {
         return res.status(403).json({ error: 'Only admins can delete bookings' });
       }
 
-      const rowNumber = parseInt(req.params.rowNumber, 10);
-      if (!rowNumber || rowNumber < 2) {
-        return res.status(400).json({ error: 'Invalid row number' });
-      }
+      const recordId = req.params.rowNumber;
 
-      // Read the DB sheet to get the bookingId (record_id at col index 34)
-      const dbRows = await sheetsService.readSheet('DB');
-      const targetRow = dbRows[rowNumber - 1]; // rowNumber is 1-based, array is 0-based
-      if (!targetRow) {
-        return res.status(404).json({ error: 'Booking row not found' });
-      }
-      const bookingId = targetRow[34] || '';
+      const { rowCount } = await pool.query(
+        `UPDATE bookings SET record_status = 'DELETED' WHERE record_id = $1 AND record_status != 'DELETED'`,
+        [recordId]
+      );
 
-      // Delete from DB sheet
-      await sheetsService.deleteRow('DB', rowNumber);
+      if (!rowCount) return res.status(404).json({ error: 'Booking not found' });
 
-      // Delete matching row from Intake sheet (record_id at col index 34 = column AI)
-      if (bookingId) {
-        const intakeRows = await sheetsService.readSheet('Intake');
-        const intakeRowIdx = intakeRows.findIndex((r, i) => i > 0 && (r[34] || '') === bookingId);
-        if (intakeRowIdx !== -1) {
-          await sheetsService.deleteRow('Intake', intakeRowIdx + 1);
-          console.log(`✅ Deleted Intake row ${intakeRowIdx + 1} for bookingId ${bookingId}`);
-        } else {
-          console.log(`ℹ️ No matching Intake row found for bookingId ${bookingId}`);
-        }
-      }
-
-      return res.json({ success: true, message: 'Booking deleted successfully', rowNumber });
-    } catch (error) {
-      console.error('deleteBooking error:', error.message);
-      res.status(500).json({ error: 'Failed to delete booking', details: error.message });
+      res.json({ success: true, message: 'Booking deleted successfully', recordId });
+    } catch (err) {
+      console.error('deleteBooking error:', err);
+      res.status(500).json({ error: 'Failed to delete booking', details: err.message });
     }
   }
 
-  //   totalSchedulesTomorrow – byBranch count + otsTomorrow/additionalTomorrow split
-  //   paymentModesTomorrow   – { Cash, Debit, Credit } counts for tomorrow's schedule
-  //   totalSchedulesNext7    – byBranch count + otsNext7/additionalNext7 split
-  //   totalOTS               – byBranch OTS count (today+tomorrow+next7) + grand total
-  async getCCReport(req, res) {
+  // ── getDailyReports ────────────────────────────────────────────────────────
+  async getDailyReports(req, res) {
     try {
-      const dbRows = await sheetsService.readSheet('DB');
-      if (dbRows.length < 2) {
-        return res.json({ success: true, data: {} });
-      }
+      // Fetch all rows needed for the 7 report sections in one query.
+      // Per-widget "refine" filters are applied per row in JS (see F.<key> below).
+      const F = parseWidgetFilters(req.query);
+      const { rows } = await pool.query(`
+        SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
+               agent, cancellation_time, underage_cancellation, underage_status, db_status, follow_up_date,
+               is_promo_hunter
+        FROM bookings
+        WHERE record_status != 'DELETED'
+          AND (
+            booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+            OR (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+            OR appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
+            OR (appointment_date > (NOW() AT TIME ZONE 'Asia/Manila')::date + 1 AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7)
+            OR (LOWER(booking_status) LIKE '%cancel%')
+            OR (appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date AND LOWER(booking_status) IN (
+                'arrived & bought','arrived not potential','comeback & bought','promo hunter','scheduled','no show'
+            ))
+            OR (follow_up_date = (NOW() AT TIME ZONE 'Asia/Manila')::date)
+          )
+      `);
 
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
-      const next7End  = new Date(today); next7End.setDate(today.getDate() + 7);
-
-      const parseDate = (str) => {
-        if (!str) return null;
-        const p = parseDateString(str);
-        if (!p || isNaN(p.getTime())) return null;
-        const d = new Date(p); d.setHours(0,0,0,0); return d;
+      const phFmt      = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
+      const now        = Date.now();
+      const todayStr      = phFmt.format(now);
+      const tomorrowStr   = phFmt.format(now + 86400000);
+      const next7EndStr   = phFmt.format(now + 7 * 86400000); // day+7 — end of "next 7 days" (e.g. next Mon when today is Mon)
+      const next7StartStr = phFmt.format(now + 2 * 86400000); // day+2 — first day after tomorrow
+      const ctx = { today: todayStr }; // shared by all per-widget date-preset checks
+      const rpts = {
+        otsBookings:             { total: 0, revenue: 0, count: 0, byBranch: {} },
+        overallBookings:         { total: 0, revenue: 0, count: 0, byBranch: {} },
+        bookedTomorrow:          { byBranch: {} },
+        bookedNext7Days:         { byBranch: {} },
+        cancellations:           { total: 0, revenue: 0, count: 0, byBranch: {} },
+        overallBookingsTomorrow: { total: 0, revenue: 0, count: 0, byBranch: {} },
+        arrivalsToday:           { count: 0, byBranch: {}, byStatus: { 'Arrived & bought': 0, 'Arrived not potential': 0 } },
+        boughtToday:             { count: 0, revenue: 0, comebackCount: 0 },
+        noShowsToday:            0,
+        promoHuntersToday:       0,
+        followUpsDueToday:       0
       };
 
-      const isDay  = (d, ref) => d && d.getTime() === ref.getTime();
-      const inNext7 = (d) => d && d > today && d <= next7End;
-      const inNext7Inc = (d) => d && d >= today && d <= next7End;
-
-      // branch → { count, revenue }
-      const makeBranchMap = () => ({});
       const inc = (map, branch, revenue = 0) => {
         if (!map[branch]) map[branch] = { count: 0, revenue: 0 };
         map[branch].count++;
         map[branch].revenue += revenue;
       };
 
-      const totalSchedulesToday    = { ots: 0, additional: 0, byBranch: makeBranchMap(), otsRevenue: 0, additionalRevenue: 0 };
-      const totalArrivalsToday     = { otsArrivals: 0, additionalArrivals: 0, byBranch: makeBranchMap() };
-      const totalSchedulesTomorrow = { otsTomorrow: 0, additionalTomorrow: 0, byBranch: makeBranchMap() };
-      const paymentModesTomorrow   = { Cash: 0, Debit: 0, Credit: 0 };
-      const totalSchedulesNext7    = { otsNext7: 0, additionalNext7: 0, byBranch: makeBranchMap() };
-      const totalOTSByBranch       = makeBranchMap(); // OTS = created today
-      const arrivalsStatusMap      = {};
+      for (const r of rows) {
+        const branch  = r.branch || 'Unknown';
+        const status  = (r.booking_status || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        // "Comeback & Bought" is excluded from the entire Daily Report folder (#20)
+        if (status === 'comeback & bought') continue;
+        const apptStr    = r.appointment_date ? new Date(r.appointment_date).toISOString().split('T')[0] : null;
+        const bookingStr = r.booking_date    ? new Date(r.booking_date).toISOString().split('T')[0]     : null;
+        const price      = parseFloat(r.total_price) || 0;
+        const created    = r.created_at ? new Date(r.created_at) : null;
 
-      for (let i = 1; i < dbRows.length; i++) {
-        const row = dbRows[i];
-        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
-        if (cancelValidation) continue;
+        const createdToday = created && phFmt.format(created) === todayStr; // used only for cancellation fallback
+        const bookedToday  = bookingStr === todayStr;                       // "OTS" = booked today (booking_date)
+        // "Valid" = both tri-state validations Approved (Pending/Rejected are excluded from reports)
+        const valid = (r.underage_status || 'Approved') === 'Approved' && (r.db_status || 'Approved') === 'Approved';
+        const isToday    = apptStr === todayStr;
+        const isTomorrow = apptStr === tomorrowStr;
+        const isNext7    = apptStr != null && apptStr > todayStr    && apptStr <= next7EndStr; // day+1 .. day+7
+        const isD7After  = apptStr != null && apptStr >= next7StartStr && apptStr <= next7EndStr; // day+2 .. day+7
 
-        const branch      = row[1] || 'Unknown';
-        const rawStatus   = row[2] || '';
-        const statusLower = rawStatus.toLowerCase().replace(/\s+/g, ' ').trim();
-        const bookingDate = parseDate(row[3]);
-        const createdDate = parseDate(row[0]);
-        const price       = parseFloat((row[12] || '0').toString().replace(/[^0-9.]/g, '')) || 0;
-        const payMode     = (row[13] || '').trim();
-
-        if (!bookingDate) continue;
-
-        const createdToday = createdDate && isDay(createdDate, today);
-        const cancelled    = statusLower.includes('cancel');
-        const isArrived    = statusLower === 'arrived & bought' || statusLower === 'arrived not potential';
-        const underageVal  = (row[45] || '').toString().toUpperCase() === 'TRUE';
-
-        // ── Section 1: Total Schedules Today ──────────────────────────
-        if (!cancelled && isDay(bookingDate, today)) {
-          inc(totalSchedulesToday.byBranch, branch, price);
-          if (createdToday) {
-            totalSchedulesToday.ots++;
-            totalSchedulesToday.otsRevenue += price;
-            inc(totalOTSByBranch, branch);
-          } else {
-            totalSchedulesToday.additional++;
-            totalSchedulesToday.additionalRevenue += price;
-          }
+        // Section 1: OTS
+        if (bookedToday && isToday && matchesWidgetFilter(r, F.ots, ctx)) {
+          rpts.otsBookings.count++; rpts.otsBookings.revenue += price; rpts.otsBookings.total++;
+          inc(rpts.otsBookings.byBranch, branch, price);
         }
 
-        // ── Section 2: Total Arrivals Today ───────────────────────────
-        if (!underageVal && isArrived && isDay(bookingDate, today)) {
-          inc(totalArrivalsToday.byBranch, branch);
-          if (!arrivalsStatusMap[rawStatus]) arrivalsStatusMap[rawStatus] = 0;
-          arrivalsStatusMap[rawStatus]++;
-          if (createdToday) totalArrivalsToday.otsArrivals++;
-          else              totalArrivalsToday.additionalArrivals++;
+        // Section 2: Overall
+        if (bookedToday && (isToday || isNext7) && matchesWidgetFilter(r, F.overall, ctx)) {
+          rpts.overallBookings.count++; rpts.overallBookings.revenue += price; rpts.overallBookings.total++;
+          inc(rpts.overallBookings.byBranch, branch, price);
         }
 
-        // ── Section 3: Total Schedules Tomorrow ───────────────────────
-        if (!cancelled && isDay(bookingDate, tomorrow)) {
-          inc(totalSchedulesTomorrow.byBranch, branch, price);
-          // Payment modes for tomorrow
-          const modeKey = payMode.toLowerCase().includes('cash') ? 'Cash'
-                        : payMode.toLowerCase().includes('debit') ? 'Debit'
-                        : payMode.toLowerCase().includes('credit') ? 'Credit' : null;
-          if (modeKey) paymentModesTomorrow[modeKey]++;
-
-          if (createdToday) totalSchedulesTomorrow.otsTomorrow++;
-          else              totalSchedulesTomorrow.additionalTomorrow++;
-
-          // OTS = created today (for OTS grand total section)
-          if (createdToday) inc(totalOTSByBranch, branch);
+        // Section 3: Booked Tomorrow
+        if (bookedToday && isTomorrow && status === 'scheduled' && matchesWidgetFilter(r, F['tomorrow'], ctx)) {
+          inc(rpts.bookedTomorrow.byBranch, branch, price);
         }
 
-        // ── Section 4: Total Schedules Next 7 Days ────────────────────
-        if (!cancelled && inNext7(bookingDate)) {
-          inc(totalSchedulesNext7.byBranch, branch, price);
-          if (createdToday) {
-            totalSchedulesNext7.otsNext7++;
-            inc(totalOTSByBranch, branch);
-          } else {
-            totalSchedulesNext7.additionalNext7++;
-          }
+        // Section 4: Booked Next 7 Days
+        if (bookedToday && isD7After && status === 'scheduled' && matchesWidgetFilter(r, F['next7days'], ctx)) {
+          inc(rpts.bookedNext7Days.byBranch, branch, price);
+        }
+
+        // Section 5: Cancellations — per Monday: Creation date is Today AND status colour = Cancelled,
+        // where the Cancelled colour group also includes Promo Hunter.
+        if ((status.includes('cancel') || r.is_promo_hunter) && createdToday && matchesWidgetFilter(r, F.cancellations, ctx)) {
+          rpts.cancellations.count++; rpts.cancellations.revenue += price; rpts.cancellations.total++;
+          inc(rpts.cancellations.byBranch, branch, price);
+        }
+
+        // Section 6: Tomorrow Summary (any creation date) — drives both the
+        // "Overall Bookings Tomorrow" big number AND its per-branch chart, so they match.
+        // Per formula #1: appt=Tomorrow, Scheduled, and both validations Approved.
+        if (isTomorrow && status === 'scheduled' && valid && matchesWidgetFilter(r, F['overall-tomorrow'], ctx)) {
+          rpts.overallBookingsTomorrow.count++;
+          rpts.overallBookingsTomorrow.revenue += price;
+          rpts.overallBookingsTomorrow.total++;
+          inc(rpts.overallBookingsTomorrow.byBranch, branch, price);
+        }
+
+        // Section 7: Arrivals Today (exclude non-Approved underage status)
+        if (isToday && r.underage_status === 'Approved' &&
+            (status === 'arrived & bought' || status === 'arrived not potential') &&
+            matchesWidgetFilter(r, F['arrivals-today'], ctx)) {
+          rpts.arrivalsToday.count++;
+          inc(rpts.arrivalsToday.byBranch, branch);
+          const label = r.booking_status || '';
+          rpts.arrivalsToday.byStatus[label] = (rpts.arrivalsToday.byStatus[label] || 0) + 1;
+        }
+
+        // Section 8: Bought Today — "Comeback & Bought" is excluded from the Daily Report (#20)
+        if (isToday && r.underage_status === 'Approved' && status === 'arrived & bought') {
+          rpts.boughtToday.count++;
+          rpts.boughtToday.revenue += price;
+        }
+
+        // Section 9: No-shows today
+        if (isToday && status === 'no show') rpts.noShowsToday++;
+
+        // Section 10: Promo hunters today
+        if (isToday && r.is_promo_hunter) rpts.promoHuntersToday++;
+
+        // Section 11: Follow-ups due today
+        const fuDate = r.follow_up_date ? String(r.follow_up_date).split('T')[0] : null;
+        if (fuDate && fuDate === todayStr) rpts.followUpsDueToday++;
+      }
+
+      // Compute derived rates
+      const schedulesToday = Object.values(rpts.arrivalsToday.byBranch).reduce((s, v) => s + v.count, 0) +
+        Object.values(rpts.otsBookings.byBranch).reduce((s, v) => s + v.count, 0);
+      const arrivalRateToday   = schedulesToday   > 0 ? +(rpts.arrivalsToday.count / schedulesToday   * 100).toFixed(1) : null;
+      const conversionRateToday = rpts.arrivalsToday.count > 0 ? +(rpts.boughtToday.count / rpts.arrivalsToday.count * 100).toFixed(1) : null;
+
+      res.json({ success: true, date: todayStr, reports: { ...rpts, arrivalRateToday, conversionRateToday } });
+    } catch (err) {
+      console.error('getDailyReports error:', err);
+      res.status(500).json({ error: 'Failed to fetch daily reports' });
+    }
+  }
+
+  // ── Detailed drill-down endpoints ─────────────────────────────────────────
+
+  async getOTSBookings(req, res) {
+    try {
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
+      const { rows } = await pool.query(`
+        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+               treatment, total_price, booking_status, phone, email, agent, booking_date
+        FROM bookings
+        WHERE record_status != 'DELETED'
+          AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
+    } catch (err) {
+      console.error('getOTSBookings error:', err);
+      res.status(500).json({ error: 'Failed to fetch OTS bookings' });
+    }
+  }
+
+  async getOverallBookings(req, res) {
+    try {
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
+      const { rows } = await pool.query(`
+        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+               treatment, total_price, booking_status, phone, email, agent, booking_date
+        FROM bookings
+        WHERE record_status != 'DELETED'
+          AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
+    } catch (err) {
+      console.error('getOverallBookings error:', err);
+      res.status(500).json({ error: 'Failed to fetch overall bookings' });
+    }
+  }
+
+  async getTomorrowBookings(req, res) {
+    try {
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
+      const { rows } = await pool.query(`
+        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+               treatment, total_price, booking_status, phone, email, agent, booking_date
+        FROM bookings
+        WHERE record_status != 'DELETED'
+          AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
+          AND LOWER(booking_status) = 'scheduled'
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
+    } catch (err) {
+      console.error('getTomorrowBookings error:', err);
+      res.status(500).json({ error: 'Failed to fetch tomorrow bookings' });
+    }
+  }
+
+  async getNext7DaysBookings(req, res) {
+    try {
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
+      const { rows } = await pool.query(`
+        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+               treatment, total_price, booking_status, phone, email, agent, booking_date
+        FROM bookings
+        WHERE record_status != 'DELETED'
+          AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND appointment_date > (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
+          AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
+          AND LOWER(booking_status) = 'scheduled'
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
+    } catch (err) {
+      console.error('getNext7DaysBookings error:', err);
+      res.status(500).json({ error: 'Failed to fetch next 7 days bookings' });
+    }
+  }
+
+  async getCancellations(req, res) {
+    try {
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
+      const { rows } = await pool.query(`
+        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+               treatment, total_price, booking_status, phone, email, agent,
+               booking_date, cancellation_time, created_at
+        FROM bookings
+        WHERE record_status != 'DELETED'
+          AND (LOWER(booking_status) LIKE '%cancel%' OR is_promo_hunter)
+          AND (created_at AT TIME ZONE 'Asia/Manila')::date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
+    } catch (err) {
+      console.error('getCancellations error:', err);
+      res.status(500).json({ error: 'Failed to fetch cancellations' });
+    }
+  }
+
+  async getArrivalsToday(req, res) {
+    try {
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
+      const { rows } = await pool.query(`
+        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+               treatment, total_price, booking_status, phone, email, agent, booking_date
+        FROM bookings
+        WHERE record_status != 'DELETED'
+          AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+          AND LOWER(booking_status) IN ('arrived & bought','arrived not potential')
+          AND underage_status = 'Approved'
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
+    } catch (err) {
+      console.error('getArrivalsToday error:', err);
+      res.status(500).json({ error: 'Failed to fetch arrivals today' });
+    }
+  }
+
+  async getTomorrowSummary(req, res) {
+    try {
+      const wf = parseSingleFilter(req.query);
+      const ctx = widgetCtx();
+      const { rows } = await pool.query(`
+        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+               treatment, total_price, booking_status, phone, email, agent, booking_date
+        FROM bookings
+        WHERE record_status != 'DELETED'
+          AND appointment_date = (NOW() AT TIME ZONE 'Asia/Manila')::date + 1
+          AND LOWER(booking_status) = 'scheduled'
+          AND underage_status = 'Approved' AND db_status = 'Approved'
+      `);
+      res.json({ success: true, bookings: rows.filter(r => matchesWidgetFilter(r, wf, ctx)).map(mapDrilldown) });
+    } catch (err) {
+      console.error('getTomorrowSummary error:', err);
+      res.status(500).json({ error: 'Failed to fetch tomorrow summary' });
+    }
+  }
+
+  // ── getCCReport ────────────────────────────────────────────────────────────
+  async getCCReport(req, res) {
+    try {
+      const F = parseWidgetFilters(req.query);   // Per-widget refine filters
+      const [{ rows }, { rows: cancelRows }] = await Promise.all([
+        pool.query(`
+          SELECT branch, booking_status, appointment_date, created_at, booking_date, total_price,
+                 payment_mode, agent, is_promo_hunter
+          FROM bookings
+          WHERE record_status != 'DELETED'
+            AND appointment_date >= (NOW() AT TIME ZONE 'Asia/Manila')::date
+            AND appointment_date <= (NOW() AT TIME ZONE 'Asia/Manila')::date + 7
+        `),
+        // Cancellation per Branch — Status = Cancelled or Promo Hunter, Booked on = Today.
+        // Fetch rows (not grouped) so the widget's own refine filter can apply per row.
+        pool.query(`
+          SELECT branch, booking_status, appointment_date, booking_date, agent, total_price
+          FROM bookings
+          WHERE record_status != 'DELETED'
+            AND (LOWER(booking_status) LIKE '%cancel%' OR is_promo_hunter)
+            AND booking_date = (NOW() AT TIME ZONE 'Asia/Manila')::date
+        `),
+      ]);
+
+      const phFmt      = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
+      const now        = Date.now();
+      const todayStr    = phFmt.format(now);
+      const ctx        = { today: todayStr }; // shared by all per-widget date-preset checks
+
+      const cancellations = {};
+      for (const c of cancelRows) {
+        if (!matchesWidgetFilter(c, F.cancellations, ctx)) continue;
+        const br = c.branch || 'Unknown';
+        if (!cancellations[br]) cancellations[br] = { count: 0, revenue: 0 };
+        cancellations[br].count++;
+        cancellations[br].revenue += parseFloat(c.total_price) || 0;
+      }
+
+      const tomorrowStr = phFmt.format(now + 86400000);
+      // "In the next 7 days" = tomorrow .. today+7 (7 days). The "Next 7 days" widget also
+      // excludes today & tomorrow, so it spans day+2 .. day+7.
+      const next7EndStr = phFmt.format(now + 7 * 86400000);
+
+      const schedToday = {}, arrToday = {}, schedTomorrow = {}, next7 = {}, otsMap = {};
+      const payModesTomorrow = { Cash: 0, Debit: 0, Credit: 0 };
+      const payModeRevTomorrow = { Cash: 0, Debit: 0, Credit: 0 };
+      const arrStatusMap = {};
+      let otsT = 0, otsAddit = 0, otsRev = 0, additRev = 0;
+      let arrOTS = 0, arrAddit = 0;
+      let schedTomOTS = 0, schedTomAddit = 0;
+      let otsNext7 = 0, additNext7 = 0;
+      let boughtTodayCount = 0, boughtTodayRevenue = 0, promoHuntersToday = 0;
+      let schedTodayRoster = 0; // everyone expected today (excl. cancelled) — arrival-rate denominator
+
+      const inc = (map, branch, rev = 0) => {
+        if (!map[branch]) map[branch] = { count: 0, revenue: 0 };
+        map[branch].count++;
+        map[branch].revenue += rev;
+      };
+
+      for (const r of rows) {
+        const branch  = r.branch || 'Unknown';
+        const status  = (r.booking_status || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const apptStr    = r.appointment_date ? new Date(r.appointment_date).toISOString().split('T')[0] : null;
+        const bookingStr = r.booking_date    ? new Date(r.booking_date).toISOString().split('T')[0]     : null;
+        const price      = parseFloat(r.total_price) || 0;
+        const pm         = (r.payment_mode || '').trim();
+
+        // "OTS" = booked today (booking_date column), regardless of the DB insertion time.
+        const bookedToday = bookingStr === todayStr;
+        const cancelled   = status.includes('cancel');
+        const isArrived   = status === 'arrived & bought' || status === 'arrived not potential';
+        // Monday filters these widgets by "Status colour is Scheduled" = the literal Scheduled
+        // status only (Promo Hunter has its own colour — verified against Monday's counts).
+        const isScheduled = status === 'scheduled';
+
+        if (!apptStr) continue;
+        const isToday    = apptStr === todayStr;
+        const isTomorrow = apptStr === tomorrowStr;
+        const inNext7    = apptStr > tomorrowStr && apptStr <= next7EndStr; // day+2 .. day+7
+
+        // Roster for the arrival-rate denominator (everyone still expected today, excl. cancelled)
+        if (!cancelled && isToday) schedTodayRoster++;
+
+        // Total OTS — Booked on = Today AND appointment in the next 7 days (today .. day+7),
+        // ANY status EXCEPT "Comeback & Bought" (team follow-up: those are not real OTS bookings).
+        if (bookedToday && apptStr >= todayStr && apptStr <= next7EndStr &&
+            status !== 'comeback & bought' && matchesWidgetFilter(r, F.ots, ctx)) {
+          inc(otsMap, branch, price);
+        }
+
+        // Schedules today — EVERY booking scheduled for today, regardless of status
+        // (Monday's widget has a single condition: Booking Schedule = Today; it counts
+        // Cancelled / Promo Hunter / Arrived / etc. alike). Booked-on splits OTS vs Additional.
+        if (isToday && matchesWidgetFilter(r, F.today, ctx)) {
+          inc(schedToday, branch, price);
+          if (bookedToday) { otsT++; otsRev += price; }
+          else             { otsAddit++; additRev += price; }
+        }
+
+        // Arrivals today (base query already excludes non-Approved underage/DB status)
+        if (isArrived && isToday && matchesWidgetFilter(r, F.arrivals, ctx)) {
+          inc(arrToday, branch);
+          const label = r.booking_status || '';
+          arrStatusMap[label] = (arrStatusMap[label] || 0) + 1;
+          if (bookedToday) arrOTS++; else arrAddit++;
+        }
+
+        // Bought today (arrived & bought + comeback & bought)
+        if (isToday &&
+            (status === 'arrived & bought' || status === 'comeback & bought')) {
+          boughtTodayCount++;
+          boughtTodayRevenue += price;
+        }
+
+        // Promo hunters today
+        if (isToday && r.is_promo_hunter) promoHuntersToday++;
+
+        // Schedules tomorrow (Status color = Scheduled → Scheduled + Promo Hunter)
+        if (isTomorrow && isScheduled && matchesWidgetFilter(r, F.tomorrow, ctx)) {
+          inc(schedTomorrow, branch, price);
+          if (bookedToday) { schedTomOTS++; }
+          else              schedTomAddit++;
+        }
+
+        // Modes of Payment for Tomorrow (own widget filter — decoupled from the Tomorrow schedule widget)
+        if (isTomorrow && isScheduled && matchesWidgetFilter(r, F.payment, ctx)) {
+          const mk = pm.toLowerCase().includes('cash') ? 'Cash'
+                   : pm.toLowerCase().includes('debit') ? 'Debit'
+                   : pm.toLowerCase().includes('credit') ? 'Credit' : null;
+          if (mk) { payModesTomorrow[mk]++; payModeRevTomorrow[mk] += price; }
+        }
+
+        // Next 7 days (day+2 .. day+7, Status color = Scheduled → Scheduled + Promo Hunter)
+        if (inNext7 && isScheduled && matchesWidgetFilter(r, F.next7, ctx)) {
+          inc(next7, branch, price);
+          if (bookedToday) { otsNext7++; }
+          else              additNext7++;
         }
       }
 
-      // Derived totals
-      const totalToday    = Object.values(totalSchedulesToday.byBranch).reduce((s, b) => s + b.count, 0);
-      const totalTomorrow = Object.values(totalSchedulesTomorrow.byBranch).reduce((s, b) => s + b.count, 0);
-      const totalArrivals = Object.values(totalArrivalsToday.byBranch).reduce((s, b) => s + b.count, 0);
-      const totalNext7    = Object.values(totalSchedulesNext7.byBranch).reduce((s, b) => s + b.count, 0);
-      const totalOTS      = Object.values(totalOTSByBranch).reduce((s, b) => s + b.count, 0);
+      const sumCount = map => Object.values(map).reduce((s, b) => s + b.count, 0);
+      const sumRev   = map => +Object.values(map).reduce((s, b) => s + b.revenue, 0).toFixed(2);
+
+      const schedTodayTotal   = sumCount(schedToday);
+      const arrTodayTotal     = sumCount(arrToday);
+      // Arrival rate = arrived / everyone expected today (roster), not / still-scheduled
+      const arrivalRateToday   = schedTodayRoster  > 0 ? +(arrTodayTotal     / schedTodayRoster  * 100).toFixed(1) : 0;
+      const conversionRateToday = arrTodayTotal    > 0 ? +(boughtTodayCount  / arrTodayTotal     * 100).toFixed(1) : 0;
 
       return res.json({
         success: true,
         generatedAt: new Date().toISOString(),
         data: {
-          totalSchedulesToday:    { ...totalSchedulesToday,    total: totalToday },
-          totalArrivalsToday:     { ...totalArrivalsToday,     total: totalArrivals, byStatus: arrivalsStatusMap },
-          totalSchedulesTomorrow: { ...totalSchedulesTomorrow, total: totalTomorrow },
-          paymentModesTomorrow,
-          totalSchedulesNext7:    { ...totalSchedulesNext7,    total: totalNext7 },
-          totalOTS:               { byBranch: totalOTSByBranch, total: totalOTS },
+          totalSchedulesToday:    { ots: otsT, additional: otsAddit, otsRevenue: otsRev, additionalRevenue: additRev, byBranch: schedToday, total: schedTodayTotal },
+          totalArrivalsToday:     { otsArrivals: arrOTS, additionalArrivals: arrAddit, byBranch: arrToday, total: arrTodayTotal, byStatus: arrStatusMap },
+          totalSchedulesTomorrow: { otsTomorrow: schedTomOTS, additionalTomorrow: schedTomAddit, byBranch: schedTomorrow, total: sumCount(schedTomorrow), potentialRevenue: sumRev(schedTomorrow) },
+          paymentModesTomorrow: payModesTomorrow,
+          paymentModeRevenueTomorrow: payModeRevTomorrow,
+          totalSchedulesNext7:    { otsNext7, additionalNext7: additNext7, byBranch: next7, total: sumCount(next7) },
+          totalOTS:               { byBranch: otsMap, total: sumCount(otsMap) },
+          cancellationsToday:     { byBranch: cancellations, total: sumCount(cancellations) },
+          performance: {
+            boughtToday:          { count: boughtTodayCount, revenue: +boughtTodayRevenue.toFixed(2) },
+            arrivalRateToday,
+            conversionRateToday,
+            promoHuntersToday
+          }
         }
       });
-    } catch (error) {
-      console.error('getCCReport error:', error.message);
+    } catch (err) {
+      console.error('getCCReport error:', err);
       res.status(500).json({ error: 'Failed to generate CC report' });
     }
   }
 
-  // GET /bookings/cc-report/drilldown?section=<section>
-  // Returns detailed bookings for a CC Report section (filtered by branch or payMode on the client).
-  // Sections: schedules-today | arrivals | schedules-tomorrow | payment-tomorrow | next7days | ots
+  // ── getCCReportDrilldown ───────────────────────────────────────────────────
   async getCCReportDrilldown(req, res) {
     try {
       const { section } = req.query;
-      const validSections = ['schedules-today', 'arrivals', 'schedules-tomorrow', 'payment-tomorrow', 'next7days', 'ots'];
+      const validSections = ['schedules-today','arrivals','schedules-tomorrow','payment-tomorrow','next7days','ots','cancellations'];
       if (!validSections.includes(section)) {
         return res.status(400).json({ error: 'Invalid section. Must be one of: ' + validSections.join(', ') });
       }
 
-      const dbRows = await sheetsService.readSheet('DB');
-      if (dbRows.length < 2) return res.json({ success: true, bookings: [] });
+      const SELECT = `
+        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+               treatment, total_price, booking_status, phone, email, agent, payment_mode,
+               booking_date, created_at
+        FROM bookings`;
+      const phToday = `(NOW() AT TIME ZONE 'Asia/Manila')::date`;
+      // The clicked widget's own refine filter (JSON), applied to the rows in JS.
+      let widgetFilter = null;
+      try { widgetFilter = req.query.filter ? JSON.parse(req.query.filter) : null; } catch { widgetFilter = null; }
+      const ctx = { today: new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(Date.now()) };
+      const apply = (rows) => rows.filter(r => matchesWidgetFilter(r, widgetFilter, ctx));
 
-      const today = new Date(); today.setHours(0, 0, 0, 0);
-      const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
-      const next7End  = new Date(today); next7End.setDate(today.getDate() + 7);
-
-      const parseDate = (str) => {
-        if (!str) return null;
-        const p = parseDateString(str);
-        if (!p || isNaN(p.getTime())) return null;
-        const d = new Date(p); d.setHours(0, 0, 0, 0); return d;
-      };
-
-      const isDay   = (d, ref) => d && d.getTime() === ref.getTime();
-      const inNext7 = (d) => d && d > today && d <= next7End;
-
-      const bookings = [];
-      for (let i = 1; i < dbRows.length; i++) {
-        const row = dbRows[i];
-        const cancelValidation = (row[44] || '').toString().toUpperCase() === 'TRUE';
-        if (cancelValidation) continue;
-
-        const branch      = row[1] || 'Unknown';
-        const rawStatus   = row[2] || '';
-        const statusLower = rawStatus.toLowerCase().replace(/\s+/g, ' ').trim();
-        const bookingDate = parseDate(row[3]);
-        const createdDate = parseDate(row[0]);
-        const payMode     = (row[13] || '').trim();
-
-        if (!bookingDate) continue;
-
-        const createdToday = createdDate && isDay(createdDate, today);
-        const cancelled    = statusLower.includes('cancel');
-        const isArrived    = statusLower === 'arrived & bought' || statusLower === 'arrived not potential';
-        const underageVal  = (row[45] || '').toString().toUpperCase() === 'TRUE';
-
-        let include = false;
-        if (section === 'schedules-today'    && !cancelled && isDay(bookingDate, today))    include = true;
-        else if (section === 'arrivals'      && !underageVal && isArrived && isDay(bookingDate, today)) include = true;
-        else if (section === 'schedules-tomorrow' && !cancelled && isDay(bookingDate, tomorrow)) include = true;
-        else if (section === 'payment-tomorrow'   && !cancelled && isDay(bookingDate, tomorrow)) include = true;
-        else if (section === 'next7days'     && !cancelled && inNext7(bookingDate))         include = true;
-        else if (section === 'ots'           && !cancelled && createdToday &&
-                 (isDay(bookingDate, today) || isDay(bookingDate, tomorrow) || inNext7(bookingDate))) include = true;
-
-        if (include) {
-          bookings.push({
-            firstName:   row[4]  || '',
-            lastName:    row[5]  || '',
-            branch,
-            date:        row[3]  || '',
-            treatment:   row[8]  || '',
-            totalPrice:  row[12] || 0,
-            status:      rawStatus,
-            phone:       row[14] || '',
-            email:       row[16] || '',
-            agent:       row[17] || '',
-            paymentMode: payMode,
-          });
-        }
+      // Cancellations are independent of the appointment window and of validation status.
+      if (section === 'cancellations') {
+        const { rows } = await pool.query(
+          `${SELECT} WHERE record_status != 'DELETED' AND (LOWER(booking_status) LIKE '%cancel%' OR is_promo_hunter) AND booking_date = ${phToday}`
+        );
+        return res.json({ success: true, bookings: apply(rows).map(r => ({ ...mapDrilldown(r), paymentMode: normalizePaymentMode(r.payment_mode) })) });
       }
 
-      res.json({ success: true, bookings });
-    } catch (error) {
-      console.error('getCCReportDrilldown error:', error.message);
+      let SQL = `${SELECT} WHERE record_status != 'DELETED'`;
+
+      if (section === 'schedules-today') {
+        // Every booking scheduled for today, any status — mirrors the widget total.
+        SQL += ` AND appointment_date = ${phToday}`;
+      } else if (section === 'arrivals') {
+        SQL += ` AND appointment_date = ${phToday} AND LOWER(booking_status) IN ('arrived & bought','arrived not potential')`;
+      } else if (section === 'schedules-tomorrow' || section === 'payment-tomorrow') {
+        SQL += ` AND appointment_date = ${phToday} + 1 AND LOWER(booking_status) = 'scheduled'`;
+      } else if (section === 'next7days') {
+        // day+2 .. day+7 (excludes today & tomorrow), Scheduled only — matches the widget.
+        SQL += ` AND appointment_date > ${phToday} + 1 AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) = 'scheduled'`;
+      } else if (section === 'ots') {
+        // Total OTS = booked today (booking_date), appt within today .. day+7, ANY status
+        // EXCEPT "Comeback & Bought" (team follow-up #1/#6).
+        SQL += ` AND booking_date = ${phToday} AND appointment_date >= ${phToday} AND appointment_date <= ${phToday} + 7 AND LOWER(booking_status) <> 'comeback & bought'`;
+      }
+
+      const { rows } = await pool.query(SQL);
+      res.json({ success: true, bookings: apply(rows).map(r => ({ ...mapDrilldown(r), paymentMode: normalizePaymentMode(r.payment_mode) })) });
+    } catch (err) {
+      console.error('getCCReportDrilldown error:', err);
       res.status(500).json({ error: 'Failed to fetch drill-down bookings' });
     }
   }
-}
 
-// Helper function to check for promo hunter by matching name, email, phone, social media, or companion name
-async function checkPromoHunter(firstName, lastName, email, phone, socialMedia, companionFirstName, companionLastName) {
-  try {
-    const dbRows = await sheetsService.readSheet('DB');
-    
-    if (dbRows.length < 2) {
-      return {
-        status: 'Scheduled',
-        matchReason: '',
-        matchedSource: '',
-        matchedRow: ''
+  // ── getFilterOptions ───────────────────────────────────────────────────────
+  // GET /api/bookings/filter-options — distinct branch / status / agent values that
+  // actually exist in the data, so the per-widget filters reflect real data (config
+  // lists can drift, e.g. agents). Case-insensitively de-duplicated, first spelling wins.
+  async getFilterOptions(req, res) {
+    try {
+      const { rows } = await pool.query(`
+        SELECT
+          COALESCE((SELECT array_agg(DISTINCT branch)         FROM bookings WHERE record_status <> 'DELETED' AND NULLIF(TRIM(branch), '')         IS NOT NULL), '{}') AS branches,
+          COALESCE((SELECT array_agg(DISTINCT booking_status) FROM bookings WHERE record_status <> 'DELETED' AND NULLIF(TRIM(booking_status), '') IS NOT NULL), '{}') AS statuses,
+          COALESCE((SELECT array_agg(DISTINCT agent)          FROM bookings WHERE record_status <> 'DELETED' AND NULLIF(TRIM(agent), '')          IS NOT NULL), '{}') AS agents
+      `);
+      const dedupe = (arr) => {
+        const seen = new Set(), out = [];
+        for (const v of (arr || [])) {
+          const k = String(v).trim().toLowerCase();
+          if (k && !seen.has(k)) { seen.add(k); out.push(String(v).trim()); }
+        }
+        return out.sort((a, b) => a.localeCompare(b));
       };
+      res.json({
+        success: true,
+        options: {
+          branches: dedupe(rows[0].branches),
+          statuses: dedupe(rows[0].statuses),
+          agents:   dedupe(rows[0].agents),
+        },
+      });
+    } catch (err) {
+      console.error('getFilterOptions error:', err);
+      res.status(500).json({ error: 'Failed to fetch filter options' });
     }
+  }
 
-    const fullName = `${firstName} ${lastName}`.toLowerCase().trim();
-    const normalizedEmail = (email || '').toLowerCase().trim();
-    const normalizedPhone = (phone || '').replace(/\D/g, '').trim(); // Remove non-digits
-    const normalizedSocialMedia = (socialMedia || '').toLowerCase().trim();
-    const companionFullName = companionFirstName && companionLastName 
-      ? `${companionFirstName} ${companionLastName}`.toLowerCase().trim() 
-      : '';
+  // ── exportBookings ─────────────────────────────────────────────────────────
+  // GET /api/bookings/export  — same filters as getOldBookings, returns CSV
+  async exportBookings(req, res) {
+    try {
+      const search    = (req.query.search    || '').trim();
+      const branch    = (req.query.branch    || '').trim();
+      const status    = (req.query.status    || '').trim();
+      const agent     = (req.query.agent     || '').trim();
+      const gender    = (req.query.gender    || '').trim();
 
-    // Check existing bookings (skip header row)
-    const matches = [];
-    const bookings = dbRows.slice(1);
+      const createdDateRange    = req.query.createdDateRange;
+      const createdStartDate    = req.query.createdStartDate;
+      const createdEndDate      = req.query.createdEndDate;
+      const appointmentDateRange = req.query.appointmentDateRange;
+      const appointmentStartDate = req.query.appointmentStartDate;
+      const appointmentEndDate   = req.query.appointmentEndDate;
 
-    for (let i = 0; i < bookings.length; i++) {
-      const row = bookings[i];
-      const rowNumber = i + 2; // +2 because we skip header and array is 0-indexed
-      
-      const existingFirstName = (row[4] || '').toLowerCase().trim();
-      const existingLastName = (row[5] || '').toLowerCase().trim();
-      const existingEmail = (row[16] || '').toLowerCase().trim();
-      const existingPhone = (row[14] || '').replace(/\D/g, '').trim();
-      const existingSocialMedia = (row[15] || '').toLowerCase().trim();
-      const existingCompanionFirstName = (row[20] || '').toLowerCase().trim();
-      const existingCompanionLastName = (row[21] || '').toLowerCase().trim();
+      const conds  = ["record_status != 'DELETED'"];
+      const params = [];
+      let   idx    = 1;
 
-      const existingFullName = `${existingFirstName} ${existingLastName}`.trim();
-      const existingCompanionFullName = existingCompanionFirstName && existingCompanionLastName
-        ? `${existingCompanionFirstName} ${existingCompanionLastName}`.trim()
-        : '';
-
-      let matchReason = '';
-      let matchedAs = '';
-
-      // Match by customer name
-      if (existingFullName && fullName && existingFullName === fullName) {
-        matchReason = 'Customer Name Match';
-        matchedAs = 'customer';
-      }
-      // Match by email
-      else if (normalizedEmail && existingEmail && existingEmail === normalizedEmail) {
-        matchReason = 'Email Match';
-        matchedAs = 'customer';
-      }
-      // Match by phone
-      else if (normalizedPhone && existingPhone && existingPhone === normalizedPhone) {
-        matchReason = 'Phone Match';
-        matchedAs = 'customer';
-      }
-      // Match by social media (Facebook / Instagram Name)
-      else if (normalizedSocialMedia && existingSocialMedia && existingSocialMedia === normalizedSocialMedia) {
-        matchReason = 'Social Media Match';
-        matchedAs = 'customer';
-      }
-      // Match by companion name (current customer was a companion before)
-      else if (companionFullName && existingCompanionFullName && existingCompanionFullName === companionFullName) {
-        matchReason = 'Previously Companion';
-        matchedAs = 'companion';
-      }
-      // Match if current companion matches previous customer
-      else if (companionFullName && existingFullName && existingFullName === companionFullName) {
-        matchReason = 'Companion Match (was customer)';
-        matchedAs = 'companion';
+      // Branch / Status / Agent / Gender filters (is + is-not combinable) — shared with getOldBookings
+      idx = pushTextFilters(conds, params, idx, {
+        branch, branchNot: req.query.branchNot,
+        status, statusNot: req.query.statusNot,
+        agent,  agentNot:  req.query.agentNot,
+        gender,
+      });
+      // Booked On (booking_date) + Appointment-date filters — shared with getOldBookings
+      idx = pushBookingDateFilters(conds, params, idx, {
+        createdStartDate, createdEndDate, createdDateRange,
+        appointmentStartDate, appointmentEndDate, appointmentDateRange,
+      });
+      if (search) {
+        const q = `%${search.toLowerCase()}%`;
+        conds.push(`(LOWER(COALESCE(first_name,'')) LIKE $${idx} OR LOWER(COALESCE(last_name,'')) LIKE $${idx} OR (LOWER(COALESCE(first_name,'')) || ' ' || LOWER(COALESCE(last_name,''))) LIKE $${idx} OR LOWER(COALESCE(full_name_norm,'')) LIKE $${idx} OR LOWER(COALESCE(email,'')) LIKE $${idx} OR phone LIKE $${idx} OR LOWER(COALESCE(social_media,'')) LIKE $${idx} OR LOWER(COALESCE(agent,'')) LIKE $${idx} OR LOWER(COALESCE(treatment,'')) LIKE $${idx} OR LOWER(COALESCE(branch,'')) LIKE $${idx} OR LOWER(COALESCE(companion_first_name,'')) LIKE $${idx} OR LOWER(COALESCE(companion_last_name,'')) LIKE $${idx} OR (LOWER(COALESCE(companion_first_name,'')) || ' ' || LOWER(COALESCE(companion_last_name,''))) LIKE $${idx} OR LOWER(COALESCE(companion_full_name_norm,'')) LIKE $${idx})`);
+        params.push(q); idx++;
       }
 
-      if (matchReason) {
-        matches.push({
-          rowNumber,
-          reason: matchReason,
-          source: matchedAs,
-          date: row[3] || '',
-          branch: row[1] || ''
-        });
-      }
-    }
+      const WHERE = `WHERE ${conds.join(' AND ')}`;
 
-    // Classify based on number of previous bookings
-    let status = '';
-    if (matches.length === 0) {
-      status = 'Scheduled'; // New customer
-    } else {
-      status = 'Promo hunter'; // Has previous booking(s)
-    }
+      const { rows } = await pool.query(`
+        SELECT record_id, created_at, branch, booking_status, booking_date, booking_time,
+               appointment_date, appointment_time,
+               first_name, last_name, age, gender, phone, email, social_media, treatment, area, freebie,
+               total_price, payment_mode, agent, ad_interacted, booking_details, remarks, purchase_details,
+               companion_first_name, companion_last_name, companion_age, companion_gender,
+               companion_freebie, companion_treatment, is_ots, is_ad_id, is_companion, is_high_priority, is_meta_conversion,
+               promo_hunter_status, follow_up_date
+        FROM bookings ${WHERE}
+        ORDER BY appointment_date DESC NULLS LAST, created_at DESC
+      `, params);
 
-    // Return detailed match information from FIRST match only (most recent booking)
-    if (matches.length > 0) {
-      const firstMatch = matches[0];
-      
-      return {
-        status,
-        matchReason: firstMatch.reason,
-        matchedSource: `${firstMatch.source} (${firstMatch.branch})`,
-        matchedRow: `Row ${firstMatch.rowNumber}`,
-        matchCount: matches.length
+      const CSV_COLS = [
+        ['Record ID','record_id'], ['Created At','created_at'], ['Branch','branch'],
+        ['Status','booking_status'], ['Booking Date','booking_date'], ['Booking Time','booking_time'],
+        ['Appointment Date','appointment_date'],
+        ['Appointment Time','appointment_time'], ['First Name','first_name'],
+        ['Last Name','last_name'], ['Age','age'], ['Gender','gender'],
+        ['Phone','phone'], ['Email','email'], ['Social Media','social_media'],
+        ['Treatment','treatment'], ['Area','area'], ['Freebie','freebie'],
+        ['Total Price','total_price'], ['Payment Mode','payment_mode'],
+        ['Agent','agent'], ['Ad Interacted','ad_interacted'],
+        ['Booking Details','booking_details'], ['Remarks','remarks'],
+        ['Purchase Details','purchase_details'],
+        ['Companion First Name','companion_first_name'],
+        ['Companion Last Name','companion_last_name'],
+        ['Companion Age','companion_age'], ['Companion Gender','companion_gender'],
+        ['Companion Freebie','companion_freebie'], ['Companion Treatment','companion_treatment'],
+        ['OTS','is_ots'], ['Ad ID','is_ad_id'], ['Companion Flag','is_companion'],
+        ['High Priority','is_high_priority'], ['Promo Hunter Status','promo_hunter_status'],
+        ['Follow-up Date','follow_up_date'],
+      ];
+
+      const escCsv = v => {
+        if (v === null || v === undefined) return '';
+        const s = String(v);
+        return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s;
       };
-    }
 
-    return {
-      status,
-      matchReason: '',
-      matchedSource: '',
-      matchedRow: '',
-      matchCount: 0
-    };
-  } catch (error) {
-    console.error('[Promo Hunter Check] Error:', error);
-    return 'Unknown';
+      const header = CSV_COLS.map(([h]) => h).join(',');
+      const lines  = rows.map(r => CSV_COLS.map(([, k]) => escCsv(r[k])).join(','));
+      const csv    = [header, ...lines].join('\r\n');
+
+      const dateStr = new Date().toISOString().slice(0, 10);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="bookings-${dateStr}.csv"`);
+      res.send('﻿' + csv); // BOM for Excel UTF-8 compatibility
+    } catch (err) {
+      console.error('Export bookings error:', err);
+      res.status(500).json({ error: 'Failed to export bookings' });
+    }
+  }
+
+  // ── bulkUpdateStatus ───────────────────────────────────────────────────────
+  // POST /api/bookings/bulk-status
+  // Body: { recordIds: ['BK-...'], status: 'Arrived & Bought' }
+  async bulkUpdateStatus(req, res) {
+    try {
+      const { recordIds, status, followUpDate } = req.body;
+
+      if (!Array.isArray(recordIds) || recordIds.length === 0) {
+        return res.status(400).json({ error: 'recordIds must be a non-empty array' });
+      }
+      if (recordIds.length > 200) {
+        return res.status(400).json({ error: 'Cannot bulk-update more than 200 bookings at once' });
+      }
+
+      // Agents can only set their own bookings to limited statuses
+      const agentAllowedStatuses = new Set([
+        'arrived & bought', 'arrived not potential', 'scheduled', 'cancelled', 'comeback'
+      ]);
+      if (req.user?.role !== 'Admin') {
+        if (status && !agentAllowedStatuses.has(status.toLowerCase())) {
+          return res.status(403).json({ error: 'Agents cannot set this status in bulk' });
+        }
+      }
+
+      const setClauses = [];
+      const params     = [];
+      let   idx        = 1;
+
+      if (status) {
+        let cancellationClause = '';
+        if (status.toLowerCase() === 'cancelled') {
+          cancellationClause = `, cancellation_time = CASE WHEN cancellation_time IS NULL THEN NOW() ELSE cancellation_time END`;
+        }
+        setClauses.push(`booking_status = $${idx++}${cancellationClause}`);
+        params.push(status);
+      }
+      if (followUpDate !== undefined) {
+        setClauses.push(`follow_up_date = $${idx++}`);
+        params.push(followUpDate || null);
+      }
+      if (setClauses.length === 0) {
+        return res.status(400).json({ error: 'No fields to update' });
+      }
+
+      setClauses.push(`updated_at = NOW()`);
+      params.push(recordIds);
+      const { rowCount } = await pool.query(
+        `UPDATE bookings SET ${setClauses.join(', ')}
+         WHERE record_id = ANY($${idx}::text[]) AND record_status != 'DELETED'`,
+        params
+      );
+
+      if (rowCount > 0 && recordIds.length <= 200) {
+        const logChanges = {};
+        if (status)        logChanges.booking_status = { to: status };
+        if (followUpDate !== undefined) logChanges.follow_up_date = { to: followUpDate || null };
+        const logRows  = recordIds.map((_, i) => `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4}, $${i * 4 + 5})`);
+        const logParams = recordIds.flatMap(rid => [
+          rid,
+          req.user?.userId || null,
+          req.user?.name   || req.user?.email || 'System',
+          'BULK_STATUS',
+          JSON.stringify(logChanges)
+        ]);
+        await pool.query(
+          `INSERT INTO booking_activity_log (booking_id, user_id, user_name, action, changes) VALUES ${recordIds.map((_, i) => `($${i*5+1},$${i*5+2},$${i*5+3},$${i*5+4},$${i*5+5})`).join(',')}`,
+          logParams
+        ).catch(e => console.error('Bulk activity log failed:', e.message));
+      }
+
+      res.json({ success: true, updated: rowCount, message: `${rowCount} booking(s) updated` });
+    } catch (err) {
+      console.error('Bulk update error:', err);
+      res.status(500).json({ error: 'Failed to bulk update bookings' });
+    }
+  }
+
+  // ── bulkEdit ───────────────────────────────────────────────────────────────
+  // POST /api/bookings/bulk-edit   Body: { recordIds: [...], fields: { <field>: value } }
+  // Applies the same change to every selected booking (Admin only). Supported
+  // fields mirror the Master Bookings bulk-edit bar (#5 team request).
+  async bulkEdit(req, res) {
+    try {
+      if (req.user?.role !== 'Admin') {
+        return res.status(403).json({ error: 'Only admins can bulk-edit bookings' });
+      }
+      const { recordIds, fields } = req.body;
+      if (!Array.isArray(recordIds) || recordIds.length === 0) {
+        return res.status(400).json({ error: 'recordIds must be a non-empty array' });
+      }
+      if (recordIds.length > 200) {
+        return res.status(400).json({ error: 'Cannot bulk-edit more than 200 bookings at once' });
+      }
+      if (!fields || typeof fields !== 'object') {
+        return res.status(400).json({ error: 'fields must be an object' });
+      }
+
+      const TEXT_COLS = {
+        status:      'booking_status',
+        branch:      'branch',
+        agent:       'agent',
+        treatment:   'treatment',
+        paymentMode: 'payment_mode',
+        freebie:     'freebie',
+      };
+      const BOOL_COLS = {
+        isPromoHunter:  'is_promo_hunter',
+        isOts:          'is_ots',
+        isHighPriority: 'is_high_priority',
+        doNotCall:      'do_not_call',
+      };
+
+      const sets = [], params = [], changes = {};
+      let idx = 1;
+      for (const [key, col] of Object.entries(TEXT_COLS)) {
+        if (fields[key] === undefined) continue;
+        const v = String(fields[key]).trim();
+        if (!v && (key === 'status' || key === 'branch')) {
+          return res.status(400).json({ error: `${key} cannot be set to empty` });
+        }
+        sets.push(`${col} = $${idx++}`); params.push(v || null);
+        changes[col] = { to: v || null };
+      }
+      for (const [key, col] of Object.entries(BOOL_COLS)) {
+        if (fields[key] === undefined) continue;
+        const v = fields[key] === true;
+        sets.push(`${col} = $${idx++}`); params.push(v);
+        changes[col] = { to: v };
+      }
+      if (fields.followUpDate !== undefined) {
+        sets.push(`follow_up_date = $${idx++}`); params.push(fields.followUpDate || null);
+        changes.follow_up_date = { to: fields.followUpDate || null };
+      }
+      if (!sets.length) return res.status(400).json({ error: 'No fields to update' });
+
+      // Mirror single-edit behavior: stamp cancellation_time when bulk-setting Cancelled
+      if (fields.status && String(fields.status).toLowerCase().includes('cancel')) {
+        sets.push(`cancellation_time = CASE WHEN cancellation_time IS NULL THEN NOW() ELSE cancellation_time END`);
+      }
+      sets.push(`updated_at = NOW()`);
+
+      params.push(recordIds);
+      const { rowCount } = await pool.query(
+        `UPDATE bookings SET ${sets.join(', ')}
+         WHERE record_id = ANY($${idx}::text[]) AND record_status != 'DELETED'`,
+        params
+      );
+
+      if (rowCount > 0) {
+        const logParams = recordIds.flatMap(rid => [
+          rid,
+          req.user?.userId || null,
+          req.user?.name   || req.user?.email || 'System',
+          'BULK_EDIT',
+          JSON.stringify(changes)
+        ]);
+        await pool.query(
+          `INSERT INTO booking_activity_log (booking_id, user_id, user_name, action, changes) VALUES ${recordIds.map((_, i) => `($${i*5+1},$${i*5+2},$${i*5+3},$${i*5+4},$${i*5+5})`).join(',')}`,
+          logParams
+        ).catch(e => console.error('Bulk-edit activity log failed:', e.message));
+      }
+
+      res.json({ success: true, updated: rowCount, message: `${rowCount} booking(s) updated` });
+    } catch (err) {
+      console.error('Bulk edit error:', err);
+      res.status(500).json({ error: 'Failed to bulk edit bookings' });
+    }
+  }
+
+  // ── bulkDelete ─────────────────────────────────────────────────────────────
+  // POST /api/bookings/bulk-delete   Body: { recordIds: ['BK-...'] }  (Admin only, soft-delete)
+  async bulkDelete(req, res) {
+    try {
+      if (req.user?.role !== 'Admin') {
+        return res.status(403).json({ error: 'Only admins can delete bookings' });
+      }
+      const { recordIds } = req.body;
+      if (!Array.isArray(recordIds) || recordIds.length === 0) {
+        return res.status(400).json({ error: 'recordIds must be a non-empty array' });
+      }
+      if (recordIds.length > 200) {
+        return res.status(400).json({ error: 'Cannot delete more than 200 bookings at once' });
+      }
+      const { rowCount } = await pool.query(
+        `UPDATE bookings SET record_status = 'DELETED' WHERE record_id = ANY($1::text[]) AND record_status != 'DELETED'`,
+        [recordIds]
+      );
+      res.json({ success: true, deleted: rowCount, message: `${rowCount} booking(s) deleted` });
+    } catch (err) {
+      console.error('Bulk delete error:', err);
+      res.status(500).json({ error: 'Failed to delete bookings' });
+    }
+  }
+
+  // ── getCustomerHistory ─────────────────────────────────────────────────────
+  // GET /api/bookings/customer?query=<phone|email|name>
+  async getCustomerHistory(req, res) {
+    try {
+      const query = (req.query.query || '').trim();
+      if (!query || query.length < 3) {
+        return res.status(400).json({ error: 'Query must be at least 3 characters' });
+      }
+
+      const norm   = query.toLowerCase().replace(/\s+/g, ' ').trim();
+      const likePat = `%${norm}%`;
+
+      const { rows } = await pool.query(`
+        SELECT record_id, created_at, branch, booking_status, appointment_date, appointment_time,
+               first_name, last_name, age, gender, phone, email, social_media, treatment, area, freebie,
+               total_price, payment_mode, agent, booking_details, remarks, purchase_details,
+               companion_first_name, companion_last_name,
+               promo_hunter_status, match_reason, is_ots, is_high_priority, is_meta_conversion, is_promo_hunter,
+               do_not_call, is_rescheduled, follow_up_date
+        FROM bookings
+        WHERE record_status != 'DELETED'
+          AND (
+            phone = $1
+            OR LOWER(COALESCE(email,'')) = $2
+            OR LOWER(COALESCE(social_media,'')) = $2
+            OR (LOWER(COALESCE(first_name,'')) || ' ' || LOWER(COALESCE(last_name,''))) LIKE $3
+            OR full_name_norm LIKE $3
+          )
+        ORDER BY appointment_date DESC NULLS LAST, created_at DESC
+        LIMIT 500
+      `, [query, norm, likePat]);
+
+      if (!rows.length) {
+        return res.json({ success: true, customer: null, bookings: [] });
+      }
+
+      const latest    = rows[0];
+      const allPrices = rows.map(r => parseFloat(r.total_price) || 0);
+      const SOLD      = new Set(['arrived & bought', 'comeback & bought', 'arrived not potential']);
+      const soldRows  = rows.filter(r => SOLD.has((r.booking_status || '').toLowerCase()));
+
+      const summary = {
+        name:          `${latest.first_name || ''} ${latest.last_name || ''}`.trim(),
+        phone:         latest.phone         || '',
+        email:         latest.email         || '',
+        socialMedia:   latest.social_media  || '',
+        gender:        latest.gender        || '',
+        totalBookings: rows.length,
+        totalSpend:    +soldRows.reduce((s, r) => s + (parseFloat(r.total_price) || 0), 0).toFixed(2),
+        avgSpend:      soldRows.length > 0 ? +(soldRows.reduce((s, r) => s + (parseFloat(r.total_price) || 0), 0) / soldRows.length).toFixed(2) : 0,
+        completedBookings: soldRows.length,
+        firstVisit:    rows[rows.length - 1]?.appointment_date || null,
+        lastVisit:     rows[0]?.appointment_date || null,
+        isRepeat:      rows.length > 1,
+        branches:      [...new Set(rows.map(r => r.branch).filter(Boolean))],
+      };
+
+      const bookingList = rows.map(r => ({
+        recordId:       r.record_id,
+        date:           normDate(r.appointment_date),
+        time:           r.appointment_time || '',
+        branch:         r.branch           || '',
+        status:         r.booking_status   || '',
+        treatment:      r.treatment        || '',
+        area:           r.area             || '',
+        totalPrice:     parseFloat(r.total_price) ?? 0,
+        paymentMode:    normalizePaymentMode(r.payment_mode),
+        agent:          r.agent            || '',
+        remarks:        r.remarks          || '',
+        purchaseDetails: r.purchase_details || '',
+        followUpDate:   normDate(r.follow_up_date) || null,
+        isOts:             r.is_ots             || false,
+        isHighPriority:    r.is_high_priority   || false,
+        isMetaConversion:  r.is_meta_conversion || false,
+        isPromoHunter:     r.is_promo_hunter    || false,
+        doNotCall:         r.do_not_call        || false,
+        isRescheduled:     r.is_rescheduled     || false,
+        promoHunterStatus: r.promo_hunter_status || '',
+        createdAt:      r.created_at,
+      }));
+
+      res.json({ success: true, customer: summary, bookings: bookingList });
+    } catch (err) {
+      console.error('Customer history error:', err);
+      res.status(500).json({ error: 'Failed to fetch customer history' });
+    }
+  }
+
+  // ── getActivityLog ─────────────────────────────────────────────────────────
+  async getActivityLog(req, res) {
+    try {
+      const { id } = req.params;
+      const { rows } = await pool.query(
+        `SELECT id, user_name, action, changes, created_at
+         FROM booking_activity_log
+         WHERE booking_id = $1
+         ORDER BY created_at DESC
+         LIMIT 200`,
+        [id]
+      );
+      res.json({ success: true, log: rows });
+    } catch (err) {
+      console.error('Activity log error:', err);
+      res.status(500).json({ error: 'Failed to load activity log' });
+    }
+  }
+
+  // ── getKanbanBookings ──────────────────────────────────────────────────────
+  async getKanbanBookings(req, res) {
+    try {
+      const date   = req.query.date   || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date());
+      const branch = (req.query.branch || '').trim();
+
+      const conds  = ["record_status != 'DELETED'", `appointment_date = $1::date`];
+      const params = [date];
+      if (branch && branch !== 'All') {
+        conds.push(`branch = $2`);
+        params.push(branch);
+      }
+
+      const { rows } = await pool.query(`
+        SELECT
+          record_id, booking_status, branch, appointment_time,
+          first_name, last_name, treatment, total_price, payment_mode,
+          agent, phone, is_ots, is_high_priority, is_meta_conversion, is_promo_hunter,
+          do_not_call, is_rescheduled, follow_up_date, remarks
+        FROM bookings
+        WHERE ${conds.join(' AND ')}
+        ORDER BY appointment_time ASC NULLS LAST, created_at ASC
+      `, params);
+
+      const bookings = rows.map(r => ({
+        recordId:      r.record_id,
+        status:        r.booking_status   || '',
+        branch:        r.branch           || '',
+        time:          r.appointment_time || '',
+        firstName:     r.first_name       || '',
+        lastName:      r.last_name        || '',
+        treatment:     r.treatment        || '',
+        totalPrice:    parseFloat(r.total_price) ?? 0,
+        paymentMode:   normalizePaymentMode(r.payment_mode),
+        agent:         r.agent            || '',
+        phone:         r.phone            || '',
+        isOts:            r.is_ots             || false,
+        isHighPriority:   r.is_high_priority   || false,
+        isMetaConversion: r.is_meta_conversion || false,
+        isPromoHunter:    r.is_promo_hunter    || false,
+        doNotCall:        r.do_not_call        || false,
+        isRescheduled:    r.is_rescheduled     || false,
+        followUpDate:     normDate(r.follow_up_date) || null,
+        remarks:          r.remarks            || '',
+      }));
+
+      res.json({ success: true, date, bookings });
+    } catch (err) {
+      console.error('Kanban error:', err);
+      res.status(500).json({ error: 'Failed to load kanban data' });
+    }
   }
 }
 
+// ── Promo hunter check ───────────────────────────────────────────────────────
+
+async function checkPromoHunter(firstName, lastName, email, phone, socialMedia, companionFirstName, companionLastName) {
+  try {
+    const fullName        = `${firstName} ${lastName}`.toLowerCase().trim();
+    const companionFull   = companionFirstName && companionLastName
+      ? `${companionFirstName} ${companionLastName}`.toLowerCase().trim() : '';
+    const emailNorm       = normalizeEmail(email);
+    const phoneNorm       = (phone       || '').replace(/\D/g, '');
+    const socialNorm      = (socialMedia || '').toLowerCase().trim();
+
+    if (!fullName && !emailNorm && !phoneNorm && !socialNorm && !companionFull) {
+      return { status: 'Scheduled', matchReason: '', matchedSource: '', matchedRow: '', matchCount: 0 };
+    }
+
+    const { rows } = await pool.query(`
+      SELECT record_id, first_name, last_name, branch,
+             full_name_norm, email_norm, phone_norm, social_norm, companion_full_name_norm
+      FROM bookings
+      WHERE record_status != 'DELETED'
+        AND (
+          ($1 != '' AND full_name_norm = $1)
+          OR ($2 != '' AND email_norm = $2)
+          OR ($3 != '' AND phone_norm = $3)
+          OR ($4 != '' AND social_norm = $4)
+          OR ($1 != '' AND companion_full_name_norm = $1)
+          OR ($5 != '' AND full_name_norm = $5)
+        )
+      LIMIT 5
+    `, [fullName, emailNorm, phoneNorm, socialNorm, companionFull]);
+
+    if (!rows.length) {
+      return { status: 'Scheduled', matchReason: '', matchedSource: '', matchedRow: '', matchCount: 0 };
+    }
+
+    const first = rows[0];
+    let matchReason = '', matchedAs = 'customer';
+
+    if (fullName && first.full_name_norm === fullName)                 { matchReason = 'Customer Name Match'; }
+    else if (emailNorm && first.email_norm === emailNorm)               { matchReason = 'Email Match'; }
+    else if (phoneNorm && first.phone_norm === phoneNorm)               { matchReason = 'Phone Match'; }
+    else if (socialNorm && first.social_norm === socialNorm)            { matchReason = 'Social Media Match'; }
+    else if (companionFull && first.companion_full_name_norm === companionFull) { matchReason = 'Previously Companion'; matchedAs = 'companion'; }
+    else if (companionFull && first.full_name_norm === companionFull)   { matchReason = 'Companion Match (was customer)'; matchedAs = 'companion'; }
+    else                                                                { matchReason = 'Name Match'; }
+
+    return {
+      status: 'Promo hunter',
+      matchReason,
+      matchedSource: `${matchedAs} (${first.branch || ''})`,
+      matchedRow:    first.record_id,
+      matchCount:    rows.length
+    };
+  } catch (err) {
+    console.error('[Promo Hunter Check] Error:', err);
+    return { status: 'Scheduled', matchReason: '', matchedSource: '', matchedRow: '', matchCount: 0 };
+  }
+}
+
+// ── Excel Import helpers (mirrors migrate-from-excel.js) ─────────────────────
+
+function _str(v) {
+  if (v === null || v === undefined) return null;
+  if (v instanceof Date) return null;
+  const s = String(v).trim();
+  return (s === '' || s === 'NaN' || s === 'undefined' || s === 'null') ? null : s;
+}
+function _bool(v) {
+  if (typeof v === 'boolean') return v;
+  if (v === null || v === undefined) return false;
+  return ['TRUE', '1', 'YES'].includes(String(v).toUpperCase().trim());
+}
+function _price(v) {
+  if (v === null || v === undefined) return 0;
+  if (typeof v === 'number' && !isNaN(v)) return v;
+  const n = parseFloat(String(v).replace(/[₱,\s]/g, ''));
+  return isNaN(n) ? 0 : n;
+}
+function _int(v) {
+  const n = parseInt(v, 10);
+  return isNaN(n) ? null : n;
+}
+function _isoTs(v) {
+  if (!v) return null;
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : v.toISOString();
+  const d = new Date(String(v));
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+function _dateOnly(v) {
+  if (!v) return null;
+  const d = v instanceof Date ? v : new Date(String(v));
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString().split('T')[0];
+}
+function _timeOnly(v) {
+  if (!v) return null;
+  const d = v instanceof Date ? v : new Date(String(v));
+  if (isNaN(d.getTime())) return null;
+  const h = d.getHours(), m = d.getMinutes();
+  return `${h % 12 || 12}:${String(m).padStart(2, '0')} ${h >= 12 ? 'PM' : 'AM'}`;
+}
+
+let _importIdCounter = 0;
+function _genRecordId(createdAt) {
+  const d = (createdAt instanceof Date && !isNaN(createdAt)) ? createdAt : new Date();
+  const p = n => String(n).padStart(2, '0');
+  const rand = (++_importIdCounter).toString(36).toUpperCase().padStart(3, '0')
+             + Math.random().toString(36).toUpperCase().slice(2, 4);
+  return `BK-${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}`
+       + `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+       + `-${rand.slice(0, 5)}`;
+}
+
+const IMPORT_COLS = [
+  'record_id', 'record_status', 'created_at', 'branch', 'booking_status',
+  'booking_date', 'booking_time', 'appointment_date', 'appointment_time',
+  'cancellation_time',
+  'first_name', 'last_name', 'age', 'gender', 'phone', 'email', 'social_media',
+  'treatment', 'area', 'freebie', 'total_price', 'payment_mode',
+  'companion_treatment', 'companion_first_name', 'companion_last_name',
+  'companion_age', 'companion_gender', 'companion_freebie', 'companion_area',
+  'agent', 'booking_details', 'remarks', 'purchase_details', 'ad_interacted',
+  'email_norm', 'phone_norm', 'social_norm', 'full_name_norm',
+  'companion_full_name_norm',
+  'promo_hunter_status', 'match_reason', 'matched_source', 'matched_row',
+  'last_checked_at',
+  'cancel_validation', 'underage_status', 'underage_cancellation', 'db_status',
+  'legacy_full_name', 'exclude_from_dashboards',
+  'is_ots', 'is_ad_id', 'is_companion', 'is_high_priority',
+  'do_not_call', 'is_rescheduled',
+];
+const IMPORT_N = IMPORT_COLS.length;
+
+const IMPORT_SINGLE_SQL = `
+  INSERT INTO bookings (${IMPORT_COLS.join(', ')})
+  VALUES (${Array.from({ length: IMPORT_N }, (_, i) => `$${i + 1}`).join(', ')})
+  ON CONFLICT (record_id) DO NOTHING
+`;
+
+function _rowToValues(row) {
+  const createdAt = row[0] instanceof Date ? row[0] : null;
+  const apptDt    = row[3] instanceof Date ? row[3] : null;
+  const rawId     = _str(row[38]);
+  return [
+    rawId || _genRecordId(createdAt),
+    _str(row[39]) || 'ACTIVE',
+    _isoTs(createdAt),
+    _str(row[1])  || '',
+    _str(row[2])  || 'Scheduled',
+    _dateOnly(createdAt),
+    _timeOnly(createdAt),
+    _dateOnly(apptDt),
+    _timeOnly(apptDt),
+    null,
+    _str(row[4])  || '',
+    _str(row[5])  || '',
+    _int(row[6]),
+    _str(row[7]),
+    _str(row[14]),
+    _str(row[16]),
+    _str(row[15]),
+    _str(row[8]),
+    _str(row[9]),
+    _str(row[10]),
+    _price(row[12]),
+    _str(row[13]),
+    _str(row[11]),
+    _str(row[20]),
+    _str(row[21]),
+    _int(row[22]),
+    _str(row[23]),
+    _str(row[24]),
+    null,
+    _str(row[17]),
+    _str(row[18]),
+    null,
+    _str(row[43]),
+    _str(row[19]),
+    _str(row[29]),
+    _str(row[30]),
+    _str(row[31]),
+    _str(row[32]),
+    _str(row[33]),
+    _str(row[34]),
+    _str(row[35]),
+    _str(row[36]),
+    _str(row[37]),
+    _isoTs(row[40] instanceof Date ? row[40] : null),
+    _bool(row[25]),
+    _str(row[26]),
+    _bool(row[27]),
+    _str(row[28]),
+    _str(row[41]),
+    _bool(row[42]),
+    false, false, false, false, false, false,
+  ];
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function formatTime12h(timeStr) {
+  if (!timeStr) return null;
+  const [hStr, mStr] = timeStr.split(':');
+  const h = parseInt(hStr, 10);
+  const m = parseInt(mStr || '0', 10);
+  if (isNaN(h) || isNaN(m)) return timeStr;
+  const ampm    = h >= 12 ? 'PM' : 'AM';
+  const display = h % 12 || 12;
+  return `${display}:${String(m).padStart(2, '0')} ${ampm}`;
+}
+
+function mapDrilldown(r) {
+  return {
+    firstName:  r.first_name || '',
+    lastName:   r.last_name  || '',
+    branch:     r.branch     || '',
+    date:       r.appointment_date ? new Date(r.appointment_date).toISOString().split('T')[0] : '',
+    treatment:  r.treatment  || '',
+    totalPrice: parseFloat(r.total_price) || 0,
+    status:     r.booking_status || '',
+    phone:      r.phone      || '',
+    email:      r.email      || '',
+    agent:      r.agent      || ''
+  };
+}
+
+// ── Import (attached outside class so it can be used as standalone middleware) ─
+BookingController.prototype.importBookings = async function(req, res) {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const XLSX = require('xlsx');
+    const wb = XLSX.read(req.file.buffer, { cellDates: true });
+    const ws = wb.Sheets['MASTER_RECORDS'];
+    if (!ws) {
+      return res.status(400).json({
+        error: `Sheet "MASTER_RECORDS" not found. Available sheets: ${wb.SheetNames.join(', ')}`
+      });
+    }
+
+    const allRows  = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+    const dataRows = allRows
+      .slice(1)
+      .filter(r => r && r.some(v => v !== null && v !== undefined && v !== ''));
+
+    const total     = dataRows.length;
+    const BATCH     = 200;
+    let inserted    = 0;
+    let skipped     = 0;
+    let errCount    = 0;
+    const errDetails = [];
+
+    for (let b = 0; b < total; b += BATCH) {
+      const batch   = dataRows.slice(b, b + BATCH);
+      const rowVals = batch.map(_rowToValues);
+
+      const groups = rowVals.map((_, i) => {
+        const start = i * IMPORT_N + 1;
+        return `(${Array.from({ length: IMPORT_N }, (_, j) => `$${start + j}`).join(', ')})`;
+      });
+
+      const batchSql = `
+        INSERT INTO bookings (${IMPORT_COLS.join(', ')})
+        VALUES ${groups.join(',\n')}
+        ON CONFLICT (record_id) DO NOTHING
+      `;
+
+      try {
+        const result = await pool.query(batchSql, rowVals.flat());
+        inserted += result.rowCount || 0;
+        skipped  += batch.length - (result.rowCount || 0);
+      } catch {
+        for (let r = 0; r < rowVals.length; r++) {
+          try {
+            const res2 = await pool.query(IMPORT_SINGLE_SQL, rowVals[r]);
+            inserted += res2.rowCount || 0;
+          } catch (rowErr) {
+            errCount++;
+            if (errDetails.length < 20) {
+              errDetails.push(`Row ${b + r + 2} (${rowVals[r][0]}): ${rowErr.message}`);
+            }
+            skipped++;
+          }
+        }
+      }
+    }
+
+    return res.json({ total, inserted, skipped, errors: errCount, errDetails });
+  } catch (err) {
+    console.error('[importBookings] Fatal:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+// Re-export the singleton with the patched method
 module.exports = new BookingController();

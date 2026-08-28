@@ -11,10 +11,16 @@ const bookingRoutes = require('./routes/booking.routes');
 const analyticsRoutes = require('./routes/analytics.routes');
 const dashboardRoutes = require('./routes/dashboard.routes');
 const healthRoutes = require('./routes/health.routes');
-const leadsRoutes = require('./routes/leads.routes');
+const leadsRoutes      = require('./routes/leads.routes');
+const configRoutes     = require('./routes/config.routes');
+const savedViewsRoutes = require('./routes/savedViews.routes');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
+
+// Railway (and most cloud hosts) sit behind a reverse proxy that sets X-Forwarded-For.
+// Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set('trust proxy', 1);
 
 // Security middleware — disable crossOriginResourcePolicy for public endpoints
 // so external websites can read the response (CORP 'same-origin' would block it)
@@ -23,24 +29,28 @@ app.use(helmet({
 }));
 
 const rawAllowed = process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000';
-const allowedOrigins = rawAllowed.split(',').map(o => o.trim()).filter(Boolean);
+const allowedOrigins = rawAllowed.split(',').map(o => o.trim().replace(/\/+$/, '')).filter(Boolean);
 
-// CORS: only the root POST /api/leads is public (website form submissions).
-// All sub-paths (/call, /booking, /centers, /:type/:rowIndex) are CRM-only → restricted.
-app.use(cors(function (req, callback) {
-  const isPublicLeads = req.path === '/api/leads';
-  if (isPublicLeads) {
-    return callback(null, { origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] });
+// CORS — explicit manual headers so preflight and credentialed requests both work reliably.
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const isLeads = req.path === '/api/leads';
+
+  if (isLeads) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  } else if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Vary', 'Origin');
   }
-  callback(null, {
-    origin: function (origin, cb) {
-      if (!origin) return cb(null, true);
-      if (allowedOrigins.indexOf(origin) !== -1) return cb(null, true);
-      return cb(new Error('CORS policy: origin not allowed'), false);
-    },
-    credentials: true
-  });
-}));
+
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 // Rate limiting
 const limiter = rateLimit({
@@ -58,7 +68,9 @@ app.use('/api/auth', authRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/analytics', analyticsRoutes);
-app.use('/api/leads', leadsRoutes);
+app.use('/api/leads',  leadsRoutes);
+app.use('/api/config', configRoutes);
+app.use('/api/saved-views', savedViewsRoutes);
 
 // Health check routes
 app.use('/health', healthRoutes);
@@ -93,4 +105,5 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🌐 Allowed origins: ${allowedOrigins.join(', ')}`);
 });
