@@ -270,6 +270,11 @@ class BookingController {
       const finalStatus   = d.status || 'Scheduled';
       const isPromoHunter = d.isPromoHunter === true || promoResult.status === 'Promo hunter';
 
+      // Underage Status: auto-Approved for clients 27 and over, Pending for 26 and
+      // below (or missing age) so only those need manual validation. Double Booking
+      // Status always starts Pending (team rule, CRM fixes PDF item 6/3).
+      const underageStatus = Number(d.age) >= 27 ? 'Approved' : 'Pending';
+
       // Normalized fields
       const emailNorm   = normalizeEmail(d.email);
       const phoneNorm   = (d.phone        || '').replace(/\D/g, '');
@@ -307,7 +312,7 @@ class BookingController {
           $32,$33,$34,$35,$36,
           $37,$38,$39,$40,$2,
           $42,false,$43,false,false,$44,
-          $41,'Pending','Pending'
+          $41,$45,'Pending'
         )`,
         [
           recordId, now,
@@ -324,7 +329,8 @@ class BookingController {
           d.followUpDate || null,
           d.isOts === true,        // $42 is_ots
           d.isCompanion === true,  // $43 is_companion
-          isPromoHunter            // $44 is_promo_hunter
+          isPromoHunter,           // $44 is_promo_hunter
+          underageStatus           // $45 underage_status (age ≥ 27 → Approved)
         ]
       );
 
