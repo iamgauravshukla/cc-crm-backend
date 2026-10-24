@@ -1064,7 +1064,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1083,7 +1083,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1103,7 +1103,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1123,7 +1123,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1144,7 +1144,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent,
                booking_date, cancellation_time, created_at
         FROM bookings
@@ -1164,7 +1164,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1184,7 +1184,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1385,7 +1385,7 @@ class BookingController {
       }
 
       const SELECT = `
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, payment_mode,
                booking_date, created_at
         FROM bookings`;
@@ -2128,6 +2128,7 @@ function mapDrilldown(r) {
   return {
     firstName:  r.first_name || '',
     lastName:   r.last_name  || '',
+    age:        r.age ?? null,
     branch:     r.branch     || '',
     date:       r.appointment_date ? new Date(r.appointment_date).toISOString().split('T')[0] : '',
     treatment:  r.treatment  || '',
