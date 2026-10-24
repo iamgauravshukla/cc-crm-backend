@@ -8,7 +8,8 @@ const {
   getCallLeads,
   getBookingLeads,
   getCenters,
-  updateLead
+  updateLead,
+  deleteLeads
 } = require('../controllers/leads.controller');
 
 // Rate limiter for public lead submission
@@ -37,6 +38,9 @@ router.get('/booking', authMiddleware, getBookingLeads);
 
 // GET /api/leads/centers
 router.get('/centers', authMiddleware, getCenters);
+
+// POST /api/leads/:type/bulk-delete — permanently delete selected leads (Admin only)
+router.post('/:type/bulk-delete', authMiddleware, deleteLeads);
 
 // PATCH /api/leads/:type/:rowIndex — update status & feedback
 router.patch('/:type/:rowIndex', authMiddleware, updateLead);
