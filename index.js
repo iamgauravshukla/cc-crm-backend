@@ -14,6 +14,7 @@ const healthRoutes = require('./routes/health.routes');
 const leadsRoutes      = require('./routes/leads.routes');
 const configRoutes     = require('./routes/config.routes');
 const savedViewsRoutes = require('./routes/savedViews.routes');
+const packagesRoutes   = require('./routes/packages.routes');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -71,6 +72,10 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/leads',  leadsRoutes);
 app.use('/api/config', configRoutes);
 app.use('/api/saved-views', savedViewsRoutes);
+app.use('/api/packages', packagesRoutes);
+
+// Session Tracker reminder scheduler (daily 09:00 Asia/Manila)
+require('./services/reminder.service').startScheduler();
 
 // Health check routes
 app.use('/health', healthRoutes);
