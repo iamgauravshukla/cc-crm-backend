@@ -342,16 +342,19 @@ async function executeRun(runId, { page, sinceUnix, untilUnix, agentFilter, samp
       }
     }
 
-    // Random sample so agents can't predict which chats get reviewed
-    if (sampleSize && convs.length > sampleSize) {
-      for (let i = convs.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [convs[i], convs[j]] = [convs[j], convs[i]];
-      }
-      convs = convs.slice(0, sampleSize);
+    // Random order so agents can't predict which chats get reviewed.
+    // sampleSize is a target of SCORED chats, not of attempts: on ad-heavy
+    // pages most "conversations" in a window are reactions, auto-reply-only
+    // threads or one-liners with no real exchange, which the quality gate
+    // rejects. So keep drawing candidates until enough real chats are scored,
+    // within a sane attempt budget so a run can't crawl a huge page forever.
+    for (let i = convs.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [convs[i], convs[j]] = [convs[j], convs[i]];
     }
+    const maxAttempts = Math.min(convs.length, Math.max((sampleSize || 20) * 10, 100), 600);
 
-    let analyzed = 0, skipped = 0, failed = 0, tin = 0, tout = 0;
+    let analyzed = 0, skipped = 0, failed = 0, tin = 0, tout = 0, attempts = 0;
     const window = { sinceMs: sinceUnix * 1000, untilMs: untilUnix * 1000 };
     const phFmtRun = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
     const fromDate = phFmtRun.format(sinceUnix * 1000), toDate = phFmtRun.format(untilUnix * 1000);
@@ -371,6 +374,8 @@ async function executeRun(runId, { page, sinceUnix, untilUnix, agentFilter, samp
     };
 
     for (const c of convs) {
+      if (analyzed >= (sampleSize || Infinity) || attempts >= maxAttempts) break;
+      attempts++;
       try {
         if (!force) {
           const { rows: existing } = await pool.query(
