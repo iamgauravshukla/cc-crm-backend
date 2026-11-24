@@ -33,6 +33,23 @@ const maskPII = (text) =>
 
 const stripHtml = (s) => String(s || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 
+// Customer phone from a Pancake conversation, digits only (for booking attribution).
+// Shapes vary across pages: customers[].phone_numbers may hold strings or objects,
+// and recent_phone_numbers may hold strings or { phone_number } objects.
+function extractPhone(conv) {
+  const candidates = [];
+  for (const cust of conv.customers || []) {
+    for (const p of cust.phone_numbers || []) candidates.push(p);
+  }
+  for (const p of conv.recent_phone_numbers || []) candidates.push(p);
+  for (const raw of candidates) {
+    const s = typeof raw === 'string' ? raw : (raw?.phone_number || raw?.number || raw?.phone || '');
+    const digits = String(s).replace(/\D/g, '');
+    if (digits.length >= 7) return digits.slice(0, 40);
+  }
+  return null;
+}
+
 // window: { sinceMs, untilMs } — only messages inside the window are scored.
 // Facebook threads live for years (the conversation is the customer), so without
 // this the analysis would read history far older than the selected date range.
@@ -300,6 +317,31 @@ async function executeRun(runId, { page, sinceUnix, untilUnix, agentFilter, samp
     }
     await bump('convs_found = $1', [convs.length]);
 
+    // Cost reuse: chats already scored in a previous run join this run's report
+    // for free — no message fetch from Pancake, no GPT call. The sample is then
+    // spent only on chats we have never scored.
+    let reused = 0;
+    if (!force && convs.length) {
+      const ids = convs.map(c => String(c.id));
+      const { rows: existRows } = await pool.query(
+        `SELECT id, conversation_id FROM qa_conversations
+         WHERE page_id = $1 AND overall IS NOT NULL AND conversation_id = ANY($2)`,
+        [page.pageId, ids]
+      );
+      if (existRows.length) {
+        const values = existRows.map((_, i) => `($1, $${i + 2}, true)`).join(', ');
+        await pool.query(
+          `INSERT INTO qa_run_items (run_id, conv_id, reused) VALUES ${values}
+           ON CONFLICT (run_id, conv_id) DO NOTHING`,
+          [runId, ...existRows.map(r => r.id)]
+        );
+        reused = existRows.length;
+        await bump('convs_reused = $1', [reused]);
+        const known = new Set(existRows.map(r => r.conversation_id));
+        convs = convs.filter(c => !known.has(String(c.id)));
+      }
+    }
+
     // Random sample so agents can't predict which chats get reviewed
     if (sampleSize && convs.length > sampleSize) {
       for (let i = convs.length - 1; i > 0; i--) {
@@ -350,26 +392,32 @@ async function executeRun(runId, { page, sinceUnix, untilUnix, agentFilter, samp
         tin += a.tokensIn; tout += a.tokensOut;
 
         const customerName = (c.customers && c.customers[0]?.name) || c.from?.name || t.lines.find(l => l.role === 'customer')?.name || '';
+        const customerPhone = extractPhone(c);
         await pool.query(`
           INSERT INTO qa_conversations
-            (run_id, page_id, page_name, conversation_id, customer_name, agent_name, agent_names,
+            (run_id, page_id, page_name, conversation_id, customer_name, customer_phone, agent_name, agent_names,
              msg_count, agent_msg_count, customer_msg_count, first_response_sec, max_gap_sec,
              started_at, last_msg_at, transcript, overall, scores, red_flags,
              sentiment_start, sentiment_end, followthrough, summary, coaching_tip, model, analyzed_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,NOW())
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,NOW())
           ON CONFLICT (page_id, conversation_id) DO UPDATE SET
             run_id = EXCLUDED.run_id, transcript = EXCLUDED.transcript, overall = EXCLUDED.overall,
+            customer_phone = COALESCE(EXCLUDED.customer_phone, qa_conversations.customer_phone),
             scores = EXCLUDED.scores, red_flags = EXCLUDED.red_flags,
             sentiment_start = EXCLUDED.sentiment_start, sentiment_end = EXCLUDED.sentiment_end,
             followthrough = EXCLUDED.followthrough, summary = EXCLUDED.summary,
             coaching_tip = EXCLUDED.coaching_tip, model = EXCLUDED.model, analyzed_at = NOW()
+          RETURNING id
         `, [
-          runId, page.pageId, page.label, c.id, customerName, t.primaryAgent, t.agentNames,
+          runId, page.pageId, page.label, c.id, customerName, customerPhone, t.primaryAgent, t.agentNames,
           t.lines.length, t.agentMsgCount, t.customerMsgCount, t.firstResponseSec, t.maxGapSec,
           t.startedAt ? new Date(`${t.startedAt}Z`) : null, t.lastMsgAt ? new Date(`${t.lastMsgAt}Z`) : null,
           JSON.stringify(t.lines), a.overall, JSON.stringify(a.scores), JSON.stringify(a.redFlags),
           a.sentimentStart, a.sentimentEnd, a.followthrough, a.summary, a.coachingTip, a.model,
-        ]);
+        ]).then(r =>
+          pool.query(`INSERT INTO qa_run_items (run_id, conv_id, reused) VALUES ($1, $2, false)
+                      ON CONFLICT (run_id, conv_id) DO UPDATE SET reused = false`, [runId, r.rows[0].id])
+        );
         analyzed++;
         await bump('convs_analyzed = $1, tokens_in = $2, tokens_out = $3', [analyzed, tin, tout]);
       } catch (err) {

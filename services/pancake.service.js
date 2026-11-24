@@ -125,7 +125,7 @@ async function listUsers(page) {
 // Conversations in [sinceUnix, untilUnix], newest first.
 // Paginates via last_conversation_id up to maxPages requests.
 async function listConversations(page, { sinceUnix, untilUnix, maxPages = 25 }) {
-  const fields = 'id,type,snippet,message_count,inserted_at,updated_at,last_sent_by,assignee_ids,current_assign_users,customers';
+  const fields = 'id,type,snippet,message_count,inserted_at,updated_at,last_sent_by,assignee_ids,current_assign_users,customers,recent_phone_numbers';
   // The API's since/until proved unreliable in practice, so the window is also
   // enforced here on updated_at, and pagination stops once a batch falls
   // entirely before `since` (results come newest-first by updated_at).

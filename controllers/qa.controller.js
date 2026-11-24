@@ -2,6 +2,7 @@
 const pool = require('../db/pool');
 const pancake = require('../services/pancake.service');
 const qa = require('../services/qa.service');
+const rating = require('../services/rating.service');
 
 const phFmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' });
 
@@ -47,13 +48,18 @@ async function startRun(req, res) {
     const page = await pancake.getPage(pageId);
     if (!page) return res.status(404).json({ error: 'Page not configured or has no API token' });
 
+    // Future dates make no sense for chat history — clamp to today (Manila)
+    const todayStr = phFmt.format(Date.now());
+    const clampedTo = to > todayStr ? todayStr : to;
+    const clampedFrom = from > clampedTo ? clampedTo : from;
+
     // Manila-local day bounds → unix seconds
-    const sinceUnix = Math.floor(new Date(`${from}T00:00:00+08:00`).getTime() / 1000);
-    const untilUnix = Math.floor(new Date(`${to}T23:59:59+08:00`).getTime() / 1000);
+    const sinceUnix = Math.floor(new Date(`${clampedFrom}T00:00:00+08:00`).getTime() / 1000);
+    const untilUnix = Math.floor(new Date(`${clampedTo}T23:59:59+08:00`).getTime() / 1000);
     const size = Math.max(1, Math.min(200, parseInt(sampleSize, 10) || 20));
 
     const runName = String(name || '').trim().slice(0, 140)
-      || `${page.label} · ${from} → ${to}${agentName ? ` · ${agentName}` : ''}`;
+      || `${page.label} · ${clampedFrom} → ${clampedTo}${agentName ? ` · ${agentName}` : ''}`;
     const { rows } = await pool.query(`
       INSERT INTO qa_runs (name, page_id, page_name, run_type, since, until, agent_filter, sample_size, model, created_by_name)
       VALUES ($1, $2, $3, 'manual', to_timestamp($4), to_timestamp($5), $6, $7, $8, $9)
@@ -77,7 +83,7 @@ const mapRun = (r) => ({
   id: r.id, name: r.name || '', pageId: r.page_id, pageName: r.page_name, runType: r.run_type,
   since: r.since, until: r.until, agentFilter: r.agent_filter, sampleSize: r.sample_size,
   status: r.status, convsFound: r.convs_found, convsAnalyzed: r.convs_analyzed,
-  convsSkipped: r.convs_skipped, convsFailed: r.convs_failed,
+  convsSkipped: r.convs_skipped, convsFailed: r.convs_failed, convsReused: r.convs_reused || 0,
   tokensIn: Number(r.tokens_in), tokensOut: Number(r.tokens_out), model: r.model,
   error: r.error, createdByName: r.created_by_name, createdAt: r.created_at, finishedAt: r.finished_at,
 });
@@ -101,6 +107,8 @@ function convFilters(q) {
   const conds = ['overall IS NOT NULL'];
   const params = [];
   let i = 1;
+  // A run's report = its scored chats + chats reused from earlier runs
+  if (q.runId)    { conds.push(`id IN (SELECT conv_id FROM qa_run_items WHERE run_id = $${i++})`); params.push(parseInt(q.runId, 10)); }
   if (q.pageId)   { conds.push(`page_id = $${i++}`); params.push(q.pageId); }
   if (q.agent)    { conds.push(`LOWER(COALESCE(agent_name,'')) LIKE $${i++}`); params.push(`%${q.agent.toLowerCase()}%`); }
   if (q.from)     { conds.push(`last_msg_at >= $${i++}::timestamptz`); params.push(`${q.from}T00:00:00+08:00`); }
@@ -119,7 +127,14 @@ async function deleteRun(req, res) {
     if (!rows.length) return res.status(404).json({ error: 'Run not found' });
     if (rows[0].status === 'Running') return res.status(400).json({ error: 'This run is still in progress — wait for it to finish first' });
 
-    const { rowCount: convsDeleted } = await pool.query('DELETE FROM qa_conversations WHERE run_id = $1', [id]);
+    // Remove this run's membership first; then delete only the chat scores this
+    // run produced that no other run still references (reused elsewhere = kept).
+    await pool.query('DELETE FROM qa_run_items WHERE run_id = $1', [id]);
+    const { rowCount: convsDeleted } = await pool.query(`
+      DELETE FROM qa_conversations c
+      WHERE c.run_id = $1
+        AND NOT EXISTS (SELECT 1 FROM qa_run_items ri WHERE ri.conv_id = c.id)
+    `, [id]);
     await pool.query('DELETE FROM qa_runs WHERE id = $1', [id]);
     res.json({ success: true, deleted: { run: id, conversations: convsDeleted } });
   } catch (err) {
@@ -166,7 +181,27 @@ async function getConversation(req, res) {
     const { rows } = await pool.query('SELECT * FROM qa_conversations WHERE id = $1', [parseInt(req.params.id, 10)]);
     if (!rows.length) return res.status(404).json({ error: 'Conversation not found' });
     const r = rows[0];
+    // Booking outcome: CRM bookings created −1…+7 days around the chat, matched by phone
+    let linkedBookings = [];
+    if (r.customer_phone && r.last_msg_at) {
+      try {
+        const { rows: lb } = await pool.query(`
+          SELECT booking_date, appointment_date, booking_status, total_price, agent, branch, treatment
+          FROM bookings
+          WHERE record_status <> 'DELETED' AND COALESCE(phone_norm,'') <> ''
+            AND RIGHT(phone_norm, 10) = RIGHT($1, 10)
+            AND booking_date BETWEEN ($2::date - 1) AND ($2::date + 7)
+          ORDER BY booking_date LIMIT 3
+        `, [r.customer_phone, r.last_msg_at]);
+        linkedBookings = lb.map(b => ({
+          bookingDate: b.booking_date, appointmentDate: b.appointment_date,
+          status: b.booking_status, totalPrice: parseFloat(b.total_price) || 0,
+          agent: b.agent, branch: b.branch, treatment: b.treatment,
+        }));
+      } catch { /* attribution is best-effort */ }
+    }
     res.json({ success: true, conversation: {
+      linkedBookings, hasPhone: !!r.customer_phone,
       id: r.id, pageId: r.page_id, pageName: r.page_name, conversationId: r.conversation_id,
       customerName: r.customer_name, agentName: r.agent_name, agentNames: r.agent_names || [],
       msgCount: r.msg_count, agentMsgCount: r.agent_msg_count, customerMsgCount: r.customer_msg_count,
@@ -497,4 +532,45 @@ async function getAgentScorecard(req, res) {
   }
 }
 
-module.exports = { getPagesList, getPageAgents, startRun, listRuns, getRun, deleteRun, listConversations, getConversation, getStats, getAgentProfile, getWorkload, getAgentScorecard };
+// GET /qa/ratings?from&to — Agent Capability Index leaderboard (defaults: last 30 days)
+async function getRatings(req, res) {
+  try {
+    const to   = /^\d{4}-\d{2}-\d{2}$/.test(req.query.to || '')   ? req.query.to   : phFmt.format(Date.now());
+    const from = /^\d{4}-\d{2}-\d{2}$/.test(req.query.from || '') ? req.query.from : phFmt.format(Date.now() - 29 * 86400000);
+    res.json({ success: true, ...(await rating.computeRatings(from, to)) });
+  } catch (err) {
+    console.error('getRatings error:', err);
+    res.status(500).json({ error: 'Failed to compute agent ratings' });
+  }
+}
+
+// GET /qa/agent-map — Pancake agents with their confirmed/suggested CRM match
+async function getAgentMap(req, res) {
+  try { res.json({ success: true, ...(await rating.listAgentMap()) }); }
+  catch (err) { res.status(500).json({ error: 'Failed to load agent mapping' }); }
+}
+
+// PUT /qa/agent-map — confirm one mapping ({ pancakeName, crmAgent|null })
+async function putAgentMap(req, res) {
+  try {
+    const pancakeName = String(req.body.pancakeName || '').trim();
+    if (!pancakeName) return res.status(400).json({ error: 'pancakeName is required' });
+    const crmAgent = req.body.crmAgent ? String(req.body.crmAgent).trim() : null;
+    await rating.saveAgentMap(pancakeName, crmAgent, req.user?.name || req.user?.email);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Failed to save mapping' }); }
+}
+
+// GET/PUT /qa/settings/aci-weights — tunable ACI component weights
+async function getAciWeights(req, res) {
+  try { res.json({ success: true, weights: await rating.getWeights(), defaults: rating.DEFAULT_WEIGHTS }); }
+  catch (err) { res.status(500).json({ error: 'Failed to load weights' }); }
+}
+async function putAciWeights(req, res) {
+  try {
+    const weights = await rating.saveWeights(req.body.weights, req.user?.name || req.user?.email);
+    res.json({ success: true, weights });
+  } catch (err) { res.status(400).json({ error: err.message || 'Failed to save weights' }); }
+}
+
+module.exports = { getPagesList, getPageAgents, startRun, listRuns, getRun, deleteRun, listConversations, getConversation, getStats, getAgentProfile, getWorkload, getAgentScorecard, getRatings, getAgentMap, putAgentMap, getAciWeights, putAciWeights };
