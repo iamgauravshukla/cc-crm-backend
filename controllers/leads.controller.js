@@ -258,4 +258,37 @@ async function updateLead(req, res) {
   }
 }
 
-module.exports = { submitLead, getCallLeads, getBookingLeads, getCenters, updateLead };
+/**
+ * POST /api/leads/:type/bulk-delete   Body: { ids: [1, 2, …] }
+ * Permanently deletes the selected leads (Admin only).
+ */
+async function deleteLeads(req, res) {
+  try {
+    if (req.user?.role !== 'Admin') {
+      return res.status(403).json({ error: 'Only admins can delete leads' });
+    }
+    const { type } = req.params;
+    if (!['call', 'booking'].includes(type)) {
+      return res.status(400).json({ error: 'Invalid type. Must be call or booking.' });
+    }
+    const table = type === 'call' ? 'call_leads' : 'booking_leads';
+
+    const ids = (Array.isArray(req.body?.ids) ? req.body.ids : [])
+      .map(v => parseInt(v, 10))
+      .filter(Number.isInteger);
+    if (!ids.length) return res.status(400).json({ error: 'ids must be a non-empty array' });
+    if (ids.length > 500) return res.status(400).json({ error: 'Cannot delete more than 500 leads at once' });
+
+    const { rowCount } = await pool.query(
+      `DELETE FROM ${table} WHERE id = ANY($1::int[])`,
+      [ids]
+    );
+
+    return res.json({ success: true, deleted: rowCount, message: `${rowCount} lead(s) deleted` });
+  } catch (err) {
+    console.error('Delete leads error:', err);
+    return res.status(500).json({ error: 'Failed to delete leads' });
+  }
+}
+
+module.exports = { submitLead, getCallLeads, getBookingLeads, getCenters, updateLead, deleteLeads };

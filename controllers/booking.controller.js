@@ -270,6 +270,11 @@ class BookingController {
       const finalStatus   = d.status || 'Scheduled';
       const isPromoHunter = d.isPromoHunter === true || promoResult.status === 'Promo hunter';
 
+      // Underage Status: auto-Approved for clients 27 and over, Pending for 26 and
+      // below (or missing age) so only those need manual validation. Double Booking
+      // Status always starts Pending (team rule, CRM fixes PDF item 6/3).
+      const underageStatus = Number(d.age) >= 27 ? 'Approved' : 'Pending';
+
       // Normalized fields
       const emailNorm   = normalizeEmail(d.email);
       const phoneNorm   = (d.phone        || '').replace(/\D/g, '');
@@ -307,7 +312,7 @@ class BookingController {
           $32,$33,$34,$35,$36,
           $37,$38,$39,$40,$2,
           $42,false,$43,false,false,$44,
-          $41,'Pending','Pending'
+          $41,$45,'Pending'
         )`,
         [
           recordId, now,
@@ -324,7 +329,8 @@ class BookingController {
           d.followUpDate || null,
           d.isOts === true,        // $42 is_ots
           d.isCompanion === true,  // $43 is_companion
-          isPromoHunter            // $44 is_promo_hunter
+          isPromoHunter,           // $44 is_promo_hunter
+          underageStatus           // $45 underage_status (age ≥ 27 → Approved)
         ]
       );
 
@@ -1058,7 +1064,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1077,7 +1083,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1097,7 +1103,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1117,7 +1123,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1138,7 +1144,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent,
                booking_date, cancellation_time, created_at
         FROM bookings
@@ -1158,7 +1164,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1178,7 +1184,7 @@ class BookingController {
       const wf = parseSingleFilter(req.query);
       const ctx = widgetCtx();
       const { rows } = await pool.query(`
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, booking_date
         FROM bookings
         WHERE record_status != 'DELETED'
@@ -1237,6 +1243,14 @@ class BookingController {
       const next7EndStr = phFmt.format(now + 7 * 86400000);
 
       const schedToday = {}, arrToday = {}, schedTomorrow = {}, next7 = {}, otsMap = {};
+      // Simple-view daily summary: per-branch status breakdown for today (unfiltered —
+      // it is the plain snapshot the team shares, matching the printed report)
+      const daily = {};
+      const dailyRow = (br) => daily[br] || (daily[br] = {
+        overall: 0, ots: 0, additional: 0,
+        arrivedBought: 0, arrivedNotPotential: 0, inTreatment: 0,
+        cancelled: 0, noShow: 0, promoHunter: 0, upcoming: 0,
+      });
       const payModesTomorrow = { Cash: 0, Debit: 0, Credit: 0 };
       const payModeRevTomorrow = { Cash: 0, Debit: 0, Credit: 0 };
       const arrStatusMap = {};
@@ -1276,6 +1290,20 @@ class BookingController {
 
         // Roster for the arrival-rate denominator (everyone still expected today, excl. cancelled)
         if (!cancelled && isToday) schedTodayRoster++;
+
+        // Simple-view daily summary — every booking scheduled for today, split by outcome
+        if (isToday) {
+          const d = dailyRow(branch);
+          d.overall++;
+          if (bookedToday) d.ots++; else d.additional++;
+          if (status === 'arrived & bought' || status === 'comeback & bought') d.arrivedBought++;
+          else if (status === 'arrived not potential') d.arrivedNotPotential++;
+          else if (status.includes('treatment')) d.inTreatment++;
+          else if (cancelled) d.cancelled++;
+          else if (status === 'no show') d.noShow++;
+          else if (status === 'promo hunter' || r.is_promo_hunter) d.promoHunter++;
+          else d.upcoming++;
+        }
 
         // Total OTS — Booked on = Today AND appointment in the next 7 days (today .. day+7),
         // ANY status EXCEPT "Comeback & Bought" (team follow-up: those are not real OTS bookings).
@@ -1355,6 +1383,13 @@ class BookingController {
           totalSchedulesNext7:    { otsNext7, additionalNext7: additNext7, byBranch: next7, total: sumCount(next7) },
           totalOTS:               { byBranch: otsMap, total: sumCount(otsMap) },
           cancellationsToday:     { byBranch: cancellations, total: sumCount(cancellations) },
+          dailySummary: {
+            byBranch: daily,
+            totals: Object.values(daily).reduce((t, d) => {
+              for (const k of Object.keys(d)) t[k] = (t[k] || 0) + d[k];
+              return t;
+            }, {}),
+          },
           performance: {
             boughtToday:          { count: boughtTodayCount, revenue: +boughtTodayRevenue.toFixed(2) },
             arrivalRateToday,
@@ -1379,7 +1414,7 @@ class BookingController {
       }
 
       const SELECT = `
-        SELECT first_name, last_name, branch, appointment_date, appointment_time,
+        SELECT first_name, last_name, age, branch, appointment_date, appointment_time,
                treatment, total_price, booking_status, phone, email, agent, payment_mode,
                booking_date, created_at
         FROM bookings`;
@@ -2122,6 +2157,7 @@ function mapDrilldown(r) {
   return {
     firstName:  r.first_name || '',
     lastName:   r.last_name  || '',
+    age:        r.age ?? null,
     branch:     r.branch     || '',
     date:       r.appointment_date ? new Date(r.appointment_date).toISOString().split('T')[0] : '',
     treatment:  r.treatment  || '',

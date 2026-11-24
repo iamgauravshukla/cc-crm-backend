@@ -21,7 +21,7 @@ const authMiddleware = async (req, res, next) => {
 
     if (!user) {
       const { rows } = await pool.query(
-        'SELECT user_id, email, name, role FROM users WHERE user_id = $1 AND email = $2',
+        'SELECT user_id, email, name, role, is_active FROM users WHERE user_id = $1 AND email = $2',
         [decoded.userId, decoded.email]
       );
       if (!rows.length) {
@@ -29,6 +29,11 @@ const authMiddleware = async (req, res, next) => {
       }
       user = rows[0];
       userCache.set(cacheKey, user);
+    }
+
+    // Disabled accounts are cut off even with an unexpired token
+    if (user.is_active === false) {
+      return res.status(403).json({ error: 'This account has been disabled. Contact an administrator.' });
     }
 
     req.user = {

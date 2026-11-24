@@ -822,4 +822,50 @@ async function getAgentBookings(req, res) {
   }
 }
 
-module.exports = { getAnalytics, getAgentPerformance, getAdPerformance, getSalesReport, getAgentBookings };
+// ── getSalesBookings ─────────────────────────────────────────────────────────
+// GET /analytics/sales-bookings?branch=&startDate=&endDate=
+// The bookings behind one branch bar of the Sales Report "By Branch" chart —
+// same definition of a sale as getSalesReport (SALE_STATUSES on appointment_date).
+async function getSalesBookings(req, res) {
+  try {
+    const branch = (req.query.branch || '').trim();
+    const { startDate, endDate } = req.query;
+    if (!branch || !startDate || !endDate) {
+      return res.status(400).json({ error: 'branch, startDate and endDate are required' });
+    }
+
+    const { rows } = await pool.query(`
+      SELECT record_id, appointment_date, appointment_time, first_name, last_name,
+             treatment, booking_status, total_price, payment_mode, agent, is_promo_hunter
+      FROM bookings
+      WHERE record_status != 'DELETED'
+        AND branch = $1
+        AND appointment_date >= $2::date AND appointment_date <= $3::date
+        AND LOWER(REGEXP_REPLACE(TRIM(booking_status), '\\s+', ' ', 'g')) = ANY($4::text[])
+      ORDER BY appointment_date DESC, total_price DESC
+      LIMIT 1000
+    `, [branch, startDate, endDate, [...SALE_STATUSES]]);
+
+    res.json({
+      success: true,
+      bookings: rows.map(r => ({
+        recordId:   r.record_id,
+        date:       r.appointment_date || '',
+        time:       r.appointment_time || '',
+        firstName:  r.first_name || '',
+        lastName:   r.last_name  || '',
+        treatment:  r.treatment  || '',
+        status:     r.booking_status || '',
+        totalPrice: parseFloat(r.total_price) || 0,
+        paymentMode: r.payment_mode || '',
+        agent:      r.agent || '',
+        isPromoHunter: r.is_promo_hunter || false,
+      })),
+    });
+  } catch (err) {
+    console.error('Sales bookings error:', err);
+    res.status(500).json({ error: 'Failed to fetch sales bookings' });
+  }
+}
+
+module.exports = { getAnalytics, getAgentPerformance, getAdPerformance, getSalesReport, getAgentBookings, getSalesBookings };

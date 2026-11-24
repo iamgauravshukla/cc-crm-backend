@@ -14,6 +14,8 @@ const healthRoutes = require('./routes/health.routes');
 const leadsRoutes      = require('./routes/leads.routes');
 const configRoutes     = require('./routes/config.routes');
 const savedViewsRoutes = require('./routes/savedViews.routes');
+const packagesRoutes   = require('./routes/packages.routes');
+const qaRoutes         = require('./routes/qa.routes');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -52,10 +54,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// Rate limiting
+// Rate limiting — generous: the dashboards poll (run progress every few seconds),
+// so 100/15min starved the UI's own requests. Login has its own strict limiter.
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
+  max: 3000,
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 app.use('/api/', limiter);
 
@@ -71,6 +76,11 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/leads',  leadsRoutes);
 app.use('/api/config', configRoutes);
 app.use('/api/saved-views', savedViewsRoutes);
+app.use('/api/packages', packagesRoutes);
+app.use('/api/qa', qaRoutes);
+
+// Session Tracker reminder scheduler (daily 09:00 Asia/Manila)
+require('./services/reminder.service').startScheduler();
 
 // Health check routes
 app.use('/health', healthRoutes);
