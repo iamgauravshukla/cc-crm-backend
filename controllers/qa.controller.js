@@ -15,7 +15,7 @@ async function getPagesList(req, res) {
       success: true,
       openaiConfigured: !!process.env.OPENAI_API_KEY,
       model: process.env.OPENAI_QA_MODEL || 'gpt-4o-mini',
-      pages: pages.map(p => ({ pageId: p.pageId, label: p.label, platform: p.platform, hasToken: !!p.token })),
+      pages: pages.map(p => ({ pageId: p.pageId, label: p.label, platform: p.platform, hasToken: !!p.token, tokenError: p.tokenError || null })),
     });
   } catch (err) {
     res.status(502).json({ error: err.message || 'Failed to load Pancake pages' });

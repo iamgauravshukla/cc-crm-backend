@@ -46,6 +46,7 @@ async function fetchPagesViaUserToken() {
   const pages = [];
   for (const p of list) {
     let token = p.settings?.page_access_token || '';
+    let tokenError = '';
     // No token yet (and none to invalidate) → generate one, once; it then
     // persists in the page's settings on Pancake's side.
     if (!token) {
@@ -56,9 +57,14 @@ async function fetchPagesViaUserToken() {
           validateStatus: () => true,
         });
         token = gen.data?.page_access_token || gen.data?.data?.page_access_token || '';
-      } catch { /* not admin on this page — listed without a token */ }
+        if (!token) {
+          // e.g. "No subscriptions found" (page has no Pancake plan) or
+          // "Missing administer permission" (our account isn't admin there)
+          tokenError = gen.data?.message || gen.data?.errors?.[0]?.message || 'Could not generate a page token';
+        }
+      } catch (err) { tokenError = err.message; }
     }
-    pages.push({ label: p.name || p.id, pageId: String(p.id), token, platform: p.platform || 'facebook' });
+    pages.push({ label: p.name || p.id, pageId: String(p.id), token, tokenError, platform: p.platform || 'facebook' });
   }
   return pages;
 }
