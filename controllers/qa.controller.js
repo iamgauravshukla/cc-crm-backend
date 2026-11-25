@@ -321,16 +321,25 @@ async function getWorkload(req, res) {
         if (name) assigned[name] = (assigned[name] || 0) + 1;
       }
     }
-    // Pancake per-staff totals, keyed back by display name
+    // Pancake per-staff totals. The API returns HOURLY rows per user, so they
+    // must be summed across the period (the old code kept one arbitrary hour).
+    // average_response_time is in SECONDS and is averaged per hour — combine
+    // hours as a weighted mean (weight = responded conversations that hour).
     const pstats = {};
-    for (const [, u] of Object.entries(stats.users || {})) {
+    for (const u of Object.values(stats.users || {})) {
       const name = (u.user_name || '').trim();
       if (!name) continue;
-      pstats[name] = {
-        messagesSent: (u.inbox_count || 0) + (u.comment_count || 0),
-        respondedUnique: u.unique_inbox_count || 0,
-        avgResponseSec: u.average_response_time ? Math.round(u.average_response_time / 1000) : null,
-      };
+      const p = pstats[name] || (pstats[name] = { messagesSent: 0, respondedUnique: 0, respSum: 0, respW: 0 });
+      p.messagesSent += (u.inbox_count || 0) + (u.comment_count || 0);
+      p.respondedUnique += (u.unique_inbox_count || 0);
+      if (u.average_response_time > 0) {
+        const w = Math.max(1, u.unique_inbox_count || 0);
+        p.respSum += u.average_response_time * w;
+        p.respW += w;
+      }
+    }
+    for (const p of Object.values(pstats)) {
+      p.avgResponseSec = p.respW > 0 ? Math.round(p.respSum / p.respW) : null;
     }
 
     const names = [...new Set([...Object.keys(assigned), ...Object.keys(pstats)])];
