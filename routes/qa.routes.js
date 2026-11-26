@@ -4,7 +4,12 @@ const authMiddleware = require('../middleware/auth.middleware');
 const ctrl = require('../controllers/qa.controller');
 
 router.use(authMiddleware);
-// Chat QA is supervisor tooling — Admin only, end to end.
+
+// Agent self-service — any authenticated user, but strictly their OWN results
+router.get('/my/overview', ctrl.getMyOverview);
+router.get('/my/conversations/:id', ctrl.getMyConversation);
+
+// Everything below is supervisor tooling — Admin only, end to end.
 router.use((req, res, next) => {
   if (req.user?.role !== 'Admin') return res.status(403).json({ error: 'Access denied. Admin only.' });
   next();
