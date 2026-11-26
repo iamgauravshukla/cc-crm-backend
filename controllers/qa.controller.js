@@ -541,6 +541,153 @@ async function getAgentScorecard(req, res) {
   }
 }
 
+const RUBRIC_KEYS = ['greeting', 'responsiveness', 'accuracy', 'tone_empathy', 'clarity', 'compliance', 'closing'];
+const RUBRIC_AVG_SQL = RUBRIC_KEYS
+  .map(k => `ROUND(AVG((scores->'${k}'->>'score')::numeric), 1) AS avg_${k}`)
+  .join(',\n               ');
+
+// ── Agent self-service ("My QA") ─────────────────────────────────────────────
+// Resolve which identities belong to the logged-in user: their CRM booking
+// agent (word-match against bookings.agent, same rule as the scorecard) and
+// every Pancake chat name mapped/matched to it. Everything they can see is
+// filtered to those names — never anyone else's results.
+async function resolveMyIdentities(user) {
+  const userName = String(user?.name || '').trim();
+  if (!userName) return { crmAgent: null, pancakeNames: [] };
+  const { agents: mapRows, crmAgents } = await rating.listAgentMap();
+  // Exact (case-insensitive) CRM name first, then whole-word containment
+  const uUp = userName.toUpperCase();
+  let crmAgent = crmAgents.find(a => a.toUpperCase() === uUp) || null;
+  if (!crmAgent) {
+    const uWords = uUp.split(/[^A-Z0-9]+/).filter(Boolean);
+    let best = '';
+    for (const a of crmAgents) {
+      const aWords = a.toUpperCase().split(/[^A-Z0-9]+/).filter(Boolean);
+      if (aWords.length && aWords.every(w => uWords.includes(w)) && a.length > best.length) best = a;
+    }
+    crmAgent = best || null;
+  }
+  const pancakeNames = mapRows
+    .filter(r => r.crmAgent && crmAgent && r.crmAgent.toUpperCase() === crmAgent.toUpperCase())
+    .map(r => r.pancakeName);
+  return { crmAgent, pancakeNames };
+}
+
+// GET /qa/my/overview?from&to — one agent's own QA + booking picture
+async function getMyOverview(req, res) {
+  try {
+    const to   = /^\d{4}-\d{2}-\d{2}$/.test(req.query.to || '')   ? req.query.to   : phFmt.format(Date.now());
+    const from = /^\d{4}-\d{2}-\d{2}$/.test(req.query.from || '') ? req.query.from : phFmt.format(Date.now() - 29 * 86400000);
+    const { crmAgent, pancakeNames } = await resolveMyIdentities(req.user);
+    if (!crmAgent && !pancakeNames.length) {
+      return res.json({ success: true, matched: false, from, to,
+        hint: 'No agent data matched your CRM user name yet — ask an admin to confirm your mapping on Chat QA → Agents → Agent mapping.' });
+    }
+
+    const tFrom = `${from}T00:00:00+08:00`, tTo = `${to}T23:59:59+08:00`;
+    const names = pancakeNames.length ? pancakeNames : ['\u0000none'];
+    const [{ rows: head }, { rows: trend }, { rows: convs }, { rows: tips }, { rows: insights }, { rows: book }] = await Promise.all([
+      pool.query(`
+        SELECT COUNT(*)::int AS convs, ROUND(AVG(overall))::int AS avg_score,
+               COUNT(*) FILTER (WHERE jsonb_array_length(COALESCE(red_flags,'[]'::jsonb)) > 0)::int AS flagged,
+               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY first_response_sec) AS median_first,
+               ${RUBRIC_AVG_SQL}
+        FROM qa_conversations
+        WHERE overall IS NOT NULL AND agent_name = ANY($1) AND last_msg_at BETWEEN $2::timestamptz AND $3::timestamptz
+      `, [names, tFrom, tTo]),
+      pool.query(`
+        SELECT to_char(last_msg_at AT TIME ZONE 'Asia/Manila', 'YYYY-MM-DD') AS day,
+               ROUND(AVG(overall))::int AS avg_score, COUNT(*)::int AS convs
+        FROM qa_conversations
+        WHERE overall IS NOT NULL AND agent_name = ANY($1) AND last_msg_at BETWEEN $2::timestamptz AND $3::timestamptz
+        GROUP BY 1 ORDER BY 1
+      `, [names, tFrom, tTo]),
+      pool.query(`
+        SELECT id, page_name, customer_name, overall, red_flags, summary, coaching_tip, last_msg_at
+        FROM qa_conversations
+        WHERE overall IS NOT NULL AND agent_name = ANY($1) AND last_msg_at BETWEEN $2::timestamptz AND $3::timestamptz
+        ORDER BY last_msg_at DESC LIMIT 20
+      `, [names, tFrom, tTo]),
+      pool.query(`
+        SELECT coaching_tip FROM qa_conversations
+        WHERE overall IS NOT NULL AND agent_name = ANY($1) AND NULLIF(TRIM(coaching_tip),'') IS NOT NULL
+        ORDER BY analyzed_at DESC LIMIT 5
+      `, [names]),
+      pool.query(`SELECT strengths, weaknesses, convs_scored FROM qa_agent_insights WHERE agent_name = ANY($1)`, [names]),
+      crmAgent ? pool.query(`
+        SELECT COUNT(*) FILTER (WHERE booking_date BETWEEN $2::date AND $3::date)::int AS bookings_created,
+               COUNT(*) FILTER (WHERE appointment_date BETWEEN $2::date AND $3::date)::int AS appts,
+               COUNT(*) FILTER (WHERE appointment_date BETWEEN $2::date AND $3::date
+                 AND LOWER(booking_status) IN ('arrived & bought','arrived not potential')
+                 AND COALESCE(underage_status,'Approved') = 'Approved' AND COALESCE(db_status,'Approved') = 'Approved'
+                 AND NOT COALESCE(cancel_validation, false))::int AS arrived,
+               COUNT(*) FILTER (WHERE appointment_date BETWEEN $2::date AND $3::date
+                 AND LOWER(booking_status) = 'no show')::int AS no_shows,
+               COUNT(*) FILTER (WHERE appointment_date BETWEEN $2::date AND $3::date
+                 AND LOWER(booking_status) LIKE '%cancel%')::int AS cancelled,
+               COUNT(*) FILTER (WHERE appointment_date BETWEEN $2::date AND $3::date
+                 AND LOWER(booking_status) IN ('arrived & bought','comeback & bought'))::int AS bought,
+               COALESCE(SUM(total_price) FILTER (WHERE appointment_date BETWEEN $2::date AND $3::date
+                 AND LOWER(booking_status) IN ('arrived & bought','comeback & bought','arrived not potential')), 0) AS revenue
+        FROM bookings WHERE record_status <> 'DELETED' AND UPPER(TRIM(agent)) = UPPER($1)
+      `, [crmAgent, from, to]) : Promise.resolve({ rows: [null] }),
+    ]);
+
+    const h = head[0] || {};
+    const criteria = {};
+    for (const k of RUBRIC_KEYS) criteria[k] = h[`avg_${k}`] != null ? Math.round(h[`avg_${k}`] * 10) / 10 : null;
+    const strengths = [...new Set(insights.flatMap(i => i.strengths || []))].slice(0, 3);
+    const weaknesses = [...new Set(insights.flatMap(i => i.weaknesses || []))].slice(0, 3);
+
+    const m = book[0];
+    const pct = (n, d) => d > 0 ? Math.round((n / d) * 1000) / 10 : null;
+    res.json({
+      success: true, matched: true, from, to, crmAgent, pancakeNames,
+      qa: {
+        convs: h.convs || 0, avgScore: h.avg_score ?? null, flagged: h.flagged || 0,
+        medianFirstResponseSec: h.median_first != null ? Math.round(h.median_first) : null,
+        criteria, trend, strengths, weaknesses,
+        coachingTips: [...new Set(tips.map(t => t.coaching_tip))],
+        conversations: convs.map(c => ({
+          id: c.id, pageName: c.page_name, customerName: c.customer_name,
+          overall: c.overall, redFlags: c.red_flags || [], summary: c.summary,
+          coachingTip: c.coaching_tip, lastMsgAt: c.last_msg_at,
+        })),
+      },
+      bookings: m ? {
+        bookingsCreated: m.bookings_created, appointments: m.appts, arrived: m.arrived,
+        showRate: pct(m.arrived, m.appts), noShowRate: pct(m.no_shows, m.appts),
+        cancelRate: pct(m.cancelled, m.appts), conversionRate: pct(m.bought, m.arrived),
+        revenue: parseFloat(m.revenue) || 0,
+        revenuePerArrival: m.arrived > 0 ? Math.round((parseFloat(m.revenue) || 0) / m.arrived) : null,
+      } : null,
+    });
+  } catch (err) {
+    console.error('getMyOverview error:', err);
+    res.status(500).json({ error: 'Failed to load your QA overview' });
+  }
+}
+
+// GET /qa/my/conversations/:id — own chat transcript + scores only
+async function getMyConversation(req, res) {
+  try {
+    const { pancakeNames } = await resolveMyIdentities(req.user);
+    const { rows } = await pool.query('SELECT * FROM qa_conversations WHERE id = $1', [parseInt(req.params.id, 10)]);
+    if (!rows.length) return res.status(404).json({ error: 'Conversation not found' });
+    const r = rows[0];
+    const mine = pancakeNames.some(n => n === r.agent_name) ||
+                 (r.agent_names || []).some(n => pancakeNames.includes(n));
+    if (!mine) return res.status(403).json({ error: 'This chat belongs to another agent' });
+    res.json({ success: true, conversation: {
+      id: r.id, pageName: r.page_name, customerName: r.customer_name, agentName: r.agent_name,
+      transcript: r.transcript || [], overall: r.overall, scores: r.scores || {},
+      redFlags: r.red_flags || [], sentimentStart: r.sentiment_start, sentimentEnd: r.sentiment_end,
+      followthrough: r.followthrough, summary: r.summary, coachingTip: r.coaching_tip,
+      firstResponseSec: r.first_response_sec, lastMsgAt: r.last_msg_at,
+    } });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch conversation' }); }
+}
+
 // GET /qa/ratings?from&to — Agent Capability Index leaderboard (defaults: last 30 days)
 async function getRatings(req, res) {
   try {
@@ -582,4 +729,4 @@ async function putAciWeights(req, res) {
   } catch (err) { res.status(400).json({ error: err.message || 'Failed to save weights' }); }
 }
 
-module.exports = { getPagesList, getPageAgents, startRun, listRuns, getRun, deleteRun, listConversations, getConversation, getStats, getAgentProfile, getWorkload, getAgentScorecard, getRatings, getAgentMap, putAgentMap, getAciWeights, putAciWeights };
+module.exports = { getPagesList, getPageAgents, startRun, listRuns, getRun, deleteRun, listConversations, getConversation, getStats, getAgentProfile, getWorkload, getAgentScorecard, getRatings, getAgentMap, putAgentMap, getAciWeights, putAciWeights, getMyOverview, getMyConversation };
